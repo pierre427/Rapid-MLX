@@ -212,6 +212,10 @@ def test_sync_config_propagates_mcp_manager(monkeypatch):
     from vllm_mlx import server
     from vllm_mlx.config import get_config
 
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "mcp_manager", None, raising=False)
+    monkeypatch.setattr(cfg, "mcp_executor", None, raising=False)
+
     monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
     monkeypatch.setattr(server, "_mcp_executor", None, raising=False)
 
@@ -240,6 +244,10 @@ def test_sync_config_preserves_unrelated_config_on_mcp_update(monkeypatch):
 
     from vllm_mlx import server
     from vllm_mlx.config import get_config
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "mcp_manager", None, raising=False)
+    monkeypatch.setattr(cfg, "mcp_executor", None, raising=False)
 
     monkeypatch.setattr(server, "_model_name", "model-a", raising=False)
     monkeypatch.setattr(server, "_tool_call_parser", "hermes", raising=False)
@@ -273,6 +281,10 @@ async def test_init_mcp_syncs_config_into_cfg(monkeypatch):
     import vllm_mlx.mcp as mcp_module
     from vllm_mlx import server
     from vllm_mlx.config import get_config
+
+    cfg = get_config()
+    monkeypatch.setattr(cfg, "mcp_manager", None, raising=False)
+    monkeypatch.setattr(cfg, "mcp_executor", None, raising=False)
 
     mock_manager = MagicMock()
     mock_manager.start = AsyncMock()
