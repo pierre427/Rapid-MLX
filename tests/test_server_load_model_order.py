@@ -260,3 +260,38 @@ def test_sync_config_preserves_unrelated_config_on_mcp_update(monkeypatch):
     assert cfg_after.mcp_manager is mock_manager
     assert cfg_after.model_name == "model-a"
     assert cfg_after.tool_call_parser == "hermes"
+
+
+async def test_init_mcp_syncs_config_into_cfg(monkeypatch):
+    """init_mcp() must publish the initialized manager/executor to cfg.
+
+    Regression for #986: this guards against deleting the `_sync_config()`
+    call inside init_mcp() and re-introducing the stale cfg bug.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    import vllm_mlx.mcp as mcp_module
+    from vllm_mlx import server
+    from vllm_mlx.config import get_config
+
+    mock_manager = MagicMock()
+    mock_manager.start = AsyncMock()
+    mock_manager.get_all_tools.return_value = []
+    mock_executor = MagicMock()
+
+    mock_config = MagicMock()
+    mock_config.allowed_high_risk_tools = []
+
+    monkeypatch.setattr(mcp_module, "load_mcp_config", lambda _path: mock_config)
+    monkeypatch.setattr(mcp_module, "MCPClientManager", lambda _cfg: mock_manager)
+    monkeypatch.setattr(mcp_module, "ToolExecutor", lambda _mgr: mock_executor)
+    monkeypatch.setattr(mcp_module, "set_sandbox", MagicMock())
+
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_executor", None, raising=False)
+
+    await server.init_mcp("/tmp/fake-mcp.json")
+
+    cfg = get_config()
+    assert cfg.mcp_manager is mock_manager
+    assert cfg.mcp_executor is mock_executor
