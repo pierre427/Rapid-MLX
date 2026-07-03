@@ -198,3 +198,65 @@ def test_sync_config_is_idempotent(monkeypatch):
 
     for k, v in snapshot.items():
         assert getattr(cfg2, k) == v, f"_sync_config() not idempotent on cfg.{k}"
+
+
+def test_sync_config_propagates_mcp_manager(monkeypatch):
+    """After init_mcp() sets the global _mcp_manager, _sync_config() must
+    copy it into cfg so MCP routes read a live manager instead of None.
+
+    Regression for #986: load_model() stamped cfg.mcp_manager = None before
+    lifespan init_mcp() ran, and no later _sync_config() updated it.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm_mlx import server
+    from vllm_mlx.config import get_config
+
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_executor", None, raising=False)
+
+    server._sync_config()
+    assert get_config().mcp_manager is None
+
+    mock_manager = MagicMock()
+    mock_executor = MagicMock()
+    monkeypatch.setattr(server, "_mcp_manager", mock_manager, raising=False)
+    monkeypatch.setattr(server, "_mcp_executor", mock_executor, raising=False)
+
+    server._sync_config()
+    cfg = get_config()
+    assert cfg.mcp_manager is mock_manager
+    assert cfg.mcp_executor is mock_executor
+
+
+def test_sync_config_preserves_unrelated_config_on_mcp_update(monkeypatch):
+    """Updating MCP globals and re-syncing must not clobber unrelated cfg.
+
+    Regression for the fix to #986: the post-init_mcp _sync_config() runs
+    late in startup; if it overwrote fields that were intentionally set
+    earlier, it would introduce ordering bugs.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm_mlx import server
+    from vllm_mlx.config import get_config
+
+    monkeypatch.setattr(server, "_model_name", "model-a", raising=False)
+    monkeypatch.setattr(server, "_tool_call_parser", "hermes", raising=False)
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_executor", None, raising=False)
+
+    server._sync_config()
+    cfg_before = get_config()
+    assert cfg_before.model_name == "model-a"
+    assert cfg_before.tool_call_parser == "hermes"
+    assert cfg_before.mcp_manager is None
+
+    mock_manager = MagicMock()
+    monkeypatch.setattr(server, "_mcp_manager", mock_manager, raising=False)
+
+    server._sync_config()
+    cfg_after = get_config()
+    assert cfg_after.mcp_manager is mock_manager
+    assert cfg_after.model_name == "model-a"
+    assert cfg_after.tool_call_parser == "hermes"
