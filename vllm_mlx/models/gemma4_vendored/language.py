@@ -135,10 +135,20 @@ class GeGLU(nn.Module):
 
 
 class Experts(nn.Module):
-    """Sparse MoE using mlx_lm SwitchGLU with gather_mm."""
+    """Sparse MoE using mlx_lm SwitchGLU with gather_mm.
+
+    Vendor-local addition: ``_require_moe_fields(config)`` guards
+    ``num_experts`` and ``moe_intermediate_size`` (both
+    ``Optional[int]`` on ``TextConfig``). Router already validates
+    on its own path — repeating the check here ensures a caller who
+    instantiates ``Experts`` directly (or reorders block init) still
+    gets the clear ``ValueError`` instead of an opaque failure
+    inside ``SwitchGLU``.
+    """
 
     def __init__(self, config: TextConfig):
         super().__init__()
+        _require_moe_fields(config)
         from mlx_lm.models.switch_layers import SwitchGLU
 
         self.switch_glu = SwitchGLU(

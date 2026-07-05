@@ -313,6 +313,105 @@ def test_gemma4_vendored_module_exists() -> None:
         )
 
 
+def test_gemma4_vendored_modules_importable_without_mlx_vlm() -> None:
+    """Codex round 3 NIT: the AST test proves the fallback SYNTAX is
+    intact but not that the vendored ``TextConfig`` and
+    ``LanguageModel`` classes are actually importable, or that they
+    stay API-compatible with what ``gemma4_text.py`` expects. Close
+    that gap by importing the vendored modules under a simulated
+    missing-``mlx_vlm`` environment and constructing a ``TextConfig``
+    from a minimal dict.
+
+    Simulation: temporarily insert ``None`` under the ``mlx_vlm.*``
+    module keys in ``sys.modules`` so any ``import mlx_vlm...``
+    raises ``ImportError`` — mirroring the fresh-venv path. Restore
+    the originals in ``finally`` so no other test sees the tampering.
+
+    We intentionally do NOT construct ``LanguageModel(tc)`` here:
+    that would allocate MLX weights (~gigabytes for a real config).
+    The wrapper's contract with the vendored file is
+    ``TextConfig.from_dict(dict) -> TextConfig`` and
+    ``LanguageModel(TextConfig)`` — the first is cheap and worth
+    asserting; the second's signature is asserted by
+    ``inspect.signature`` without invoking it."""
+    import importlib
+    import inspect
+    import sys
+
+    # Snapshot + poison mlx_vlm imports so the fallback branch is
+    # actually forced. Restore in finally so subsequent tests aren't
+    # affected. Use ``None`` (the sys.modules sentinel for "raise
+    # ImportError on next import") rather than a fake module, so
+    # `from mlx_vlm.X import Y` raises the same shape as a real
+    # missing-package failure.
+    mlx_vlm_snapshot = {
+        k: sys.modules[k] for k in list(sys.modules) if k.startswith("mlx_vlm")
+    }
+    for k in list(sys.modules):
+        if k.startswith("mlx_vlm"):
+            del sys.modules[k]
+    # Poison future imports so gemma4_text.py's `try:` branch fails
+    # and the `except ImportError:` branch is exercised.
+    sys.modules["mlx_vlm"] = None  # type: ignore[assignment]
+    sys.modules["mlx_vlm.models"] = None  # type: ignore[assignment]
+    sys.modules["mlx_vlm.models.gemma4"] = None  # type: ignore[assignment]
+    sys.modules["mlx_vlm.models.gemma4.config"] = None  # type: ignore[assignment]
+    sys.modules["mlx_vlm.models.gemma4.language"] = None  # type: ignore[assignment]
+    try:
+        # Fresh import of the vendored modules — must succeed with
+        # NO mlx_vlm on the import path.
+        cfg_mod = importlib.import_module(
+            "vllm_mlx.models.gemma4_vendored.config"
+        )
+        lang_mod = importlib.import_module(
+            "vllm_mlx.models.gemma4_vendored.language"
+        )
+        TextConfig = cfg_mod.TextConfig
+        LanguageModel = lang_mod.LanguageModel
+
+        # Contract 1: `TextConfig.from_dict` is a classmethod that
+        # accepts a params dict and returns a TextConfig. This is
+        # what gemma4_text.py calls to build the config.
+        assert hasattr(TextConfig, "from_dict"), (
+            "vendored TextConfig missing `from_dict` — gemma4_text.py "
+            "calls it as `TextConfig.from_dict(text_config)`. "
+            "Sync the vendored config.py against upstream mlx-vlm."
+        )
+        # Sanity: pass a subset of fields (from_dict must tolerate
+        # missing/extra keys per BaseModelConfig contract).
+        tc = TextConfig.from_dict(
+            {"hidden_size": 128, "num_hidden_layers": 2, "vocab_size": 100}
+        )
+        assert tc is not None
+        assert getattr(tc, "hidden_size", None) == 128
+
+        # Contract 2: `LanguageModel.__init__` accepts a single
+        # positional TextConfig. Assert via signature so we don't
+        # allocate gigabytes of MLX weights (a real construct would).
+        sig = inspect.signature(LanguageModel.__init__)
+        params = [
+            p
+            for p in sig.parameters.values()
+            if p.name != "self" and p.kind != inspect.Parameter.VAR_KEYWORD
+        ]
+        assert params, (
+            "vendored LanguageModel.__init__ has no non-self params — "
+            "gemma4_text.py calls `LanguageModel(tc)` expecting exactly "
+            "one positional TextConfig argument."
+        )
+    finally:
+        # Cleanup: remove poisoned entries and restore snapshot.
+        for k in [
+            "mlx_vlm",
+            "mlx_vlm.models",
+            "mlx_vlm.models.gemma4",
+            "mlx_vlm.models.gemma4.config",
+            "mlx_vlm.models.gemma4.language",
+        ]:
+            sys.modules.pop(k, None)
+        sys.modules.update(mlx_vlm_snapshot)
+
+
 def test_gemma4_text_prefers_vendored_fallback() -> None:
     """``vllm_mlx/models/gemma4_text.py`` must try mlx-vlm first, then
     fall back to the vendored copy. A refactor that dropped the
