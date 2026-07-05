@@ -317,10 +317,18 @@ def test_gemma4_text_prefers_vendored_fallback() -> None:
     """``vllm_mlx/models/gemma4_text.py`` must try mlx-vlm first, then
     fall back to the vendored copy. A refactor that dropped the
     fallback would silently re-introduce the 0.10.0 regression for any
-    fresh install without ``[vision]``. Detection is a source-level
-    scan for both the mlx-vlm import AND the vendored import; we don't
-    parse the AST because a plain substring check is enough to catch
-    accidental removal and stays robust against import-order tweaks."""
+    fresh install without ``[vision]``.
+
+    Detection walks the AST — not a substring scan — because the file
+    carries a ~15-line explanatory comment that itself references
+    ``mlx_vlm.models.gemma4`` and ``gemma4_vendored`` (documenting
+    why the fallback exists). A substring check would pass even if
+    someone deleted the executable ``try:/except ImportError:`` block
+    but left the comment intact, silently re-opening L-07-B. The AST
+    walk asserts the actual imports resolve to the right modules
+    inside a real ``ImportError`` handler."""
+    import ast
+
     here = Path(__file__).resolve()
     repo_root = None
     for parent in [here.parent, *here.parents]:
@@ -330,18 +338,87 @@ def test_gemma4_text_prefers_vendored_fallback() -> None:
     assert repo_root is not None, "pyproject.toml not found above test file"
     gemma4_text = repo_root / "vllm_mlx" / "models" / "gemma4_text.py"
     assert gemma4_text.is_file(), f"gemma4_text.py missing at {gemma4_text}"
-    src = gemma4_text.read_text(encoding="utf-8")
-    assert "mlx_vlm.models.gemma4" in src, (
-        "gemma4_text.py no longer imports from mlx_vlm.models.gemma4. "
-        "The mlx-vlm-first path is intentional: [vision] users share "
-        "one Gemma 4 code path with the rest of the mlx-vlm ecosystem."
+
+    tree = ast.parse(gemma4_text.read_text(encoding="utf-8"))
+    found_pattern = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        # The Try must have at least one ImportError handler (catches
+        # both `except ImportError:` and `except (ImportError, ...):`).
+        handles_import_error = any(
+            _handler_catches_import_error(h) for h in node.handlers
+        )
+        if not handles_import_error:
+            continue
+        try_imports = _module_names_imported(node.body)
+        # An ImportError handler with a bare pass / pyright ignore has
+        # no imports of its own — skip it. We need the fallback path
+        # to also import; that's how the vendored classes get loaded.
+        fallback_imports = [
+            _module_names_imported(h.body)
+            for h in node.handlers
+            if _handler_catches_import_error(h)
+        ]
+        wants_mlx_vlm_first = any(
+            m.startswith("mlx_vlm.models.gemma4") for m in try_imports
+        )
+        wants_vendored_fallback = any(
+            any(m.startswith("vllm_mlx.models.gemma4_vendored") for m in fb)
+            for fb in fallback_imports
+        )
+        if wants_mlx_vlm_first and wants_vendored_fallback:
+            found_pattern = True
+            break
+    assert found_pattern, (
+        "gemma4_text.py no longer contains a `try: from mlx_vlm.models."
+        "gemma4 import ... except ImportError: from vllm_mlx.models."
+        "gemma4_vendored import ...` block. Without it, a fresh "
+        "`pip install rapid-mlx && rapid-mlx serve gemma-4-12b-4bit` "
+        "re-crashes with the 0.10.0 ImportError (L-07-B). Restore the "
+        "try/except fallback. (Note: this test walks the AST — a bare "
+        "comment referencing these module names is intentionally NOT "
+        "enough, since deleting executable imports while keeping the "
+        "explanatory comment would silently regress L-07-B.)"
     )
-    assert "gemma4_vendored" in src, (
-        "gemma4_text.py no longer references the vendored fallback. "
-        "Without it, a fresh `pip install rapid-mlx && rapid-mlx serve "
-        "gemma-4-12b-4bit` re-crashes with the 0.10.0 ImportError "
-        "(L-07-B). Restore the try/except fallback."
-    )
+
+
+def _handler_catches_import_error(handler) -> bool:
+    """Return True if ``handler`` catches ``ImportError`` (bare or in
+    a tuple, e.g. ``except (ImportError, ModuleNotFoundError):``).
+    Import errors don't ship other names; we only need to match
+    ``ImportError`` itself since ``ModuleNotFoundError`` is a
+    subclass."""
+    import ast
+
+    exc_type = handler.type
+    if exc_type is None:
+        return True  # bare ``except:`` catches everything, including ImportError
+    if isinstance(exc_type, ast.Name) and exc_type.id == "ImportError":
+        return True
+    if isinstance(exc_type, ast.Tuple):
+        return any(
+            isinstance(el, ast.Name) and el.id == "ImportError"
+            for el in exc_type.elts
+        )
+    return False
+
+
+def _module_names_imported(body) -> list[str]:
+    """Return the module names imported by any ``import`` /
+    ``from ... import`` in ``body``. Used to confirm both the mlx-vlm
+    and vendored branches of the fallback actually IMPORT (not merely
+    comment about) their target modules."""
+    import ast
+
+    names: list[str] = []
+    for stmt in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(stmt, ast.ImportFrom) and stmt.module:
+            names.append(stmt.module)
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                names.append(alias.name)
+    return names
 
 
 def test_dev_extra_pins_tomli_for_python_310() -> None:
