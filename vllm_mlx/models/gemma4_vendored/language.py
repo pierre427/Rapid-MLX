@@ -69,11 +69,40 @@ class MLP(nn.Module):
         return self.down_proj(geglu(self.gate_proj(x), self.up_proj(x)))
 
 
+def _require_moe_fields(config) -> None:
+    """Validate MoE-required fields are set before Router/Experts init.
+    See ``Router`` docstring for rationale. Vendor-local: NOT present
+    in upstream mlx-vlm 0.6.3, added to close pr_validate codex round
+    2 finding on the fresh-install regression PR (#1017)."""
+    missing = [
+        f
+        for f in ("num_experts", "top_k_experts", "moe_intermediate_size")
+        if getattr(config, f, None) is None
+    ]
+    if missing:
+        raise ValueError(
+            f"Gemma 4 MoE block enabled but checkpoint config is missing "
+            f"required field(s): {missing}. Set them in the checkpoint's "
+            f"config.json (Gemma 4 26B-A4B ships them by default) or "
+            f"disable MoE via `enable_moe_block=false`."
+        )
+
+
 class Router(nn.Module):
-    """Expert router: norm -> scale -> project -> top-k -> renormalize."""
+    """Expert router: norm -> scale -> project -> top-k -> renormalize.
+
+    Vendor-local addition: ``_require_moe_fields(config)`` in
+    ``__init__`` guards against ``num_experts``, ``top_k_experts``,
+    and ``moe_intermediate_size`` being ``None`` (their PEP-484
+    default in ``TextConfig``). Any of these missing means the
+    checkpoint is misconfigured for MoE; a clear ``ValueError`` beats
+    an opaque ``TypeError`` from ``nn.Linear`` deep inside model
+    init. Only reached when ``enable_moe_block=True`` on the block.
+    """
 
     def __init__(self, config: TextConfig):
         super().__init__()
+        _require_moe_fields(config)
         self.config = config
         self.eps = config.rms_norm_eps
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)

@@ -384,16 +384,24 @@ def test_gemma4_text_prefers_vendored_fallback() -> None:
 
 
 def _handler_catches_import_error(handler) -> bool:
-    """Return True if ``handler`` catches ``ImportError`` (bare or in
-    a tuple, e.g. ``except (ImportError, ModuleNotFoundError):``).
-    Import errors don't ship other names; we only need to match
-    ``ImportError`` itself since ``ModuleNotFoundError`` is a
-    subclass."""
+    """Return True if ``handler`` catches ``ImportError`` **explicitly**
+    (bare ``ImportError`` or a tuple containing it, e.g.
+    ``except (ImportError, ModuleNotFoundError):``). ``ModuleNotFoundError``
+    is a subclass of ``ImportError`` so we only need to match the parent.
+
+    Codex round 2 NIT: an earlier version accepted a bare ``except:``.
+    That's too permissive — it would let a future refactor wrap the
+    upstream import in ``except: pass``, silently swallow non-import
+    bugs during model startup (e.g. ``RuntimeError`` from Metal
+    initialization), and still pass this L-07-B lock-in. Require the
+    handler type to be ``ImportError`` (or a tuple containing it) so
+    the fallback stays scoped to import failures only."""
     import ast
 
     exc_type = handler.type
     if exc_type is None:
-        return True  # bare ``except:`` catches everything, including ImportError
+        # Bare ``except:`` — rejected. See NIT above.
+        return False
     if isinstance(exc_type, ast.Name) and exc_type.id == "ImportError":
         return True
     if isinstance(exc_type, ast.Tuple):
