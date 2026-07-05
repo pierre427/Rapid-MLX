@@ -1,21 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for L-07 — ``rapid-mlx[vision]`` extra wiring.
+"""Regression tests for L-07 (``rapid-mlx[vision]`` extra wiring) and
+L-07-B (Gemma 4 fresh-install regression from 0.10.0).
 
-Pre-fix probe (Kai r2): a fresh-venv ``pip install rapid-mlx==0.8.0``
-did not pull ``mlx-vlm``, and hitting a VL route subsequently 500'd with
-``ModuleNotFoundError: No module named 'mlx_vlm'``. The expected workaround
-was an undocumented ``pip install 'mlx-vlm>=0.4.4'``.
+Pre-fix probe (Kai r2, 0.8.0): a fresh-venv ``pip install rapid-mlx==0.8.0``
+did not pull ``mlx-vlm``, and hitting a VL route 500'd with
+``ModuleNotFoundError: No module named 'mlx_vlm'``. Fix: declare
+``mlx-vlm`` under ``[project.optional-dependencies].vision`` (NOT core,
+to save ~322 MB for text-only users). README quickstart documents
+``pip install 'rapid-mlx[vision]'``.
 
-State at 0.8.0 release (``a56a39b``): ``mlx-vlm`` is intentionally NOT in
-core ``[project].dependencies`` (saves ~322 MB for text-only users) but
-IS declared under ``[project.optional-dependencies].vision``, alongside
-``opencv-python`` / ``torch`` / ``torchvision`` / ``pillow``. The
-README quickstart documents ``pip install 'rapid-mlx[vision]'``.
+0.10.0 regression (Layer A "+13 Gemma 4 aliases"): a fresh-venv
+``pip install rapid-mlx==0.10.0 && rapid-mlx serve gemma-4-12b-4bit``
+crashed the same way — Gemma 4 uses ``mlx_vlm.models.gemma4.language``
+because Google publishes it as a VLM-family checkpoint. The obvious
+fix — promoting ``mlx-vlm`` to core — would drag in ~+483 MB of
+transitive weight (opencv-python 120 MB, pyarrow 123 MB from datasets,
+pandas 70 MB, scipy 98 MB, mlx-audio 17 MB, ...) for text-only users
+who never touch Gemma 4. Instead we **vendor** the ~1200 lines of
+Gemma 4 text-only classes (config + language + rope_utils) into
+``vllm_mlx/models/gemma4_vendored/`` (+200 KB of repo, zero MB user
+install). ``vllm_mlx/models/gemma4_text.py`` prefers ``mlx-vlm`` when
+installed (so ``[vision]`` users get the shared code path) and falls
+back to the vendored copy otherwise.
 
-These tests parse ``pyproject.toml`` via ``tomllib`` and lock in the
-shape so a future refactor can't silently drop the extra (re-introducing
-the bare ``500 ModuleNotFoundError`` on the VL route — same failure
-shape as H-08's embeddings crash).
+These tests parse ``pyproject.toml`` via ``tomllib`` and lock in both
+contracts:
+
+  * ``[vision]`` still exists, still lists ``mlx-vlm`` (for Qwen-VL and
+    true VLM routes — image-input models still need mlx-vlm proper).
+  * ``mlx-vlm`` NEVER slips into core deps (the ~322 MB / ~483 MB anti-
+    bloat guard).
+  * Gemma 4 boots WITHOUT ``mlx-vlm`` — the vendored module tree exists
+    and ``gemma4_text.py`` carries the try/except fallback.
+
+A future refactor that silently drops any of these re-opens either the
+original L-07 (bare 500 on VL routes) or L-07-B (bare boot failure on
+Gemma 4 — same failure shape).
 """
 
 from __future__ import annotations
@@ -249,6 +269,78 @@ def test_pyproject_requires_python_floor_matches_tomllib_fallback() -> None:
     assert sys.version_info >= (3, 10), (
         f"Test runtime {sys.version_info[:2]} is below the project's "
         f"3.10 floor — the tomli fallback can't help here."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# L-07-B: Gemma 4 fresh-install regression from 0.10.0.
+#
+# Google publishes Gemma 4 as a VLM-family checkpoint whose Python
+# classes live in ``mlx_vlm.models.gemma4``. In 0.10.0 that dep was
+# only in ``[vision]``, so a fresh ``pip install rapid-mlx==0.10.0``
+# followed by ``rapid-mlx serve gemma-4-12b-4bit`` crashed at import.
+# The 0.10.1 fix is to vendor the ~1200 lines of Gemma 4 text-only
+# classes into ``vllm_mlx/models/gemma4_vendored/`` so the fresh
+# install works without any [vision] extra pulled.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_gemma4_vendored_module_exists() -> None:
+    """The vendored module tree must exist with the 3 upstream files
+    (config, language, rope_utils) plus the __init__.py that inlines
+    BaseModelConfig + LanguageModelOutput. Missing any one of these
+    means a fresh-venv boot re-crashes with
+    ``ImportError: mlx-vlm dependency missing`` — the exact 0.10.0
+    regression this vendor path was created to close."""
+    here = Path(__file__).resolve()
+    repo_root = None
+    for parent in [here.parent, *here.parents]:
+        if (parent / "pyproject.toml").is_file():
+            repo_root = parent
+            break
+    assert repo_root is not None, "pyproject.toml not found above test file"
+    vendored = repo_root / "vllm_mlx" / "models" / "gemma4_vendored"
+    assert vendored.is_dir(), (
+        f"gemma4_vendored/ missing at {vendored}. Without it, a fresh "
+        f"`pip install rapid-mlx && rapid-mlx serve gemma-4-12b-4bit` "
+        f"re-crashes with the 0.10.0 ImportError (L-07-B)."
+    )
+    for required in ("__init__.py", "config.py", "language.py", "rope_utils.py"):
+        path = vendored / required
+        assert path.is_file(), (
+            f"gemma4_vendored/{required} missing. All four files are "
+            f"needed to bypass mlx-vlm for Gemma 4 text-only inference."
+        )
+
+
+def test_gemma4_text_prefers_vendored_fallback() -> None:
+    """``vllm_mlx/models/gemma4_text.py`` must try mlx-vlm first, then
+    fall back to the vendored copy. A refactor that dropped the
+    fallback would silently re-introduce the 0.10.0 regression for any
+    fresh install without ``[vision]``. Detection is a source-level
+    scan for both the mlx-vlm import AND the vendored import; we don't
+    parse the AST because a plain substring check is enough to catch
+    accidental removal and stays robust against import-order tweaks."""
+    here = Path(__file__).resolve()
+    repo_root = None
+    for parent in [here.parent, *here.parents]:
+        if (parent / "pyproject.toml").is_file():
+            repo_root = parent
+            break
+    assert repo_root is not None, "pyproject.toml not found above test file"
+    gemma4_text = repo_root / "vllm_mlx" / "models" / "gemma4_text.py"
+    assert gemma4_text.is_file(), f"gemma4_text.py missing at {gemma4_text}"
+    src = gemma4_text.read_text(encoding="utf-8")
+    assert "mlx_vlm.models.gemma4" in src, (
+        "gemma4_text.py no longer imports from mlx_vlm.models.gemma4. "
+        "The mlx-vlm-first path is intentional: [vision] users share "
+        "one Gemma 4 code path with the rest of the mlx-vlm ecosystem."
+    )
+    assert "gemma4_vendored" in src, (
+        "gemma4_text.py no longer references the vendored fallback. "
+        "Without it, a fresh `pip install rapid-mlx && rapid-mlx serve "
+        "gemma-4-12b-4bit` re-crashes with the 0.10.0 ImportError "
+        "(L-07-B). Restore the try/except fallback."
     )
 
 
