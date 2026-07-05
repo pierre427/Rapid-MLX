@@ -242,6 +242,8 @@ def load_gemma4_text(model_path: str | Path, tokenizer_config: dict = None):
     except ImportError:
         from vllm_mlx.models.gemma4_vendored import (
             config as _v_cfg,
+        )
+        from vllm_mlx.models.gemma4_vendored import (
             language as _v_lang,
         )
 
