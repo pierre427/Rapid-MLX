@@ -360,12 +360,8 @@ def test_gemma4_vendored_modules_importable_without_mlx_vlm() -> None:
     try:
         # Fresh import of the vendored modules — must succeed with
         # NO mlx_vlm on the import path.
-        cfg_mod = importlib.import_module(
-            "vllm_mlx.models.gemma4_vendored.config"
-        )
-        lang_mod = importlib.import_module(
-            "vllm_mlx.models.gemma4_vendored.language"
-        )
+        cfg_mod = importlib.import_module("vllm_mlx.models.gemma4_vendored.config")
+        lang_mod = importlib.import_module("vllm_mlx.models.gemma4_vendored.language")
         TextConfig = cfg_mod.TextConfig
         LanguageModel = lang_mod.LanguageModel
 
@@ -505,8 +501,7 @@ def _handler_catches_import_error(handler) -> bool:
         return True
     if isinstance(exc_type, ast.Tuple):
         return any(
-            isinstance(el, ast.Name) and el.id == "ImportError"
-            for el in exc_type.elts
+            isinstance(el, ast.Name) and el.id == "ImportError" for el in exc_type.elts
         )
     return False
 
