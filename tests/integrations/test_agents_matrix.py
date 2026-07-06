@@ -50,6 +50,7 @@ from tests.integrations.conftest import (
     assert_no_analysis_channel_leak,
     assert_no_think_tag_leak,
     assert_tool_call_shape,
+    strict_skip_or_fail,
 )
 
 # --------------------------------------------------------------------------- #
@@ -108,14 +109,13 @@ def _run_openai_tool_smoke(
             temperature=0.0,
             max_tokens=384,
         )
-    except (BadRequestError, NotFoundError) as exc:
-        pytest.skip(
+    except (BadRequestError, NotFoundError, APIStatusError) as exc:
+        # Codex #1030 finding 3: server rejecting a tool-call request is a
+        # regression, not a degraded-cell condition. In strict mode we fail
+        # the cell so CI can catch the wire break; non-strict skips so a
+        # local dev on a still-booting server doesn't get spurious reds.
+        strict_skip_or_fail(
             f"{agent_label}/{family_alias.family}: server rejected tool request "
-            f"on {model_id!r}: {exc}"
-        )
-    except APIStatusError as exc:
-        pytest.skip(
-            f"{agent_label}/{family_alias.family}: server status error "
             f"on {model_id!r}: {exc}"
         )
 
@@ -186,11 +186,17 @@ class TestCodexCLI:
         try:
             r = httpx.post(f"{base_url}/responses", json=payload, timeout=90)
         except httpx.HTTPError as exc:
+            # Transport-layer failure is inconclusive (network hiccup, server
+            # tearing down mid-test) — always skip, never fail.
             pytest.skip(f"codex-cli smoke: transport error {exc!r}")
         if r.status_code in (404, 405):
+            # Route intentionally not wired (older server without codex shim).
             pytest.skip("codex-cli smoke: /v1/responses not enabled on this server")
         if r.status_code >= 400:
-            pytest.skip(
+            # Codex #1030 finding 2: a 4xx / 5xx from a wired route IS a
+            # regression. Strict CI must fail so the codex-shape SSE break
+            # can't hide behind a skipped cell.
+            strict_skip_or_fail(
                 f"codex-cli/{family_alias.family}: server returned {r.status_code} "
                 f"({r.text[:200]!r})"
             )
@@ -227,14 +233,16 @@ class TestClaudeCode:
                 messages=[{"role": "user", "content": "Reply with just SHIPPED."}],
             )
         except NotFoundError:
-            # /v1/messages not exposed on the running server — mock or older
-            # build. Cell is degraded, not red.
+            # /v1/messages intentionally not exposed on the running server
+            # (mock or older build) — always skip, never fail.
             pytest.skip(
                 f"claude-code/{family_alias.family}: /v1/messages returned 404 "
                 f"on {rapid_mlx_server['base_url']}"
             )
         except (BadRequestError, APIStatusError) as exc:
-            pytest.skip(
+            # Codex #1030 finding 2: a wired-but-broken /v1/messages IS a
+            # regression. Strict CI fails; local dev skips.
+            strict_skip_or_fail(
                 f"claude-code/{family_alias.family}: server rejected request: {exc}"
             )
 
@@ -305,7 +313,9 @@ class TestOpenHands:
                 max_tokens=64,
             )
         except (BadRequestError, NotFoundError, APIStatusError) as exc:
-            pytest.skip(
+            # Codex #1030 finding 3: strict CI treats a server rejection as a
+            # regression on the plain-wire path used by OpenHands / LiteLLM.
+            strict_skip_or_fail(
                 f"openhands/{family_alias.family}: server rejected request: {exc}"
             )
         content = resp.choices[0].message.content or ""
@@ -358,7 +368,11 @@ class TestAider:
                 max_tokens=64,
             )
         except (BadRequestError, NotFoundError, APIStatusError) as exc:
-            pytest.skip(f"aider/{family_alias.family}: server rejected request: {exc}")
+            # Codex #1030 finding 3: strict CI treats a rejection on the same
+            # OpenAI-wire path Aider uses as a regression.
+            strict_skip_or_fail(
+                f"aider/{family_alias.family}: server rejected request: {exc}"
+            )
         content = resp.choices[0].message.content or ""
         assert_content_nonempty(content, ctx=f"aider/{family_alias.family}")
         assert_no_think_tag_leak(content)

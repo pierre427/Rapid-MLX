@@ -26,6 +26,7 @@ from tests.integrations.conftest import (
     assert_no_analysis_channel_leak,
     assert_no_think_tag_leak,
     assert_tool_call_shape,
+    strict_skip_or_fail,
 )
 
 # --------------------------------------------------------------------------- #
@@ -65,7 +66,12 @@ class TestLangChain:
         try:
             r = llm.invoke([HumanMessage(content="Reply with just OK.")])
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"langchain/{family_alias.family}: plain invoke failed: {exc}")
+            # Codex #1030 finding 4: a wired-server failure on the same
+            # /v1/chat/completions path LangChain drives is a regression.
+            # Strict CI fails; local dev skips.
+            strict_skip_or_fail(
+                f"langchain/{family_alias.family}: plain invoke failed: {exc}"
+            )
         content = r.content or ""
         assert_content_nonempty(content, ctx=f"langchain/{family_alias.family}")
         assert_no_think_tag_leak(content)
@@ -83,7 +89,11 @@ class TestLangChain:
                 [HumanMessage(content="What's the weather in Tokyo? Use the tool.")]
             )
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"langchain/{family_alias.family}: tool invoke failed: {exc}")
+            # Codex #1030 finding 4: strict CI must fail on a real bind_tools
+            # regression — one of the two most common LangChain agent paths.
+            strict_skip_or_fail(
+                f"langchain/{family_alias.family}: tool invoke failed: {exc}"
+            )
         tool_calls = getattr(r, "tool_calls", None) or []
         if not tool_calls:
             pytest.skip(
@@ -136,7 +146,11 @@ class TestPydanticAI:
         try:
             result = agent.run_sync("Reply with just OK.")
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"pydantic-ai/{family_alias.family}: run_sync failed: {exc}")
+            # Codex #1030 finding 4: strict CI must fail on a real regression
+            # in the PydanticAI run_sync path.
+            strict_skip_or_fail(
+                f"pydantic-ai/{family_alias.family}: run_sync failed: {exc}"
+            )
         content = (result.output or "").strip()
         assert_content_nonempty(content, ctx=f"pydantic-ai/{family_alias.family}")
         assert_no_think_tag_leak(content)
@@ -172,7 +186,9 @@ class TestSmolagents:
         try:
             answer = agent.run("Reply with just OK.")
         except Exception as exc:  # noqa: BLE001
-            pytest.skip(f"smolagents/{family_alias.family}: run failed: {exc}")
+            # Codex #1030 finding 4: strict CI must fail on a real regression
+            # in the smolagents agent-run path.
+            strict_skip_or_fail(f"smolagents/{family_alias.family}: run failed: {exc}")
         content = str(answer)
         assert_content_nonempty(content, ctx=f"smolagents/{family_alias.family}")
         assert_no_think_tag_leak(content)

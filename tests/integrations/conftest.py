@@ -110,6 +110,31 @@ def _strict() -> bool:
     return os.environ.get("RAPID_MLX_MATRIX_STRICT", "").strip() == "1"
 
 
+def matrix_strict_mode() -> bool:
+    """Public accessor for ``RAPID_MLX_MATRIX_STRICT``.
+
+    Cells use this to decide whether to skip on a server / route / SDK
+    failure (default, non-strict) or fail the CI job (strict). CI shards
+    that want per-cell coverage enforcement set ``RAPID_MLX_MATRIX_STRICT=1``
+    before running the matrix.
+    """
+    return _strict()
+
+
+def strict_skip_or_fail(reason: str) -> None:
+    """Skip in non-strict mode; fail in strict mode.
+
+    Consolidates the "cell degraded, not red" pattern so a broken
+    server-side route or a regressed SDK doesn't quietly hide behind a
+    green skipped cell when the operator asked for enforcement via
+    ``RAPID_MLX_MATRIX_STRICT=1``. Codex #1030 flagged the earlier all-skip
+    pattern as regression-hiding.
+    """
+    if _strict():
+        pytest.fail(reason)
+    pytest.skip(reason)
+
+
 # --------------------------------------------------------------------------- #
 # Server fixture
 # --------------------------------------------------------------------------- #
@@ -196,6 +221,48 @@ def family_alias_for_active_server(
     return None
 
 
+@pytest.fixture(autouse=True)
+def _guard_family_matches_server(
+    request: pytest.FixtureRequest,
+    rapid_mlx_server: dict[str, Any],
+    family_alias_for_active_server: FamilyAlias | None,
+) -> None:
+    """Autouse guard: skip / fail a family cell when the server model doesn't match.
+
+    Codex #1030 flagged that parametrizing every cell over all three
+    families lets a single-family server (e.g. Qwen 3.6 only) silently
+    "cover" Gemma 4 / gpt-oss cells. This guard fires per cell:
+
+    * cell fixture requests ``family_alias`` — the parametrized target;
+    * ``family_alias_for_active_server`` maps the running model → family;
+    * mismatch → ``strict_skip_or_fail`` (fail in strict, skip otherwise).
+
+    Cells that DON'T request ``family_alias`` (there are none right now
+    but future cells might do plain wire-level tests) are exempt.
+    """
+    if "family_alias" not in request.fixturenames:
+        return
+    try:
+        cell_family: FamilyAlias = request.getfixturevalue("family_alias")
+    except pytest.FixtureLookupError:
+        return
+    active = family_alias_for_active_server
+    if active is None:
+        strict_skip_or_fail(
+            f"cell {cell_family.family}: running model "
+            f"{rapid_mlx_server['model_id']!r} doesn't map to any known family "
+            f"(qwen36 / gemma4 / gptoss)."
+        )
+        return
+    if active.family != cell_family.family:
+        strict_skip_or_fail(
+            f"cell {cell_family.family}: running server is {active.family} "
+            f"({rapid_mlx_server['model_id']!r}) — coverage for {cell_family.family} "
+            f"belongs in a separate matrix run "
+            f"(RAPID_MLX_AGENT_MATRIX_FAMILY={cell_family.family})."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Assertion helpers — shared across both matrices
 # --------------------------------------------------------------------------- #
@@ -270,4 +337,6 @@ __all__ = [
     "assert_no_think_tag_leak",
     "assert_stream_deltas_valid",
     "assert_tool_call_shape",
+    "matrix_strict_mode",
+    "strict_skip_or_fail",
 ]
