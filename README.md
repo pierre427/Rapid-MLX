@@ -210,8 +210,8 @@ Tunnels your local server through `rapidserver.quicksilverpro.io` over a WebSock
 
 Three tiers of integration are shipped:
 
-1. **Tier-1 Agent Backends** (8) — every one has a `rapid-mlx agents <name> --setup` config template *and* a real integration test that boots the server + real model + real client flow. This is "verified", not "should work".
-2. **Tier-1 Frameworks** (3) — Python libraries that speak `/v1/chat/completions`. Same integration-test bar as agents.
+1. **Tier-1 Agent Backends** (8) — every one has a `rapid-mlx agents <name> --setup` config template *and* an integration test that boots the server + real model and drives the same wire the agent drives. For clarity: **Claude Code** and **Hermes Agent** get real-client SDK smoke (Anthropic SDK, dedicated `test_hermes.py`); **Aider** gets a shell-harness smoke (`test_aider.sh`); **Codex CLI** gets a raw `/v1/responses` route smoke; **OpenCode / Qwen Code / OpenHands / Kilo Code** get **wire-level smoke** via the Python OpenAI SDK against the identical `/v1/chat/completions` route their real binary hits — proving the route + tool schema + envelope, not the vendor binary itself. This is "wire-verified for every agent, client-verified where the client is drivable in-process".
+2. **Tier-1 Frameworks** (3) — Python libraries that speak `/v1/chat/completions`. Same wire-verified bar as agents, driven through the real framework packages.
 3. **Compatible** (community-verified) — UIs / IDE extensions / older tools that plug in via the OpenAI-compatible URL. No per-model matrix here; if you use one that isn't listed, it almost certainly still works.
 
 ### Tier-1 Agent Backends

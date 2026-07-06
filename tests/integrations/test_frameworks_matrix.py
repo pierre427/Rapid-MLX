@@ -96,10 +96,16 @@ class TestLangChain:
             )
         tool_calls = getattr(r, "tool_calls", None) or []
         if not tool_calls:
-            pytest.skip(
-                f"langchain/{family_alias.family}: model declined tool. "
-                f"Wire is clean; cell degraded, not red."
+            # Codex #1030 round-2 finding 2: strict CI must catch the case
+            # where LangChain's bind_tools path stops surfacing tool_calls —
+            # that's exactly the regression a Tier-1 framework matrix cell
+            # is meant to gate. Local dev on a small model still skips.
+            strict_skip_or_fail(
+                f"langchain/{family_alias.family}: model returned no tool_calls "
+                f"on bind_tools path — strict CI treats this as a wire "
+                f"regression on the LangChain tool route."
             )
+            return  # unreachable in strict; explicit for local runs
         tc = tool_calls[0]
         # LangChain returns tool_calls as dicts with name/args/id.
         tc_dict = {

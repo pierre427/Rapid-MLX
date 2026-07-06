@@ -129,10 +129,16 @@ def _run_openai_tool_smoke(
         assert_content_nonempty(content, ctx=f"{agent_label}/{family_alias.family}")
         assert_no_think_tag_leak(content)
         assert_no_analysis_channel_leak(content)
-        pytest.skip(
-            f"{agent_label}/{family_alias.family}: {model_id} declined the "
-            f"tool ({content[:100]!r}); wire is clean — cell is degraded, not red."
+        # Codex #1030 round-2 finding 1: an empty tool_calls slot on a Tier-1
+        # agent cell is a real regression signal in CI (server may have
+        # dropped tool-call plumbing) — strict mode fails; local dev on a
+        # small alias still skips.
+        strict_skip_or_fail(
+            f"{agent_label}/{family_alias.family}: {model_id} returned no "
+            f"tool_calls (content={content[:100]!r}); strict CI treats this "
+            f"as a wire regression on the tool-call path."
         )
+        return  # unreachable in strict; explicit for clarity in local runs
 
     tc = tool_calls[0]
     # openai SDK returns a Pydantic model — normalize to dict for the helper.
@@ -190,8 +196,14 @@ class TestCodexCLI:
             # tearing down mid-test) — always skip, never fail.
             pytest.skip(f"codex-cli smoke: transport error {exc!r}")
         if r.status_code in (404, 405):
-            # Route intentionally not wired (older server without codex shim).
-            pytest.skip("codex-cli smoke: /v1/responses not enabled on this server")
+            # Codex #1030 round-2 finding 3: RAPID_MLX_MATRIX_STRICT=1 is meant
+            # to gate exactly this — the /v1/responses route MUST be wired for
+            # Codex CLI Tier-1 support. Strict CI fails; local dev on an older
+            # server without the shim skips.
+            strict_skip_or_fail(
+                f"codex-cli/{family_alias.family}: /v1/responses returned "
+                f"{r.status_code} — route not wired on this server."
+            )
         if r.status_code >= 400:
             # Codex #1030 finding 2: a 4xx / 5xx from a wired route IS a
             # regression. Strict CI must fail so the codex-shape SSE break
@@ -233,11 +245,13 @@ class TestClaudeCode:
                 messages=[{"role": "user", "content": "Reply with just SHIPPED."}],
             )
         except NotFoundError:
-            # /v1/messages intentionally not exposed on the running server
-            # (mock or older build) — always skip, never fail.
-            pytest.skip(
+            # Codex #1030 round-2 finding 4: strict CI must fail when the
+            # Anthropic /v1/messages route is missing — that's exactly the
+            # regression the Claude Code Tier-1 matrix cell is here to catch.
+            # Local dev on a mock or older server still skips.
+            strict_skip_or_fail(
                 f"claude-code/{family_alias.family}: /v1/messages returned 404 "
-                f"on {rapid_mlx_server['base_url']}"
+                f"on {rapid_mlx_server['base_url']} — Anthropic route not wired."
             )
         except (BadRequestError, APIStatusError) as exc:
             # Codex #1030 finding 2: a wired-but-broken /v1/messages IS a
