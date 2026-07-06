@@ -192,9 +192,15 @@ class TestCodexCLI:
         try:
             r = httpx.post(f"{base_url}/responses", json=payload, timeout=90)
         except httpx.HTTPError as exc:
-            # Transport-layer failure is inconclusive (network hiccup, server
-            # tearing down mid-test) — always skip, never fail.
-            pytest.skip(f"codex-cli smoke: transport error {exc!r}")
+            # Codex #1030 round-3 finding 1: a transport failure to a wired
+            # server AFTER the session-scope /v1/models probe succeeded is a
+            # regression signal in strict CI (the server tore down mid-test
+            # or the codex-shape route was pulled). Strict fails; local dev
+            # on a flaky loopback still skips.
+            strict_skip_or_fail(
+                f"codex-cli/{family_alias.family}: transport error hitting "
+                f"/v1/responses after session probe was healthy: {exc!r}"
+            )
         if r.status_code in (404, 405):
             # Codex #1030 round-2 finding 3: RAPID_MLX_MATRIX_STRICT=1 is meant
             # to gate exactly this — the /v1/responses route MUST be wired for

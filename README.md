@@ -216,7 +216,7 @@ Three tiers of integration are shipped:
 
 ### Tier-1 Agent Backends
 
-Auto-setup with `rapid-mlx agents <name> --setup`. Each row's **Integration test** column links a cell in the 24-cell agent matrix (`tests/integrations/test_agents_matrix.py`) or the dedicated deep-flow file.
+Most rows auto-setup with `rapid-mlx agents <name> --setup`. Claude Code is a one-liner env-var config against the vendor CLI (no `claude-code` profile in this repo — the setup column shows the exact env-var). Each row's **Integration test** column links a cell in the 24-cell agent matrix (`tests/integrations/test_agents_matrix.py`) or the dedicated deep-flow file.
 
 | Agent | Category | Wire | Setup | Integration test |
 |---|---|---|---|---|

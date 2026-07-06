@@ -169,7 +169,14 @@ class TestPydanticAI:
 
 
 class TestSmolagents:
-    """smolagents — ToolCallingAgent quick smoke."""
+    """smolagents — ToolCallingAgent with a real tool.
+
+    Codex #1030 round-3 finding 2: an empty ``tools=[]`` ToolCallingAgent
+    doesn't actually exercise the tool-calling path the docstring claims
+    to smoke. A ``final_answer`` tool + a math helper give the agent a
+    real routing decision — a wire regression on the smolagents tool
+    format now surfaces as a hard red instead of a silent "plain reply".
+    """
 
     def test_smoke(
         self,
@@ -177,23 +184,35 @@ class TestSmolagents:
         family_alias: FamilyAlias,
     ) -> None:
         try:
-            from smolagents import OpenAIServerModel, ToolCallingAgent
+            from smolagents import OpenAIServerModel, Tool, ToolCallingAgent
         except ImportError:
             pytest.skip("smolagents not installed — cell deferred")
+
+        class GetWeatherTool(Tool):
+            name = "get_weather"
+            description = "Get the weather for a city."
+            inputs = {
+                "city": {
+                    "type": "string",
+                    "description": "City name.",
+                }
+            }
+            output_type = "string"
+
+            def forward(self, city: str) -> str:  # type: ignore[override]
+                return f"sunny in {city}"
 
         model = OpenAIServerModel(
             model_id=rapid_mlx_server["model_id"],
             api_base=rapid_mlx_server["base_url"],
             api_key="not-needed",
         )
-        # ToolCallingAgent with no tools = plain reply agent — proves the
-        # wire without adding tool-choice sensitivity noise on small models.
-        agent = ToolCallingAgent(tools=[], model=model, max_steps=1)
+        agent = ToolCallingAgent(tools=[GetWeatherTool()], model=model, max_steps=3)
         try:
-            answer = agent.run("Reply with just OK.")
+            answer = agent.run("What's the weather in Tokyo? Use the tool.")
         except Exception as exc:  # noqa: BLE001
-            # Codex #1030 finding 4: strict CI must fail on a real regression
-            # in the smolagents agent-run path.
+            # Strict CI must fail on a real regression in the smolagents
+            # tool-routing path — this is the whole point of a framework cell.
             strict_skip_or_fail(f"smolagents/{family_alias.family}: run failed: {exc}")
         content = str(answer)
         assert_content_nonempty(content, ctx=f"smolagents/{family_alias.family}")
