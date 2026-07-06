@@ -7695,6 +7695,33 @@ Examples:
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (e.g. mlx-community/SmolLM3-3B-4bit)",
     ).completer = alias_completer
 
+    # Jlens command — read a model's internal "draft" with the Jacobian lens
+    jlens_parser = subparsers.add_parser(
+        "jlens",
+        help="Read a model's internal thoughts across layers (Jacobian lens)",
+    )
+    jlens_parser.add_argument(
+        "prompt",
+        help='Prompt to trace, e.g. "why is the sky blue"',
+    )
+    jlens_parser.add_argument(
+        "--model",
+        "-m",
+        default="qwen3-1.7b",
+        help="Model alias or HF repo to inspect (default: qwen3-1.7b)",
+    ).completer = alias_completer
+    jlens_parser.add_argument(
+        "--step",
+        type=int,
+        default=2,
+        help="Probe every Nth layer (default: 2; use 1 for full-resolution)",
+    )
+    jlens_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the rendered view",
+    )
+
     # Agents command
     agents_parser = subparsers.add_parser(
         "agents", help="List, configure, and test agent integrations"
@@ -8199,6 +8226,10 @@ Examples:
         chat_command(args)
     elif args.command == "info":
         info_command(args)
+    elif args.command == "jlens":
+        from vllm_mlx.jlens import jlens_command
+
+        jlens_command(args)
     elif args.command == "agents":
         agents_command(args)
     elif args.command == "doctor":
