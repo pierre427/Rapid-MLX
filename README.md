@@ -224,9 +224,9 @@ Most rows auto-setup with `rapid-mlx agents <name> --setup`. Claude Code is a on
 | [Claude Code](https://www.anthropic.com/claude-code) | CLI | `/v1/messages` | `ANTHROPIC_BASE_URL=http://localhost:8000 claude` | [test_anthropic_sdk.py](tests/integrations/test_anthropic_sdk.py) · [matrix cell](tests/integrations/test_agents_matrix.py) |
 | [OpenCode](https://github.com/sst/opencode) | TUI | `/v1/chat/completions` | `rapid-mlx agents opencode --setup` | [test_agents_matrix.py::TestOpenCode](tests/integrations/test_agents_matrix.py) |
 | [Qwen Code](https://github.com/QwenLM/qwen-code) | CLI | `/v1/chat/completions` | `rapid-mlx agents qwen-code --setup` | [test_agents_matrix.py::TestQwenCode](tests/integrations/test_agents_matrix.py) |
-| [OpenHands](https://github.com/All-Hands-AI/OpenHands) | Sandbox | `/v1/chat/completions` | `rapid-mlx agents openhands --setup` | [test_agents_matrix.py::TestOpenHands](tests/integrations/test_agents_matrix.py) |
+| [OpenHands](https://github.com/All-Hands-AI/OpenHands) | Sandbox | `/v1/chat/completions` | `rapid-mlx agents openhands --setup` | [test_agents_matrix.py::TestOpenHands](tests/integrations/test_agents_matrix.py) (wire smoke — Docker E2E deferred to 0.10.6 Phase 4) |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Agent | `/v1/chat/completions` | `rapid-mlx agents hermes --setup` | [test_hermes.py](tests/integrations/test_hermes.py) · [matrix cell](tests/integrations/test_agents_matrix.py) |
-| [Aider](https://aider.chat) | CLI | `/v1/chat/completions` | `rapid-mlx agents aider --setup` | [test_aider.sh](tests/integrations/test_aider.sh) · [matrix cell](tests/integrations/test_agents_matrix.py) |
+| [Aider](https://aider.chat) | CLI | `/v1/chat/completions` | `rapid-mlx agents aider --setup` | [test_aider.sh](tests/integrations/test_aider.sh) (real CLI edit-and-write) · [matrix cell](tests/integrations/test_agents_matrix.py) (wire smoke only) |
 | [Kilo Code](https://github.com/Kilo-Org/kilocode) | IDE + CLI | `/v1/chat/completions` | `rapid-mlx agents kilo-code --setup` | [test_agents_matrix.py::TestKiloCode](tests/integrations/test_agents_matrix.py) |
 
 ### Tier-1 Frameworks

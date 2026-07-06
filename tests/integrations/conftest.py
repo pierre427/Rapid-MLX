@@ -222,11 +222,7 @@ def family_alias_for_active_server(
 
 
 @pytest.fixture(autouse=True)
-def _guard_family_matches_server(
-    request: pytest.FixtureRequest,
-    rapid_mlx_server: dict[str, Any],
-    family_alias_for_active_server: FamilyAlias | None,
-) -> None:
+def _guard_family_matches_server(request: pytest.FixtureRequest) -> None:
     """Autouse guard: skip / fail a family cell when the server model doesn't match.
 
     Codex #1030 flagged that parametrizing every cell over all three
@@ -237,8 +233,12 @@ def _guard_family_matches_server(
     * ``family_alias_for_active_server`` maps the running model → family;
     * mismatch → ``strict_skip_or_fail`` (fail in strict, skip otherwise).
 
-    Cells that DON'T request ``family_alias`` (there are none right now
-    but future cells might do plain wire-level tests) are exempt.
+    Codex #1030 round-4 finding 1: ``rapid_mlx_server`` and
+    ``family_alias_for_active_server`` are fetched **lazily** — only when
+    a cell has actually opted in by requesting ``family_alias``. Fetching
+    them unconditionally would force every existing deep-flow test in
+    ``tests/integrations/`` through the /v1/models probe, changing their
+    behavior. The lazy fetch keeps this fixture scoped to matrix cells.
     """
     if "family_alias" not in request.fixturenames:
         return
@@ -246,18 +246,22 @@ def _guard_family_matches_server(
         cell_family: FamilyAlias = request.getfixturevalue("family_alias")
     except pytest.FixtureLookupError:
         return
-    active = family_alias_for_active_server
+    # Lazy fetch — only after we know this cell opted into the family matrix.
+    server_info: dict[str, Any] = request.getfixturevalue("rapid_mlx_server")
+    active: FamilyAlias | None = request.getfixturevalue(
+        "family_alias_for_active_server"
+    )
     if active is None:
         strict_skip_or_fail(
             f"cell {cell_family.family}: running model "
-            f"{rapid_mlx_server['model_id']!r} doesn't map to any known family "
+            f"{server_info['model_id']!r} doesn't map to any known family "
             f"(qwen36 / gemma4 / gptoss)."
         )
         return
     if active.family != cell_family.family:
         strict_skip_or_fail(
             f"cell {cell_family.family}: running server is {active.family} "
-            f"({rapid_mlx_server['model_id']!r}) — coverage for {cell_family.family} "
+            f"({server_info['model_id']!r}) — coverage for {cell_family.family} "
             f"belongs in a separate matrix run "
             f"(RAPID_MLX_AGENT_MATRIX_FAMILY={cell_family.family})."
         )

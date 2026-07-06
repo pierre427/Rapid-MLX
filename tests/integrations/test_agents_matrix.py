@@ -306,7 +306,15 @@ class TestQwenCode:
 
 
 class TestOpenHands:
-    """OpenHands /v1/chat/completions (text action format, no FC assertion)."""
+    """OpenHands **wire smoke only** — does NOT drive the real OpenHands binary.
+
+    Codex #1030 round-4 finding 3 tightening: this cell is explicitly not
+    an OpenHands integration test — it only probes the same
+    ``/v1/chat/completions`` route the LiteLLM shim inside OpenHands
+    would eventually hit. The deep E2E harness requires Docker and is
+    deferred to 0.10.6 Phase 4. Kept in the matrix so a regression on
+    the plain wire surfaces before the deep harness has a chance to run.
+    """
 
     def test_smoke(
         self,
@@ -358,12 +366,14 @@ class TestHermesAgent:
 
 
 class TestAider:
-    """Aider — CLI-only; deep flow in ``test_aider.sh``.
+    """Aider **wire smoke only** — does NOT invoke Aider or its edit format.
 
-    Aider does NOT use function calling — it uses text edit formats.
-    The matrix cell here proves the OpenAI wire is healthy enough that
-    Aider's ``ChatOpenAI``-shape client would connect; the actual
-    edit-format smoke lives in ``test_aider.sh`` (bash harness).
+    Codex #1030 round-4 finding 4 tightening: the real Aider integration
+    lives in ``test_aider.sh`` (bash harness that drives the ``aider``
+    CLI end-to-end through edit-and-write). This matrix cell only proves
+    the shared OpenAI-compat wire Aider's ``ChatOpenAI`` client would
+    connect through is healthy — Aider's edit format, prompt caching,
+    and CLI behavior are exercised in the shell harness only.
     """
 
     def test_smoke(

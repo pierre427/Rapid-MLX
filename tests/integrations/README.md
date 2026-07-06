@@ -27,12 +27,12 @@ client flow, not just a YAML profile. See `workflow.md` W3 taxonomy §B.3.
 |---|---|---|---|
 | codex-cli | `/v1/responses` | `TestCodexCLI` | (matrix only) |
 | claude-code | `/v1/messages` | `TestClaudeCode` | `test_anthropic_sdk.py` |
-| opencode | `/v1/chat/completions` | `TestOpenCode` | (matrix only) |
-| qwen-code | `/v1/chat/completions` | `TestQwenCode` | (matrix only) |
-| openhands | `/v1/chat/completions` | `TestOpenHands` | (Docker E2E deferred to 0.10.6) |
-| hermes-agent | `/v1/chat/completions` | `TestHermesAgent` | `test_hermes.py` |
-| aider | `/v1/chat/completions` | `TestAider` | `test_aider.sh` |
-| kilo-code | `/v1/chat/completions` | `TestKiloCode` | (matrix only) |
+| opencode | `/v1/chat/completions` | `TestOpenCode` (wire smoke via OpenAI SDK) | (matrix only) |
+| qwen-code | `/v1/chat/completions` | `TestQwenCode` (wire smoke via OpenAI SDK) | (matrix only) |
+| openhands | `/v1/chat/completions` | `TestOpenHands` (**wire smoke only** — does not exercise the real OpenHands binary / LiteLLM shim) | (Docker E2E deferred to 0.10.6 Phase 4) |
+| hermes-agent | `/v1/chat/completions` | `TestHermesAgent` (wire smoke via OpenAI SDK) | `test_hermes.py` (real 62-tool E2E) |
+| aider | `/v1/chat/completions` | `TestAider` (**wire smoke only** — does not exercise Aider's edit format or CLI) | `test_aider.sh` (real CLI edit-and-write) |
+| kilo-code | `/v1/chat/completions` | `TestKiloCode` (wire smoke via OpenAI SDK) | (matrix only) |
 
 ### Tier-1 frameworks
 
@@ -51,19 +51,28 @@ rapid-mlx serve qwen3.5-4b-4bit \
     --tool-call-parser hermes --enable-auto-tool-choice
 ```
 
-Then run either matrix or a specific deep file:
+Then run either matrix or a specific deep file. **Strict mode requires
+one family shard per booted server** — the ``_guard_family_matches_server``
+autouse fixture in ``conftest.py`` fails cells that ask for a family the
+running server doesn't serve. In practice this means: pick the family
+that matches your ``rapid-mlx serve`` alias and shard the other two into
+separate server boots (or CI jobs).
 
 ```bash
-# 24-cell agent matrix (all three families sequentially)
+# All 24 agent cells; only the family matching the running server passes,
+# the other two skip (non-strict) or fail (strict). Use for local sanity;
+# for CI, prefer per-family shards below.
 pytest tests/integrations/test_agents_matrix.py -v
 
-# 9-cell framework matrix
+# 9-cell framework matrix (same shard rule as above)
 pytest tests/integrations/test_frameworks_matrix.py -v
 
-# Restrict to one family (CI shard)
-RAPID_MLX_AGENT_MATRIX_FAMILY=qwen36 pytest tests/integrations/test_agents_matrix.py
+# Strict CI — per-family shard (this is the intended workflow: three
+# CI jobs, one per family, each with its own booted server).
+RAPID_MLX_MATRIX_STRICT=1 RAPID_MLX_AGENT_MATRIX_FAMILY=qwen36 \
+    pytest tests/integrations/test_agents_matrix.py
 
-# One agent's cells across all families
+# One agent's cells across all families (still shard-restricted)
 pytest tests/integrations/test_agents_matrix.py -k QwenCode
 
 # Deep flows (Python)

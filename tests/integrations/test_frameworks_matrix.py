@@ -16,6 +16,7 @@ to be re-run for every family.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -113,7 +114,7 @@ class TestLangChain:
             "type": "function",
             "function": {
                 "name": tc["name"],
-                "arguments": __import__("json").dumps(tc["args"]),
+                "arguments": json.dumps(tc["args"]),
             },
         }
         assert_tool_call_shape(tc_dict)
