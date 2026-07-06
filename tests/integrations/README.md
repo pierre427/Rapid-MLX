@@ -156,31 +156,35 @@ Populated as tests land. Empty (🔲) cells will be filled by the 0.10.6 Phase
 
 ### Agent × Family matrix (11 × 4 = 44)
 
-Pilot execution: Qwen 3.6 column populated by this PR; Gemma 4 /
-DeepSeek V4 / gpt-oss columns deferred to sibling PRs (PR-2c-1 /
-PR-2c-2 / PR-2c-3).
+Pilot execution 2026-07-06 · `mlx-community/Qwen3.6-35B-A3B-8bit`
+running on `127.0.0.1:8802` (auto-detect `qwen3_coder_xml` tool-call
+parser, `qwen3` reasoning parser). Whole matrix ran in **10.81 s**
+against the 35 B-total / 3 B-active MoE checkpoint under
+`RAPID_MLX_MATRIX_STRICT=1`. Gemma 4 / DeepSeek V4 / gpt-oss columns
+deferred to sibling PRs (PR-2c-1 / PR-2c-2 / PR-2c-3) — see PR body
+for cache-retention plan.
 
 | Agent | Qwen 3.6 | Gemma 4 | DeepSeek V4 | gpt-oss |
 |---|---|---|---|---|
-| codex-cli | 🔲 | 🔲 | 🔲 | 🔲 |
-| claude-code | 🔲 | 🔲 | 🔲 | 🔲 |
-| opencode | 🔲 | 🔲 | 🔲 | 🔲 |
-| qwen-code | 🔲 | 🔲 | 🔲 | 🔲 |
-| openhands | 🔲 | 🔲 | 🔲 | 🔲 |
-| hermes-agent | 🔲 | 🔲 | 🔲 | 🔲 |
-| aider | 🔲 | 🔲 | 🔲 | 🔲 |
-| kilo-code | 🔲 | 🔲 | 🔲 | 🔲 |
-| copilot | 🔲 | 🔲 | 🔲 | 🔲 |
-| droid | 🔲 | 🔲 | 🔲 | 🔲 |
-| kimi-code | 🔲 | 🔲 | 🔲 | 🔲 |
+| codex-cli | ✅ | 🔲 | 🔲 | 🔲 |
+| claude-code | ✅ | 🔲 | 🔲 | 🔲 |
+| opencode | ✅ | 🔲 | 🔲 | 🔲 |
+| qwen-code | ✅ | 🔲 | 🔲 | 🔲 |
+| openhands | ✅ | 🔲 | 🔲 | 🔲 |
+| hermes-agent | ✅ | 🔲 | 🔲 | 🔲 |
+| aider | ✅ | 🔲 | 🔲 | 🔲 |
+| kilo-code | ✅ | 🔲 | 🔲 | 🔲 |
+| copilot | ✅ | 🔲 | 🔲 | 🔲 |
+| droid | ✅ | 🔲 | 🔲 | 🔲 |
+| kimi-code | ✅ | 🔲 | 🔲 | 🔲 |
 
 ### Framework × Family matrix (3 × 4 = 12)
 
 | Framework | Qwen 3.6 | Gemma 4 | DeepSeek V4 | gpt-oss |
 |---|---|---|---|---|
-| LangChain (+ LangGraph) | 🔲 | 🔲 | 🔲 | 🔲 |
-| PydanticAI | 🔲 | 🔲 | 🔲 | 🔲 |
-| smolagents | 🔲 | 🔲 | 🔲 | 🔲 |
+| LangChain (+ LangGraph) | ✅ | 🔲 | 🔲 | 🔲 |
+| PydanticAI | ✅ | 🔲 | 🔲 | 🔲 |
+| smolagents | ✅ | 🔲 | 🔲 | 🔲 |
 
 Legend: ✅ passing · ⚠️ skipped (known cause) · 🔲 pending
 
