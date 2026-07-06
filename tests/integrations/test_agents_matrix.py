@@ -1,19 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier-1 agents × 3 families integration matrix (0.10.2).
+"""Tier-1 agents × 4 families integration matrix (0.10.2 PR-2 pilot).
 
-Eight Tier-1 agents from ``0.10-TODO.md`` §0.10.2:
+Eleven Tier-1 agents — the pilot finalized the top 10 via pre-flight
+verification of five commercial CLIs (cursor / droid / kimi-code /
+qodercli / copilot) against the "can be pointed at a custom OpenAI
+base_url" bar; kilo-code retained from #1030 pending an operator scope
+call on top-10-vs-top-11:
+
+Existing wire cells (from #1030 scaffold):
 
 * codex-cli (/v1/responses)
 * claude-code (/v1/messages via Anthropic SDK — covered by
   ``test_anthropic_sdk.py``; the matrix cell here proves the SDK still
   drives an end-to-end tool loop on the running server)
 * opencode (/v1/chat/completions)
-* qwen-code (/v1/chat/completions)
+* qwen-code (/v1/chat/completions, promoted from fallback pool since
+  Cursor CLI's agent path is locked to Cursor's backend)
 * openhands (/v1/chat/completions)
 * hermes-agent (covered end-to-end by ``test_hermes.py`` — this file
-  smokes the wire in a lightweight cell)
+  smokes the wire in a lightweight cell; promoted from fallback pool
+  since Alibaba Qoder's CLI has no first-party OpenAI-compat base_url
+  hook, only proxy wrappers)
 * aider (CLI edit-and-write, covered by ``test_aider.sh``)
 * kilo-code (/v1/chat/completions)
+
+New wire cells (0.10.2 PR-2 pilot):
+
+* copilot (GitHub Copilot CLI — /v1/chat/completions via BYOK env vars
+  ``COPILOT_PROVIDER_BASE_URL`` + ``COPILOT_PROVIDER_API_KEY``, docs
+  https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models)
+* droid (Factory AI Droid CLI — /v1/chat/completions via
+  ``~/.factory/settings.json`` ``customModels`` array with
+  ``provider: generic-chat-completion-api``)
+* kimi-code (Moonshot Kimi Code CLI — /v1/chat/completions via
+  ``~/.kimi/config.toml`` provider block with ``type = "openai"``
+  and ``base_url``)
 
 Each cell is a **smoke** — connect via the agent's wire, run a single
 tool-calling exchange, verify the response envelope is well-formed and
@@ -462,3 +483,74 @@ class TestKiloCode:
         family_alias: FamilyAlias,
     ) -> None:
         _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="kilo-code")
+
+
+class TestCopilot:
+    """GitHub Copilot CLI wire smoke.
+
+    Pre-flight verdict: **PASS** — Copilot CLI supports BYOK via the
+    env vars ``COPILOT_PROVIDER_BASE_URL``, ``COPILOT_PROVIDER_API_KEY``,
+    ``COPILOT_MODEL``, and ``COPILOT_PROVIDER_TYPE=openai``. Docs:
+    https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models
+
+    Cell shape: **wire-smoke only** — the plain
+    ``/v1/chat/completions`` tool-call round-trip. Driving the real
+    ``copilot`` CLI as a non-interactive subprocess is blocked on
+    ``gh auth login`` OAuth (interactive TTY, no ``--no-tty`` escape
+    hatch as of 2026-07). A follow-up sibling PR can add a real-CLI
+    subprocess cell once a token-flow harness is agreed with raullen —
+    the wire-smoke here still catches server-side tool-call regressions
+    that would break Copilot BYOK users.
+    """
+
+    def test_smoke(
+        self,
+        rapid_mlx_server: dict[str, Any],
+        family_alias: FamilyAlias,
+    ) -> None:
+        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="copilot")
+
+
+class TestDroid:
+    """Factory AI Droid CLI wire smoke.
+
+    Pre-flight verdict: **PASS** — Droid CLI supports custom models via
+    ``~/.factory/settings.json`` ``customModels`` array with fields
+    ``model`` / ``displayName`` / ``baseUrl`` / ``apiKey`` /
+    ``provider = "generic-chat-completion-api"``. Docs:
+    https://docs.factory.ai/cli/byok/overview
+
+    Cell shape: **wire-smoke only** — same rationale as ``TestCopilot``.
+    Real subprocess driving requires ``droid`` first-run onboarding and
+    a Factory session token; wire-smoke catches the /v1/chat/completions
+    tool-call regressions that would break Droid BYOK users.
+    """
+
+    def test_smoke(
+        self,
+        rapid_mlx_server: dict[str, Any],
+        family_alias: FamilyAlias,
+    ) -> None:
+        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="droid")
+
+
+class TestKimiCode:
+    """Moonshot Kimi Code CLI wire smoke.
+
+    Pre-flight verdict: **PASS** — Kimi Code CLI supports OpenAI-compat
+    providers via ``~/.kimi/config.toml`` provider blocks with
+    ``type = "openai"`` + ``base_url``. Docs:
+    https://moonshotai.github.io/kimi-cli/en/configuration/providers.html
+
+    Cell shape: **wire-smoke only** — same rationale as ``TestCopilot``.
+    Real subprocess driving requires kimi-cli first-run auth flow;
+    wire-smoke catches the /v1/chat/completions tool-call regressions
+    that would break Kimi-Code BYOK users.
+    """
+
+    def test_smoke(
+        self,
+        rapid_mlx_server: dict[str, Any],
+        family_alias: FamilyAlias,
+    ) -> None:
+        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="kimi-code")

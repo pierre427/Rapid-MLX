@@ -3,9 +3,15 @@
 
 Two matrices share this harness:
 
-* ``test_agents_matrix.py`` — 8 Tier-1 agents × 3 families (Qwen 3.6, Gemma 4,
-  gpt-oss) = 24 cells.
-* ``test_frameworks_matrix.py`` — 3 Tier-1 frameworks × 3 families = 9 cells.
+* ``test_agents_matrix.py`` — 11 Tier-1 agents × 4 families (Qwen 3.6,
+  Gemma 4, DeepSeek V4, gpt-oss) = 44 cells. The three commercial-CLI
+  cells added in the 0.10.2 pilot (copilot / droid / kimi-code) run as
+  **wire-smoke via the shared OpenAI SDK helper** — driving the actual
+  CLI binaries as subprocesses in <60 s is blocked by vendor OAuth /
+  first-run onboarding flows (documented in the pre-flight verdict at
+  the top of ``README.md``).
+* ``test_frameworks_matrix.py`` — 3 Tier-1 frameworks × 4 families =
+  12 cells.
 
 Both matrices reuse the same server fixture, cheap-alias-per-family fixture,
 and assertion helpers. The fixtures never boot the server themselves — the
@@ -19,7 +25,9 @@ Environment overrides
 
 * ``RAPID_MLX_BASE_URL`` — where to point clients (default: localhost:8000/v1).
 * ``RAPID_MLX_AGENT_MATRIX_FAMILY`` — restrict matrix to one family
-  (``qwen36`` / ``gemma4`` / ``gptoss``). Handy for CI shards.
+  (``qwen36`` / ``gemma4`` / ``deepseek`` / ``gptoss``). Handy for CI
+  shards, and mandatory in Golden-Path runs so the CI job knows which
+  server alias to boot.
 * ``RAPID_MLX_MATRIX_STRICT`` — if ``1``, missing-server / model-mismatch
   raise instead of skipping. Off by default so a naive ``pytest`` run stays
   green.
@@ -55,7 +63,7 @@ DEFAULT_BASE_URL = "http://localhost:8000/v1"
 class FamilyAlias:
     """A cheap-per-family alias used across the matrices."""
 
-    family: str  # matrix column key: "qwen36" / "gemma4" / "gptoss"
+    family: str  # matrix column key: "qwen36" / "gemma4" / "deepseek" / "gptoss"
     alias: str  # rapid-mlx alias string (positional model arg)
     reason: str  # why this alias — used in skip messages
 
@@ -80,6 +88,20 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         family="gemma4",
         alias="gemma-4-12b-4bit",
         reason="smallest Gemma 4 text-only alias (12B fits in ~7 GB @ 4-bit)",
+    ),
+    "deepseek": FamilyAlias(
+        family="deepseek",
+        # 0.10.2 Tier-1 strong pick — no smaller DeepSeek V4 SKU exists.
+        # The 8-bit V4-Flash is ~69 GB on disk and 46 B active params
+        # (dispatched across 8 shared + 128 routed experts), so the
+        # matrix cell here maps to the *only* alias the family ships
+        # today. Any cheaper stand-in would break the family-guard
+        # invariant this matrix relies on.
+        alias="deepseek-v4-flash-8bit",
+        reason=(
+            "no smaller DeepSeek V4 SKU exists — Flash is the family's "
+            "smallest quant"
+        ),
     ),
     "gptoss": FamilyAlias(
         family="gptoss",
@@ -214,6 +236,11 @@ def family_alias_for_active_server(
         return _FAMILY_ALIASES["gemma4"]
     if mid.startswith("gpt-oss") or "gpt-oss" in mid:
         return _FAMILY_ALIASES["gptoss"]
+    # DeepSeek V4 family — 0.10.2 Tier-1. Match both the flash variant
+    # cached today and any future ``deepseek-v4-*`` variants without
+    # requiring another string in this dispatch.
+    if mid.startswith("deepseek-v4") or "deepseek-v4" in mid:
+        return _FAMILY_ALIASES["deepseek"]
     # Qwen 3.5 stands in for Qwen 3.6 in the small-alias matrix (see
     # ``_FAMILY_ALIASES['qwen36'].reason``).
     if mid.startswith("qwen3.5"):
@@ -255,7 +282,7 @@ def _guard_family_matches_server(request: pytest.FixtureRequest) -> None:
         strict_skip_or_fail(
             f"cell {cell_family.family}: running model "
             f"{server_info['model_id']!r} doesn't map to any known family "
-            f"(qwen36 / gemma4 / gptoss)."
+            f"(qwen36 / gemma4 / deepseek / gptoss)."
         )
         return
     if active.family != cell_family.family:
