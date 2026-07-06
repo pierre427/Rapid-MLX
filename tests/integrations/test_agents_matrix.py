@@ -363,15 +363,27 @@ class TestQwenCode:
         _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="qwen-code")
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OpenHands uses text-action format (openhands.yaml "
+        "capabilities.function_calling: false), NOT OpenAI-style function "
+        "calling — no OpenAI-shape tool_calls to parse. Real drive requires "
+        "the Docker E2E harness deferred to 0.10.6 Phase 4. Wire-only smoke "
+        "was previously here but was flagged as shape-only. Kept as a "
+        "structural xfail so the matrix stays symmetric and the intended "
+        "coverage gap is grep-visible in test output."
+    ),
+)
 class TestOpenHands:
-    """OpenHands **wire smoke only** — does NOT drive the real OpenHands binary.
+    """OpenHands — expected-fail placeholder for Docker E2E harness.
 
-    Codex #1030 round-4 finding 3 tightening: this cell is explicitly not
-    an OpenHands integration test — it only probes the same
-    ``/v1/chat/completions`` route the LiteLLM shim inside OpenHands
-    would eventually hit. The deep E2E harness requires Docker and is
-    deferred to 0.10.6 Phase 4. Kept in the matrix so a regression on
-    the plain wire surfaces before the deep harness has a chance to run.
+    OpenHands' native wire is a text-action format, not OpenAI function
+    calling. A tool-call assertion against ``/v1/chat/completions``
+    cannot faithfully represent what OpenHands actually drives. The
+    real coverage will land in the 0.10.6 Phase 4 Docker E2E harness;
+    this placeholder xfails strictly so the matrix cell count stays at
+    11 × 4 and the coverage gap can't be quietly forgotten.
     """
 
     def test_smoke(
@@ -379,36 +391,11 @@ class TestOpenHands:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        # OpenHands uses text action format, not OpenAI function calling
-        # (see openhands.yaml capabilities.function_calling: false). Smoke
-        # the plain wire — the deep E2E harness requires Docker and lives
-        # in a follow-up file (deferred to 0.10.6 Phase 4 plumbing).
-        # Codex #1030 round-5 finding 2: use the tuple-returning helper so
-        # a missing ``openai`` package skips cleanly instead of erroring
-        # at the top-level import.
-        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
-        try:
-            resp = client.chat.completions.create(
-                model=rapid_mlx_server["model_id"],
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "Reply with just OK.",
-                    }
-                ],
-                temperature=0.0,
-                max_tokens=64,
-            )
-        except wire_errors as exc:
-            # Codex #1030 finding 3: strict CI treats a server rejection as a
-            # regression on the plain-wire path used by OpenHands / LiteLLM.
-            strict_skip_or_fail(
-                f"openhands/{family_alias.family}: server rejected request: {exc}"
-            )
-        content = resp.choices[0].message.content or ""
-        assert_content_nonempty(content, ctx=f"openhands/{family_alias.family}")
-        assert_no_think_tag_leak(content)
-        assert_no_analysis_channel_leak(content)
+        pytest.fail(
+            f"openhands/{family_alias.family}: strict xfail — Docker E2E "
+            "harness required for OpenHands' text-action format; OpenAI "
+            "tool-call shape does not apply. See class docstring."
+        )
 
 
 class TestHermesAgent:
@@ -424,15 +411,24 @@ class TestHermesAgent:
         )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Aider drives via a bash CLI (``test_aider.sh``) using its own "
+        "edit-and-write format, NOT OpenAI-style tool_calls — no OpenAI-"
+        "shape tool_calls to parse. Real drive lives in the shell harness. "
+        "Kept as a structural xfail so the matrix stays symmetric."
+    ),
+)
 class TestAider:
-    """Aider **wire smoke only** — does NOT invoke Aider or its edit format.
+    """Aider — expected-fail placeholder for shell CLI harness.
 
-    Codex #1030 round-4 finding 4 tightening: the real Aider integration
-    lives in ``test_aider.sh`` (bash harness that drives the ``aider``
-    CLI end-to-end through edit-and-write). This matrix cell only proves
-    the shared OpenAI-compat wire Aider's ``ChatOpenAI`` client would
-    connect through is healthy — Aider's edit format, prompt caching,
-    and CLI behavior are exercised in the shell harness only.
+    Aider's real integration is a bash harness (``test_aider.sh``) that
+    drives the ``aider`` CLI end-to-end through its own edit-and-write
+    format. A tool-call assertion against ``/v1/chat/completions``
+    cannot faithfully represent that flow. This placeholder xfails
+    strictly so the 11 × 4 matrix stays symmetric and the coverage gap
+    can't be quietly forgotten.
     """
 
     def test_smoke(
@@ -440,33 +436,11 @@ class TestAider:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        # Codex #1030 round-5 finding 3: use the tuple-returning helper so
-        # a missing ``openai`` package skips cleanly instead of erroring
-        # at the top-level import.
-        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
-        try:
-            resp = client.chat.completions.create(
-                model=rapid_mlx_server["model_id"],
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful coding assistant.",
-                    },
-                    {"role": "user", "content": "Say hi."},
-                ],
-                temperature=0.0,
-                max_tokens=64,
-            )
-        except wire_errors as exc:
-            # Codex #1030 finding 3: strict CI treats a rejection on the same
-            # OpenAI-wire path Aider uses as a regression.
-            strict_skip_or_fail(
-                f"aider/{family_alias.family}: server rejected request: {exc}"
-            )
-        content = resp.choices[0].message.content or ""
-        assert_content_nonempty(content, ctx=f"aider/{family_alias.family}")
-        assert_no_think_tag_leak(content)
-        assert_no_analysis_channel_leak(content)
+        pytest.fail(
+            f"aider/{family_alias.family}: strict xfail — bash CLI harness "
+            "(test_aider.sh) required for Aider's edit-and-write format; "
+            "OpenAI tool-call shape does not apply. See class docstring."
+        )
 
 
 class TestKiloCode:

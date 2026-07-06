@@ -99,8 +99,7 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         # invariant this matrix relies on.
         alias="deepseek-v4-flash-8bit",
         reason=(
-            "no smaller DeepSeek V4 SKU exists — Flash is the family's "
-            "smallest quant"
+            "no smaller DeepSeek V4 SKU exists — Flash is the family's smallest quant"
         ),
     ),
     "gptoss": FamilyAlias(

@@ -156,37 +156,58 @@ Populated as tests land. Empty (🔲) cells will be filled by the 0.10.6 Phase
 
 ### Agent × Family matrix (11 × 4 = 44)
 
-Pilot execution 2026-07-06 · `mlx-community/Qwen3.6-35B-A3B-8bit`
-running on `127.0.0.1:8802` (auto-detect `qwen3_coder_xml` tool-call
-parser, `qwen3` reasoning parser). Whole matrix ran in **10.81 s**
-against the 35 B-total / 3 B-active MoE checkpoint under
-`RAPID_MLX_MATRIX_STRICT=1`. Gemma 4 / DeepSeek V4 / gpt-oss columns
-deferred to sibling PRs (PR-2c-1 / PR-2c-2 / PR-2c-3) — see PR body
-for cache-retention plan.
+Pilot execution 2026-07-06 — **serial 3-family run** against real
+inference under `RAPID_MLX_MATRIX_STRICT=1`. All PASS cells exercised
+real tool-call routing (function name = `get_weather`, arg parses as
+JSON, `city == "Tokyo"`, no `<think>` leak, no `<|channel|>analysis`
+leak). PydanticAI + smolagents cells assert the tool implementation
+itself was invoked (closure counter check), not just that the model
+produced final text. OpenHands and Aider `XFAIL` structurally
+because their native wire is text-action / edit-and-write, not
+OpenAI function calling — real coverage lives in a Docker E2E
+harness / bash harness respectively.
+
+DeepSeek V4 Flash column is **BLOCKED**: the model cache was present
+at initial recon (69 GB) but freed by an external process before the
+DeepSeek boot attempt. Re-downloading the 144.5 GB repo would push
+free disk from 156 GB to ~10 GB — far below the G11 100 GB floor —
+so the DeepSeek slice is deferred to a sibling PR that pre-stages
+the cache on an external HF_HOME volume.
+
+| Family | Boot alias | Boot time | Wall time (14 cells) | Result |
+|---|---|---|---|---|
+| Qwen 3.6 | `qwen3.6-35b-8bit` (MoE, 3 B active) | ~15 s | 11.32 s | 12 PASS / 2 XFAIL |
+| Gemma 4 | `gemma-4-31b-4bit` (dense) | ~10 s | 17.45 s | 12 PASS / 2 XFAIL |
+| DeepSeek V4 | `deepseek-v4-flash-8bit` | — | — | BLOCKED (cache freed; see above) |
+| gpt-oss | `gpt-oss-120b-mxfp4-q8` (MoE) | ~15 s | 14.61 s | 12 PASS / 2 XFAIL |
 
 | Agent | Qwen 3.6 | Gemma 4 | DeepSeek V4 | gpt-oss |
 |---|---|---|---|---|
-| codex-cli | ✅ | 🔲 | 🔲 | 🔲 |
-| claude-code | ✅ | 🔲 | 🔲 | 🔲 |
-| opencode | ✅ | 🔲 | 🔲 | 🔲 |
-| qwen-code | ✅ | 🔲 | 🔲 | 🔲 |
-| openhands | ✅ | 🔲 | 🔲 | 🔲 |
-| hermes-agent | ✅ | 🔲 | 🔲 | 🔲 |
-| aider | ✅ | 🔲 | 🔲 | 🔲 |
-| kilo-code | ✅ | 🔲 | 🔲 | 🔲 |
-| copilot | ✅ | 🔲 | 🔲 | 🔲 |
-| droid | ✅ | 🔲 | 🔲 | 🔲 |
-| kimi-code | ✅ | 🔲 | 🔲 | 🔲 |
+| codex-cli | ✅ | ✅ | 🔲 | ✅ |
+| claude-code | ✅ | ✅ | 🔲 | ✅ |
+| opencode | ✅ | ✅ | 🔲 | ✅ |
+| qwen-code | ✅ | ✅ | 🔲 | ✅ |
+| openhands | XFAIL | XFAIL | 🔲 | XFAIL |
+| hermes-agent | ✅ | ✅ | 🔲 | ✅ |
+| aider | XFAIL | XFAIL | 🔲 | XFAIL |
+| kilo-code | ✅ | ✅ | 🔲 | ✅ |
+| copilot | ✅ | ✅ | 🔲 | ✅ |
+| droid | ✅ | ✅ | 🔲 | ✅ |
+| kimi-code | ✅ | ✅ | 🔲 | ✅ |
 
 ### Framework × Family matrix (3 × 4 = 12)
 
 | Framework | Qwen 3.6 | Gemma 4 | DeepSeek V4 | gpt-oss |
 |---|---|---|---|---|
-| LangChain (+ LangGraph) | ✅ | 🔲 | 🔲 | 🔲 |
-| PydanticAI | ✅ | 🔲 | 🔲 | 🔲 |
-| smolagents | ✅ | 🔲 | 🔲 | 🔲 |
+| LangChain (+ LangGraph) | ✅ | ✅ | 🔲 | ✅ |
+| PydanticAI | ✅ | ✅ | 🔲 | ✅ |
+| smolagents | ✅ | ✅ | 🔲 | ✅ |
 
-Legend: ✅ passing · ⚠️ skipped (known cause) · 🔲 pending
+Legend: ✅ passing (real inference · real tool call · semantic assertion)
+· XFAIL = strict expected-fail with reason (Docker / shell harness required)
+· 🔲 = pending (DeepSeek cache not resident, download blocked by G11)
+
+**Totals across 3 executed families**: 42 cells run → **36 PASS · 6 XFAIL · 0 FAIL**. DeepSeek slice (14 cells) deferred.
 
 ## Historical deep-file coverage (pre-0.10.2)
 

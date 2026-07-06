@@ -447,8 +447,7 @@ def test_d_tool_recur_parser_depth_1000_returns_invalid_request_code(monkeypatch
     assert err["code"] == "invalid_request"
     message = err["message"]
     assert (
-        "parsing the body" in message
-        or "RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH" in message
+        "parsing the body" in message or "RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH" in message
     ), f"unexpected 400 message on depth-1000 body: {message!r}"
     assert "Traceback" not in resp.text
 
