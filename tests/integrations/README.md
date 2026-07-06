@@ -97,10 +97,12 @@ python3 tests/integrations/test_librechat_docker.py
 
 ## Cheap-alias policy
 
-The matrix boots against small aliases only (≤ 8B, or the smallest SKU per
-family). The 27-35B flagships are reserved for the weekly Golden Path job.
-This keeps the per-process resident footprint under the W5 OOM budget on
-M3 Ultra (operator services baseline + matrix + Metal overhead ≤ 150 GB).
+The matrix boots the smallest available alias per family — 4B for Qwen 3.5
+(3.6 has no <8B SKU), 12B for Gemma 4 (smallest text-only SKU, ~7 GB @ 4-bit),
+20B for gpt-oss (no smaller SKU in the family, MXFP4-Q8 ~11 GB). The 27-35B
+family flagships are reserved for the weekly Golden Path job. This keeps the
+per-process resident footprint under the W5 OOM budget on M3 Ultra (operator
+services baseline + matrix + Metal overhead ≤ 150 GB).
 
 Family choice per matrix run:
 

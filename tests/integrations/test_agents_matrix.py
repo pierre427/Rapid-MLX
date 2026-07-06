@@ -240,8 +240,24 @@ class TestCodexCLI:
                 f"({r.text[:200]!r})"
             )
         data = r.json()
-        # /v1/responses envelope: at least one output message with a text block.
-        assert data.get("output"), f"empty output: {data}"
+        # Codex #1030 round-6 finding 4: walk the /v1/responses envelope,
+        # extract the first output_text block, assert it is non-empty and
+        # channel-clean. A blank output_text or a leaked ``<|channel|>``
+        # marker now fails instead of passing on envelope-only truthiness.
+        outputs = data.get("output") or []
+        assert outputs, f"empty output envelope: {data}"
+        text = ""
+        for output_msg in outputs:
+            for block in output_msg.get("content", []) or []:
+                if block.get("type") in ("output_text", "text"):
+                    text = block.get("text", "") or ""
+                    if text:
+                        break
+            if text:
+                break
+        assert_content_nonempty(text, ctx=f"codex-cli/{family_alias.family}")
+        assert_no_think_tag_leak(text)
+        assert_no_analysis_channel_leak(text)
 
 
 class TestClaudeCode:
