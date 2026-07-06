@@ -76,13 +76,36 @@ _TOOL_SCHEMA = [
 _TOOL_PROMPT = "What's the weather in Tokyo? Use the get_weather tool."
 
 
-def _openai_client(base_url: str):
-    """Lazy openai import — the pkg is optional in the base venv."""
+def _openai_client_and_errors(base_url: str):
+    """Lazy openai import — the pkg is optional in the base venv.
+
+    Codex #1030 round-5 findings 1-3: return the exception classes AND
+    the client instance from a single import site so callers can never
+    accidentally trigger a raw ImportError before the skip guard fires.
+    Every OpenAI-wire cell in this module goes through this helper.
+    """
     try:
-        from openai import OpenAI
+        from openai import (
+            APIStatusError,
+            BadRequestError,
+            NotFoundError,
+            OpenAI,
+        )
     except ImportError:
         pytest.skip("openai package not installed — agent matrix skipped")
-    return OpenAI(base_url=base_url, api_key="not-needed")
+    client = OpenAI(base_url=base_url, api_key="not-needed")
+    return client, (BadRequestError, NotFoundError, APIStatusError)
+
+
+def _openai_client(base_url: str):
+    """Back-compat single-value client accessor (thin wrapper).
+
+    Preserved for cells that only want the client and use a bare
+    ``except Exception`` handler; the tool-call helper below uses the
+    tuple-returning ``_openai_client_and_errors`` for typed catching.
+    """
+    client, _errs = _openai_client_and_errors(base_url)
+    return client
 
 
 def _run_openai_tool_smoke(
@@ -96,9 +119,7 @@ def _run_openai_tool_smoke(
     Shared by every Tier-1 agent that speaks the OpenAI wire (opencode,
     qwen-code, openhands, kilo-code, and — degraded — hermes).
     """
-    from openai import APIStatusError, BadRequestError, NotFoundError
-
-    client = _openai_client(rapid_mlx_server["base_url"])
+    client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
     model_id = rapid_mlx_server["model_id"]
 
     try:
@@ -109,7 +130,7 @@ def _run_openai_tool_smoke(
             temperature=0.0,
             max_tokens=384,
         )
-    except (BadRequestError, NotFoundError, APIStatusError) as exc:
+    except wire_errors as exc:
         # Codex #1030 finding 3: server rejecting a tool-call request is a
         # regression, not a degraded-cell condition. In strict mode we fail
         # the cell so CI can catch the wire break; non-strict skips so a
@@ -325,9 +346,10 @@ class TestOpenHands:
         # (see openhands.yaml capabilities.function_calling: false). Smoke
         # the plain wire — the deep E2E harness requires Docker and lives
         # in a follow-up file (deferred to 0.10.6 Phase 4 plumbing).
-        from openai import APIStatusError, BadRequestError, NotFoundError
-
-        client = _openai_client(rapid_mlx_server["base_url"])
+        # Codex #1030 round-5 finding 2: use the tuple-returning helper so
+        # a missing ``openai`` package skips cleanly instead of erroring
+        # at the top-level import.
+        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
         try:
             resp = client.chat.completions.create(
                 model=rapid_mlx_server["model_id"],
@@ -340,7 +362,7 @@ class TestOpenHands:
                 temperature=0.0,
                 max_tokens=64,
             )
-        except (BadRequestError, NotFoundError, APIStatusError) as exc:
+        except wire_errors as exc:
             # Codex #1030 finding 3: strict CI treats a server rejection as a
             # regression on the plain-wire path used by OpenHands / LiteLLM.
             strict_skip_or_fail(
@@ -381,9 +403,10 @@ class TestAider:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        from openai import APIStatusError, BadRequestError, NotFoundError
-
-        client = _openai_client(rapid_mlx_server["base_url"])
+        # Codex #1030 round-5 finding 3: use the tuple-returning helper so
+        # a missing ``openai`` package skips cleanly instead of erroring
+        # at the top-level import.
+        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
         try:
             resp = client.chat.completions.create(
                 model=rapid_mlx_server["model_id"],
@@ -397,7 +420,7 @@ class TestAider:
                 temperature=0.0,
                 max_tokens=64,
             )
-        except (BadRequestError, NotFoundError, APIStatusError) as exc:
+        except wire_errors as exc:
             # Codex #1030 finding 3: strict CI treats a rejection on the same
             # OpenAI-wire path Aider uses as a regression.
             strict_skip_or_fail(
