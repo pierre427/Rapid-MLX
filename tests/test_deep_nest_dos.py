@@ -411,10 +411,26 @@ def test_d_tool_recur_tools_depth_above_cap_returns_400_canonical_envelope(
 
 
 def test_d_tool_recur_parser_depth_1000_returns_invalid_request_code(monkeypatch):
-    """At extreme depths the JSON parser can reject the body before the
-    per-tool validator sees it. That is still a client 400, and the
-    OpenAI-shaped envelope should carry the canonical invalid_request code
-    instead of a null code.
+    """At extreme depths the request MUST bottom out with a 400
+    ``invalid_request`` envelope even when the body-depth gate has been
+    disabled by the operator.
+
+    Two rejection paths can win the race:
+
+    1. The FastAPI JSON parser rejects the body first (legacy path;
+       envelope carries ``There was an error parsing the body``).
+    2. The per-tool schema depth validator rejects
+       ``function.parameters`` first (default path once
+       ``RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH`` is present; envelope carries
+       the ``RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH`` message).
+
+    Post-Task-#460 the tool schema validator (default cap 64) sees
+    depth-1000 payloads before the JSON parser errors, so the message
+    now names the tool-schema knob. The assertion accepts either path —
+    the invariant this test protects is the ``invalid_request`` code +
+    canonical envelope + no traceback leak, NOT the specific error
+    string. If a future rework flips the winner back to the JSON parser
+    path, this test does not have to move again.
     """
     monkeypatch.setenv("RAPID_MLX_MAX_BODY_DEPTH", "0")
     app = _build_minimal_app(with_pydantic_chat=True)
@@ -429,7 +445,11 @@ def test_d_tool_recur_parser_depth_1000_returns_invalid_request_code(monkeypatch
     err = resp.json()["error"]
     assert err["type"] == "invalid_request_error"
     assert err["code"] == "invalid_request"
-    assert "parsing the body" in err["message"]
+    message = err["message"]
+    assert (
+        "parsing the body" in message
+        or "RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH" in message
+    ), f"unexpected 400 message on depth-1000 body: {message!r}"
     assert "Traceback" not in resp.text
 
 
