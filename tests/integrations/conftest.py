@@ -43,7 +43,6 @@ from typing import Any
 
 import pytest
 
-
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -217,7 +216,9 @@ def assert_tool_call_shape(tool_call: dict[str, Any]) -> None:
     assert isinstance(fn, dict), f"tool_call.function not a dict: {fn!r}"
     assert fn.get("name"), f"tool_call.function missing name: {fn!r}"
     args = fn.get("arguments")
-    assert isinstance(args, str), f"tool_call.function.arguments must be JSON string: {args!r}"
+    assert isinstance(args, str), (
+        f"tool_call.function.arguments must be JSON string: {args!r}"
+    )
     # arguments should parse as JSON (may be an empty object for no-arg tools)
     try:
         json.loads(args)
@@ -231,8 +232,7 @@ def assert_stream_deltas_valid(events: list[dict[str, Any]]) -> None:
     """Assert an OpenAI streaming response yielded well-formed deltas."""
     assert events, "no streaming events collected"
     assert any(
-        ev.get("choices", [{}])[0].get("delta", {}).get("content")
-        for ev in events
+        ev.get("choices", [{}])[0].get("delta", {}).get("content") for ev in events
     ), f"no content deltas in {len(events)} events"
 
 

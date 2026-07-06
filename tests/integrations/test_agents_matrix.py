@@ -52,7 +52,6 @@ from tests.integrations.conftest import (
     assert_tool_call_shape,
 )
 
-
 # --------------------------------------------------------------------------- #
 # Shared per-cell tool-call payload
 # --------------------------------------------------------------------------- #
@@ -176,7 +175,9 @@ class TestCodexCLI:
             "input": [
                 {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "Reply with just SHIPPED."}],
+                    "content": [
+                        {"type": "input_text", "text": "Reply with just SHIPPED."}
+                    ],
                 }
             ],
             "stream": False,
@@ -207,7 +208,12 @@ class TestClaudeCode:
         family_alias: FamilyAlias,
     ) -> None:
         try:
-            from anthropic import Anthropic, APIStatusError, BadRequestError, NotFoundError
+            from anthropic import (
+                Anthropic,
+                APIStatusError,
+                BadRequestError,
+                NotFoundError,
+            )
         except ImportError:
             pytest.skip("anthropic SDK not installed — cell deferred")
 
@@ -228,7 +234,9 @@ class TestClaudeCode:
                 f"on {rapid_mlx_server['base_url']}"
             )
         except (BadRequestError, APIStatusError) as exc:
-            pytest.skip(f"claude-code/{family_alias.family}: server rejected request: {exc}")
+            pytest.skip(
+                f"claude-code/{family_alias.family}: server rejected request: {exc}"
+            )
 
         # Walk content blocks and find the first text — reasoning models emit a
         # thinking block first (see test_anthropic_sdk.py _first_text).
@@ -250,9 +258,7 @@ class TestOpenCode:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        _run_openai_tool_smoke(
-            rapid_mlx_server, family_alias, agent_label="opencode"
-        )
+        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="opencode")
 
 
 class TestQwenCode:
@@ -268,9 +274,7 @@ class TestQwenCode:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        _run_openai_tool_smoke(
-            rapid_mlx_server, family_alias, agent_label="qwen-code"
-        )
+        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="qwen-code")
 
 
 class TestOpenHands:
@@ -301,7 +305,9 @@ class TestOpenHands:
                 max_tokens=64,
             )
         except (BadRequestError, NotFoundError, APIStatusError) as exc:
-            pytest.skip(f"openhands/{family_alias.family}: server rejected request: {exc}")
+            pytest.skip(
+                f"openhands/{family_alias.family}: server rejected request: {exc}"
+            )
         content = resp.choices[0].message.content or ""
         assert_content_nonempty(content, ctx=f"openhands/{family_alias.family}")
         assert_no_think_tag_leak(content)
@@ -342,7 +348,10 @@ class TestAider:
             resp = client.chat.completions.create(
                 model=rapid_mlx_server["model_id"],
                 messages=[
-                    {"role": "system", "content": "You are a helpful coding assistant."},
+                    {
+                        "role": "system",
+                        "content": "You are a helpful coding assistant.",
+                    },
                     {"role": "user", "content": "Say hi."},
                 ],
                 temperature=0.0,
@@ -369,6 +378,4 @@ class TestKiloCode:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        _run_openai_tool_smoke(
-            rapid_mlx_server, family_alias, agent_label="kilo-code"
-        )
+        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="kilo-code")
