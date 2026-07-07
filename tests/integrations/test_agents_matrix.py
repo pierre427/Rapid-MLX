@@ -69,7 +69,6 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import pytest
 
@@ -429,7 +428,7 @@ class TestAider:
     the way we asked**, not **did tool_calls fire**.
 
     The bash harness at ``tests/integrations/test_aider.sh`` takes
-    ``--model <alias>`` + ``--port <port>``, seeds a scratch ``add.py``
+    ``--model <alias>`` + ``--base-url <url>``, seeds a scratch ``add.py``
     with ``return a - b  # BUG``, runs aider one-shot with
     ``--message "Fix the bug ... this function should add, not subtract"``,
     then asserts (a) aider exited 0 and (b) the file now contains
@@ -438,6 +437,31 @@ class TestAider:
     """
 
     _HARNESS_TIMEOUT_SECONDS = 300
+
+    _PINNED_AIDER_BIN = "/Users/raullenstudio/.local/bin/aider"
+
+    @staticmethod
+    def _resolve_aider_bin() -> str | None:
+        """Return a usable aider binary path, or ``None`` if none present.
+
+        Codex #1047 nit: previously the pytest skip guard only checked
+        ``shutil.which("aider")`` + the pinned operator path, ignoring
+        the ``AIDER_BIN`` env var that the bash harness already honors.
+        A CI operator that pins a non-standard binary via ``AIDER_BIN``
+        would see the cell skip even though the harness would happily
+        run. Centralize the lookup so Python and bash agree.
+        """
+        env_pin = os.environ.get("AIDER_BIN")
+        if env_pin and Path(env_pin).is_file() and os.access(env_pin, os.X_OK):
+            return env_pin
+        which = shutil.which("aider")
+        if which is not None:
+            return which
+        if Path(TestAider._PINNED_AIDER_BIN).is_file() and os.access(
+            TestAider._PINNED_AIDER_BIN, os.X_OK
+        ):
+            return TestAider._PINNED_AIDER_BIN
+        return None
 
     def test_smoke(
         self,
@@ -450,16 +474,22 @@ class TestAider:
         # Aider is not installable as an importable pkg here — it's the
         # end-user CLI. Skip cleanly if it's not on disk instead of
         # rebooting install policy from the test.
-        if (
-            shutil.which("aider") is None
-            and not Path("/Users/raullenstudio/.local/bin/aider").exists()
-        ):
-            pytest.skip("aider CLI not on PATH — install `pip install aider-chat`")
+        if self._resolve_aider_bin() is None:
+            pytest.skip(
+                "aider CLI not found (checked AIDER_BIN env var, PATH, and "
+                f"{self._PINNED_AIDER_BIN}) — install `pip install aider-chat` "
+                "or set AIDER_BIN"
+            )
 
-        # Extract the port the rapid_mlx_server fixture is pointing us
-        # at. The base_url has the form ``http://host:port/v1``.
-        parsed = urlparse(rapid_mlx_server["base_url"])
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        # Codex #1047 blocking: pass the FULL parsed base_url to the
+        # harness, not just the port. The old ``--port`` path silently
+        # rewrote host to ``127.0.0.1``, which would test the wrong
+        # server if the fixture was pointed at a non-localhost host
+        # (CI shard on a remote-serve node, or a devcontainer where
+        # the app runs on ``host.docker.internal``). ``--base-url`` is
+        # authoritative; the harness still accepts ``--port`` for
+        # standalone local invocations.
+        base_url = rapid_mlx_server["base_url"]
 
         # Drive aider against the actual served model_id — this ensures
         # LiteLLM's ``openai/<model>`` prefix in the harness lines up
@@ -480,8 +510,8 @@ class TestAider:
                     str(harness),
                     "--model",
                     model_id,
-                    "--port",
-                    str(port),
+                    "--base-url",
+                    base_url,
                     "--timeout",
                     str(self._HARNESS_TIMEOUT_SECONDS),
                 ],

@@ -14,12 +14,19 @@
 # ``add.py`` really contains ``return a + b`` after aider exits.
 #
 # Usage:
-#   test_aider.sh --model <alias> --port <port> [--timeout <secs>]
+#   test_aider.sh --model <alias> (--base-url <url> | --port <port>) [--timeout <secs>]
+#
+# ``--base-url`` takes the full ``http[s]://host:port/v1`` URL and is the
+# preferred form — it lets the Python wrapper pass whatever URL the
+# ``rapid_mlx_server`` fixture is actually pointed at (which may be
+# non-localhost in CI shards or a remote-serve run). ``--port`` is kept
+# for standalone local invocations and defaults host to ``127.0.0.1``.
 #
 # Env vars (set automatically, but overridable):
 #   HOME              — overridden to a scratch dir so aider's config /
 #                       cache / analytics files don't touch the operator's
 #                       real ``~/.aider*`` state
+#   AIDER_BIN         — full path to the aider binary; skipped-search if set
 #   AIDER_ANALYTICS_ASKED=1
 #   AIDER_CHECK_UPDATE=false
 #
@@ -37,10 +44,11 @@ set -o pipefail
 TIMEOUT=300
 MODEL=""
 PORT=""
+BASE_URL=""
 VERBOSE=0
 
 usage() {
-    echo "Usage: $0 --model <alias> --port <port> [--timeout <secs>] [-v]" >&2
+    echo "Usage: $0 --model <alias> (--base-url <url> | --port <port>) [--timeout <secs>] [-v]" >&2
     exit 1
 }
 
@@ -48,6 +56,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --model) MODEL="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
+        --base-url) BASE_URL="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         -v|--verbose) VERBOSE=1; shift ;;
         -h|--help) usage ;;
@@ -55,8 +64,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ -z "$MODEL" ] || [ -z "$PORT" ]; then
+if [ -z "$MODEL" ] || { [ -z "$BASE_URL" ] && [ -z "$PORT" ]; }; then
     usage
+fi
+
+# Derive BASE_URL from --port only if --base-url wasn't given (back-compat
+# for the standalone invocation shape kept for local docs/dev). --base-url
+# wins so a Python wrapper that always passes the full URL is authoritative.
+if [ -z "$BASE_URL" ]; then
+    BASE_URL="http://127.0.0.1:${PORT}/v1"
 fi
 
 # Locate aider — never PATH-search on the operator's box because the
@@ -97,8 +113,6 @@ def add(a, b):
     return a - b  # BUG
 PYEOF
 
-BASE_URL="http://127.0.0.1:${PORT}/v1"
-
 # Sanity: is the server actually up? A quick /v1/models probe with a
 # 5 s timeout catches "operator forgot to boot serve" instantly instead
 # of eating the 300 s aider timeout.
@@ -113,7 +127,7 @@ fi
 # rapid-mlx aliases.
 LITELLM_MODEL="openai/${MODEL}"
 
-echo "[test_aider.sh] model=$MODEL port=$PORT timeout=${TIMEOUT}s"
+echo "[test_aider.sh] model=$MODEL base_url=$BASE_URL timeout=${TIMEOUT}s"
 echo "[test_aider.sh] litellm-model=$LITELLM_MODEL"
 echo "[test_aider.sh] scratch home=$SCRATCH_HOME workdir=$WORKDIR"
 echo "[test_aider.sh] BEFORE add.py:"
