@@ -21,7 +21,8 @@ Existing wire cells (from #1030 scaffold):
   smokes the wire in a lightweight cell; promoted from fallback pool
   since Alibaba Qoder's CLI has no first-party OpenAI-compat base_url
   hook, only proxy wrappers)
-* aider (CLI edit-and-write, covered by ``test_aider.sh``)
+* aider (real bash-CLI drive via ``test_aider.sh`` — matrix cell shells
+  out to the harness, asserts add.py rewritten to ``return a + b``)
 * kilo-code (/v1/chat/completions)
 
 New wire cells (0.10.2 PR-2 pilot):
@@ -54,14 +55,21 @@ Rationale for lightweight cells + heavy dedicated files:
 README matrix:** claude-code needs an installed ``anthropic`` package (in
 optional extras, not core); openhands needs Docker (E2E harness lives in
 ``test_openhands.py``, deferred to 0.10.6 Phase 4 plumbing per 0.10-TODO
-line 246); aider drives via a shell script (``test_aider.sh``) since
-aider is not importable — the matrix cell here defers to that harness.
+line 246). Aider previously deferred to ``test_aider.sh`` for its
+edit-and-write flow; as of 0.10.3-window the matrix cell now shells out
+to that harness directly (see ``TestAider`` below) so the four Tier-1
+family cells run for real instead of xfail'ing structurally.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 
@@ -411,36 +419,98 @@ class TestHermesAgent:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Aider drives via a bash CLI (``test_aider.sh``) using its own "
-        "edit-and-write format, NOT OpenAI-style tool_calls — no OpenAI-"
-        "shape tool_calls to parse. Real drive lives in the shell harness. "
-        "Kept as a structural xfail so the matrix stays symmetric."
-    ),
-)
 class TestAider:
-    """Aider — expected-fail placeholder for shell CLI harness.
+    """Aider — real bash-CLI harness (``test_aider.sh``).
 
-    Aider's real integration is a bash harness (``test_aider.sh``) that
-    drives the ``aider`` CLI end-to-end through its own edit-and-write
-    format. A tool-call assertion against ``/v1/chat/completions``
-    cannot faithfully represent that flow. This placeholder xfails
-    strictly so the 11 × 4 matrix stays symmetric and the coverage gap
-    can't be quietly forgotten.
+    Aider does not speak OpenAI tool_calls — it sends the file + user
+    instruction as plain messages, expects the LLM to emit
+    ``SEARCH ... REPLACE ...`` blocks, and applies those edits locally.
+    So the correctness signal is **did aider actually rewrite the file
+    the way we asked**, not **did tool_calls fire**.
+
+    The bash harness at ``tests/integrations/test_aider.sh`` takes
+    ``--model <alias>`` + ``--port <port>``, seeds a scratch ``add.py``
+    with ``return a - b  # BUG``, runs aider one-shot with
+    ``--message "Fix the bug ... this function should add, not subtract"``,
+    then asserts (a) aider exited 0 and (b) the file now contains
+    ``return a + b``. Full family-by-family empirical verification is
+    documented in the PR that un-xfailed this cell.
     """
+
+    _HARNESS_TIMEOUT_SECONDS = 300
 
     def test_smoke(
         self,
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        pytest.fail(
-            f"aider/{family_alias.family}: strict xfail — bash CLI harness "
-            "(test_aider.sh) required for Aider's edit-and-write format; "
-            "OpenAI tool-call shape does not apply. See class docstring."
-        )
+        harness = Path(__file__).parent / "test_aider.sh"
+        assert harness.exists(), f"aider harness missing: {harness}"
+
+        # Aider is not installable as an importable pkg here — it's the
+        # end-user CLI. Skip cleanly if it's not on disk instead of
+        # rebooting install policy from the test.
+        if (
+            shutil.which("aider") is None
+            and not Path("/Users/raullenstudio/.local/bin/aider").exists()
+        ):
+            pytest.skip("aider CLI not on PATH — install `pip install aider-chat`")
+
+        # Extract the port the rapid_mlx_server fixture is pointing us
+        # at. The base_url has the form ``http://host:port/v1``.
+        parsed = urlparse(rapid_mlx_server["base_url"])
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        # Drive aider against the actual served model_id — this ensures
+        # LiteLLM's ``openai/<model>`` prefix in the harness lines up
+        # with what the /v1/models probe returned.
+        model_id = rapid_mlx_server["model_id"]
+
+        env = os.environ.copy()
+        # Belt-and-braces: also set the analytics/update opt-out env vars
+        # in the parent process so a nested aider subprocess sees them
+        # even if the harness accidentally strips them.
+        env.setdefault("AIDER_ANALYTICS_ASKED", "1")
+        env.setdefault("AIDER_CHECK_UPDATE", "false")
+
+        try:
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(harness),
+                    "--model",
+                    model_id,
+                    "--port",
+                    str(port),
+                    "--timeout",
+                    str(self._HARNESS_TIMEOUT_SECONDS),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self._HARNESS_TIMEOUT_SECONDS + 30,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail(
+                f"aider/{family_alias.family}: harness wall-timeout "
+                f"({self._HARNESS_TIMEOUT_SECONDS + 30}s) exceeded. "
+                f"stdout(tail)={(exc.stdout or b'')[-800:]!r} "
+                f"stderr(tail)={(exc.stderr or b'')[-800:]!r}"
+            )
+
+        # Assert exit 0 with the tail of stdout+stderr for diagnostics
+        # — the harness itself already prints BEFORE/AFTER add.py and
+        # the last 40 lines of aider's log, so this is enough to
+        # root-cause any empirical failure without re-running.
+        if result.returncode != 0:
+            tail_out = result.stdout[-2000:] if result.stdout else ""
+            tail_err = result.stderr[-1000:] if result.stderr else ""
+            pytest.fail(
+                f"aider/{family_alias.family}: harness exited "
+                f"{result.returncode} on model {model_id!r}\n"
+                f"--- stdout tail ---\n{tail_out}\n"
+                f"--- stderr tail ---\n{tail_err}"
+            )
 
 
 class TestKiloCode:
