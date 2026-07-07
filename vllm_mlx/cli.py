@@ -8070,7 +8070,15 @@ Examples:
 
         resolved = resolve_model(args.model)
         if resolved != args.model:
-            print(f"  Alias: {args.model} → {resolved}")
+            # Keep stdout pure JSON for machine-readable modes (jlens --json);
+            # the human-facing alias banner goes to stderr there.
+            _alias_stream = (
+                sys.stderr
+                if getattr(args, "command", None) == "jlens"
+                and getattr(args, "json", False)
+                else sys.stdout
+            )
+            print(f"  Alias: {args.model} → {resolved}", file=_alias_stream)
             args._original_alias = args.model
             args.model = resolved
         elif "/" not in args.model and not os.path.exists(args.model):
