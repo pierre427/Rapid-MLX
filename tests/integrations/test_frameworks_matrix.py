@@ -8,12 +8,22 @@ Three Tier-1 frameworks from ``0.10-TODO.md`` §0.10.2:
 * smolagents
 
 Family axis expanded from 3 (qwen36 / gemma4 / gptoss) to 4 in the
-0.10.2 PR-2 pilot by adding DeepSeek V4 — see ``conftest.py``
+0.10.2 PR-2 pilot by adding DeepSeek — see ``conftest.py``
 ``_FAMILY_ALIASES['deepseek']`` for the strong-pick alias
-(``deepseek-v4-flash-8bit``). The family-guard fixture in
-``conftest.py`` still skips per family, so a single-family server boot
-runs the intended slice (3 cells for that family) and skips the other
-9 unless ``RAPID_MLX_MATRIX_STRICT=1`` requests hard-fail.
+(``deepseek-r1-32b-4bit`` — swapped from V4-Flash-8bit which is 155 GB
+single-node-infeasible; full V4-Flash Tier-1 tracked in follow-up
+issue #1041). The family-guard fixture in ``conftest.py`` still skips
+per family, so a single-family server boot runs the intended slice
+(3 cells for that family) and skips the other 9 unless
+``RAPID_MLX_MATRIX_STRICT=1`` requests hard-fail.
+
+Two of the three cells (``TestLangChain``, ``TestPydanticAI``) carry a
+strict architectural xfail on the DeepSeek variant — the R1-Distill
+Tier-1 rep architecturally cannot emit OpenAI ``tool_calls`` (root
+cause + attribution in ``conftest.py``'s
+``pytest_collection_modifyitems`` block). Smolagents' code-execution
+routing bypasses the OpenAI tool-call shape, so its DeepSeek cell
+still PASSes.
 
 Each cell is a smoke — plain-invoke + one tool call. Deep flows live in
 the dedicated files (``test_langchain.py``, ``test_pydantic_ai_full.py``,

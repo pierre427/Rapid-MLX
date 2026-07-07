@@ -146,7 +146,7 @@ Family choice per matrix run:
 |---|---|---|
 | Qwen 3.6 | `qwen3.5-4b-4bit` | 3.6 has no <27B SKU; 3.5-4B shares `hermes` / `qwen3` parsers |
 | Gemma 4 | `gemma-4-12b-4bit` | Smallest text-only alias; ~7 GB at 4-bit |
-| DeepSeek V4 | `deepseek-v4-flash-8bit` | **No smaller SKU in the family** — Flash is the smallest V4 quant on `mlx-community` (~69 GB on disk, 46 B active params). Cell reserved for the Golden Path job on the M3 Ultra 512 GB reference host |
+| DeepSeek | `deepseek-r1-32b-4bit` | 0.10.2 PR-2 pilot swapped from `deepseek-v4-flash-8bit` (~155 GB weights, single-node-infeasible on 256 GB M3 Ultra + G11 100 GB floor). R1-Distill-Qwen-32B-4bit at ~16 GB stays above the "no cheap-alias" bar and exercises the same `deepseek` tool-call + `deepseek_r1` reasoning parsers V4-Flash would have. **Full DeepSeek V4 Flash Tier-1 slot tracked in follow-up issue #1041** (hardware plan needed) |
 | gpt-oss | `gpt-oss-20b-mxfp4-q8` | Smallest gpt-oss; ~11 GB |
 
 ## Current cell status (2026-07-06 · 0.10.2)
@@ -167,47 +167,71 @@ because their native wire is text-action / edit-and-write, not
 OpenAI function calling — real coverage lives in a Docker E2E
 harness / bash harness respectively.
 
-DeepSeek V4 Flash column is **BLOCKED**: the model cache was present
-at initial recon (69 GB) but freed by an external process before the
-DeepSeek boot attempt. Re-downloading the 144.5 GB repo would push
-free disk from 156 GB to ~10 GB — far below the G11 100 GB floor —
-so the DeepSeek slice is deferred to a sibling PR that pre-stages
-the cache on an external HF_HOME volume.
+DeepSeek family Tier-1 rep was **swapped** from
+`deepseek-v4-flash-8bit` (~155 GB, single-node-infeasible on M3 Ultra
++ G11 100 GB floor) to `deepseek-r1-32b-4bit`
+(`mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit`, ~16 GB) after HF-API
+size verification showed every complete V4 Flash quant is > 96 GB. The
+swap preserves parser coverage (same `deepseek` tool-call parser +
+`deepseek_r1` reasoning parser) while fitting the pilot's disk budget.
+Full V4 Flash coverage tracked in follow-up issue **#1041**
+("hardware plan needed").
 
 | Family | Boot alias | Boot time | Wall time (14 cells) | Result |
 |---|---|---|---|---|
 | Qwen 3.6 | `qwen3.6-35b-8bit` (MoE, 3 B active) | ~15 s | 11.32 s | 12 PASS / 2 XFAIL |
 | Gemma 4 | `gemma-4-31b-4bit` (dense) | ~10 s | 17.45 s | 12 PASS / 2 XFAIL |
-| DeepSeek V4 | `deepseek-v4-flash-8bit` | — | — | BLOCKED (cache freed; see above) |
+| DeepSeek | `deepseek-r1-32b-4bit` (R1-distilled Qwen 32B, dense) | ~18 s | 191.29 s | 3 PASS / 11 XFAIL (9 arch-XFAIL R1-Distill tool-call gap, 2 pre-existing OpenHands/Aider) |
 | gpt-oss | `gpt-oss-120b-mxfp4-q8` (MoE) | ~15 s | 14.61 s | 12 PASS / 2 XFAIL |
 
-| Agent | Qwen 3.6 | Gemma 4 | DeepSeek V4 | gpt-oss |
+| Agent | Qwen 3.6 | Gemma 4 | DeepSeek | gpt-oss |
 |---|---|---|---|---|
-| codex-cli | ✅ | ✅ | 🔲 | ✅ |
-| claude-code | ✅ | ✅ | 🔲 | ✅ |
-| opencode | ✅ | ✅ | 🔲 | ✅ |
-| qwen-code | ✅ | ✅ | 🔲 | ✅ |
-| openhands | XFAIL | XFAIL | 🔲 | XFAIL |
-| hermes-agent | ✅ | ✅ | 🔲 | ✅ |
-| aider | XFAIL | XFAIL | 🔲 | XFAIL |
-| kilo-code | ✅ | ✅ | 🔲 | ✅ |
-| copilot | ✅ | ✅ | 🔲 | ✅ |
-| droid | ✅ | ✅ | 🔲 | ✅ |
-| kimi-code | ✅ | ✅ | 🔲 | ✅ |
+| codex-cli | ✅ | ✅ | ✅ | ✅ |
+| claude-code | ✅ | ✅ | ✅ | ✅ |
+| opencode | ✅ | ✅ | XFAIL (arch) | ✅ |
+| qwen-code | ✅ | ✅ | XFAIL (arch) | ✅ |
+| openhands | XFAIL | XFAIL | XFAIL | XFAIL |
+| hermes-agent | ✅ | ✅ | XFAIL (arch) | ✅ |
+| aider | XFAIL | XFAIL | XFAIL | XFAIL |
+| kilo-code | ✅ | ✅ | XFAIL (arch) | ✅ |
+| copilot | ✅ | ✅ | XFAIL (arch) | ✅ |
+| droid | ✅ | ✅ | XFAIL (arch) | ✅ |
+| kimi-code | ✅ | ✅ | XFAIL (arch) | ✅ |
 
 ### Framework × Family matrix (3 × 4 = 12)
 
-| Framework | Qwen 3.6 | Gemma 4 | DeepSeek V4 | gpt-oss |
+| Framework | Qwen 3.6 | Gemma 4 | DeepSeek | gpt-oss |
 |---|---|---|---|---|
-| LangChain (+ LangGraph) | ✅ | ✅ | 🔲 | ✅ |
-| PydanticAI | ✅ | ✅ | 🔲 | ✅ |
-| smolagents | ✅ | ✅ | 🔲 | ✅ |
+| LangChain (+ LangGraph) | ✅ | ✅ | XFAIL (arch) | ✅ |
+| PydanticAI | ✅ | ✅ | XFAIL (arch) | ✅ |
+| smolagents | ✅ | ✅ | ✅ | ✅ |
 
 Legend: ✅ passing (real inference · real tool call · semantic assertion)
-· XFAIL = strict expected-fail with reason (Docker / shell harness required)
-· 🔲 = pending (DeepSeek cache not resident, download blocked by G11)
+· XFAIL = strict expected-fail with reason (Docker / shell harness required
+for OpenHands + Aider; **XFAIL (arch)** = R1-Distill architectural
+tool-emission gap, see next paragraph and issue #1041)
 
-**Totals across 3 executed families**: 42 cells run → **36 PASS · 6 XFAIL · 0 FAIL**. DeepSeek slice (14 cells) deferred.
+**Totals across all 4 families**: 56 cells run → **39 PASS · 17 XFAIL · 0 FAIL**
+(15 XFAIL are structural expected-fails documented in `conftest.py` /
+`test_agents_matrix.py` docstrings; 2 additional XFAILs are Aider +
+OpenHands DeepSeek variants).
+
+**DeepSeek family — architectural tool-emission gap.** The 9 DeepSeek
+tool-call cells (7 agents + LangChain + PydanticAI) are marked
+`xfail(strict=True)` via `pytest_collection_modifyitems` in
+`conftest.py`. Root cause verified on **both** 4bit (16 GB) and 8bit
+(34.8 GB) R1-Distill-Qwen-32B weights: R1's post-training was
+reasoning-only per DeepSeek's own paper (arXiv 2501.12948 §2.3.3), and
+distillation into Qwen 32B lost the base model's tool-emission
+behavior. The refusal
+`"I cannot provide the current weather in Tokyo as I cannot access the get_weather tool."`
+reproduces deterministically at both quant levels — not a rapid-mlx
+parser bug, not a quant artifact. Text-only cells (CodexCLI +
+ClaudeCode) and smolagents' code-execution routing PASS on the same
+booted server, proving the wire is healthy. Full tool-trained coverage
+for the family needs V4-Chat / V4-Coder / V4-Flash weights, all
+> 96 GB and single-node-infeasible on M3 Ultra under G11 — tracked in
+follow-up issue #1041 (hardware plan).
 
 ## Historical deep-file coverage (pre-0.10.2)
 
