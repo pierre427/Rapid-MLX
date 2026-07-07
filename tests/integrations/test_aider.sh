@@ -10,8 +10,10 @@
 # Why the correctness signal is NOT OpenAI tool_calls: Aider does not
 # use function-calling. It sends the file + user instruction as plain
 # messages, expects the LLM to emit ``SEARCH ... REPLACE ...`` blocks,
-# and applies those edits locally. So the pass gate is whether
-# ``add.py`` really contains ``return a + b`` after aider exits.
+# and applies those edits locally. So the pass gate is whether the
+# executed ``add()`` really returns ``a + b`` after aider exits — not a
+# simple grep, which would flake if the model adds an extra line or
+# reformats the body.
 #
 # Usage:
 #   test_aider.sh --model <alias> (--base-url <url> | --port <port>) [--timeout <secs>]
@@ -31,15 +33,21 @@
 #   AIDER_CHECK_UPDATE=false
 #
 # Exit codes:
-#   0  — aider completed and add.py now contains ``return a + b``
-#   1  — arg parse / setup error
+#   0  — aider completed and add(2, 3) == 5 in the rewritten file
+#   1  — arg parse / setup error (also emitted when ``timeout`` / ``gtimeout``
+#        is missing — see the timeout-selection block below)
 #   2  — aider CLI exited non-zero
-#   3  — aider ran but the file wasn't corrected (edit format didn't
-#        apply; SEARCH/REPLACE parse failed; LLM refused; etc.)
+#   3  — aider ran but the file wasn't corrected (add(2, 3) != 5 — edit
+#        format didn't apply; SEARCH/REPLACE parse failed; LLM refused;
+#        wrong operator, etc.)
 #   4  — timeout
 
-set -u
-set -o pipefail
+# ``set -e`` so an unchecked setup step (``mktemp``, ``cd``, ``mkdir``)
+# aborts the harness instead of running aider from the wrong directory.
+# Codex #1047 round-2 finding #4: without this, a failed ``cd $WORKDIR``
+# would silently run aider from the caller's CWD and (worse) potentially
+# rewrite an unrelated ``add.py`` there.
+set -euo pipefail
 
 TIMEOUT=300
 MODEL=""
@@ -89,11 +97,37 @@ if [ ! -x "$AIDER_BIN" ]; then
     fi
 fi
 
+# ``python3`` powers the correctness check below (AST parse + runtime
+# ``add(2, 3) == 5`` assertion). Fail early with a clear message so a
+# broken system Python doesn't get diagnosed as an aider failure.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found on PATH — required for correctness check" >&2
+    exit 1
+fi
+
+# Pick a timeout wrapper. Codex #1047 round-2 finding #3: the previous
+# "no coreutils timeout, PID-kill the background subshell" fallback only
+# signalled the subshell, not the aider grandchild, so a timed-out run
+# could leak a running ``aider``/LiteLLM process past harness exit. We
+# now REQUIRE ``gtimeout`` (macOS coreutils) or ``timeout`` (Linux),
+# both of which reliably kill the whole exec'd tree — and fail setup
+# fast otherwise.
+if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(gtimeout --preserve-status --kill-after=10 "$TIMEOUT")
+elif command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(timeout --preserve-status --kill-after=10 "$TIMEOUT")
+else
+    echo "ERROR: neither 'timeout' nor 'gtimeout' available — install " >&2
+    echo "       coreutils (macOS: 'brew install coreutils') before running." >&2
+    exit 1
+fi
+
 # Scratch state — HOME override so aider drops its config / cache into a
-# throw-away tree we can nuke on exit. WORKDIR is a fresh scratch repo.
-SCRATCH_HOME="${SCRATCH_HOME:-/tmp/aider-test-home-$$}"
-WORKDIR="$(mktemp -d)"
-mkdir -p "$SCRATCH_HOME"
+# throw-away tree we can nuke on exit. Codex #1047 round-2 finding #5
+# (nit): both scratch dirs now go through ``mktemp -d`` so we never
+# rm -rf a predictable ``/tmp/aider-test-home-$$`` path.
+SCRATCH_HOME="$(mktemp -d -t aider-test-home.XXXXXX)"
+WORKDIR="$(mktemp -d -t aider-test-work.XXXXXX)"
 
 cleanup() {
     local rc=$?
@@ -107,7 +141,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Toy file with an obvious bug: subtraction masquerading as addition.
-# Pass gate = LLM must emit an edit block that flips ``- b`` → ``+ b``.
+# Pass gate = LLM must emit an edit block that flips ``- b`` → ``+ b``
+# so that ``add(2, 3) == 5`` (see correctness check below).
 cat > "$WORKDIR/add.py" <<'PYEOF'
 def add(a, b):
     return a - b  # BUG
@@ -149,55 +184,39 @@ echo "--------"
 LOG="$WORKDIR/aider.log"
 STATUS=0
 
-# ``timeout(1)`` (coreutils) may not be present on macOS; use ``gtimeout``
-# if available, else fall back to a background-process kill approach.
-if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD=(gtimeout --preserve-status "$TIMEOUT")
-elif command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD=(timeout --preserve-status "$TIMEOUT")
-else
-    # PID-kill fallback — spawn aider in the background, watchdog kills it.
-    TIMEOUT_CMD=()
-fi
+# We disable ``set -e`` for the aider invocation so a non-zero exit
+# (timeout, LLM refusal, transport blip) is captured into $STATUS instead
+# of aborting the harness before we can print the diagnostic tail.
+set +e
+cd "$WORKDIR" || { echo "ERROR: cd $WORKDIR failed" >&2; exit 1; }
+HOME="$SCRATCH_HOME" \
+AIDER_ANALYTICS_ASKED=1 \
+AIDER_CHECK_UPDATE=false \
+OPENAI_API_BASE="$BASE_URL" \
+OPENAI_API_KEY="rapidmlx" \
+"${TIMEOUT_CMD[@]}" \
+"$AIDER_BIN" \
+    --model "$LITELLM_MODEL" \
+    --openai-api-base "$BASE_URL" \
+    --openai-api-key "rapidmlx" \
+    --no-git \
+    --no-analytics \
+    --no-check-update \
+    --no-show-model-warnings \
+    --no-pretty \
+    --no-stream \
+    --map-tokens 0 \
+    --yes-always \
+    --message "Fix the bug in add.py — this function should add, not subtract. Change the '-' operator to '+' in the return statement." \
+    add.py \
+    >"$LOG" 2>&1
+STATUS=$?
+set -e
 
-(
-    cd "$WORKDIR"
-    HOME="$SCRATCH_HOME" \
-    AIDER_ANALYTICS_ASKED=1 \
-    AIDER_CHECK_UPDATE=false \
-    OPENAI_API_BASE="$BASE_URL" \
-    OPENAI_API_KEY="rapidmlx" \
-    "${TIMEOUT_CMD[@]}" \
-    "$AIDER_BIN" \
-        --model "$LITELLM_MODEL" \
-        --openai-api-base "$BASE_URL" \
-        --openai-api-key "rapidmlx" \
-        --no-git \
-        --no-analytics \
-        --no-check-update \
-        --no-show-model-warnings \
-        --no-pretty \
-        --no-stream \
-        --map-tokens 0 \
-        --yes-always \
-        --message "Fix the bug in add.py — this function should add, not subtract. Change the '-' operator to '+' in the return statement." \
-        add.py \
-        >"$LOG" 2>&1
-) &
-AIDER_PID=$!
-
-# Fallback watchdog only when ``timeout``/``gtimeout`` missing.
-if [ ${#TIMEOUT_CMD[@]} -eq 0 ]; then
-    ( sleep "$TIMEOUT" && kill -TERM "$AIDER_PID" 2>/dev/null ) &
-    WATCHDOG_PID=$!
-    wait "$AIDER_PID" || STATUS=$?
-    kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
-else
-    wait "$AIDER_PID" || STATUS=$?
-fi
-
-# Detect timeout: 124 = coreutils timeout; 143 = SIGTERM from watchdog.
-if [ "$STATUS" -eq 124 ] || [ "$STATUS" -eq 143 ]; then
+# Detect timeout: 124 = coreutils timeout (SIGTERM path); 137 = --kill-after
+# escalation (SIGKILL); 143 = SIGTERM. All three mean "we killed it, not
+# aider exiting cleanly with a non-zero code."
+if [ "$STATUS" -eq 124 ] || [ "$STATUS" -eq 137 ] || [ "$STATUS" -eq 143 ]; then
     echo "[test_aider.sh] TIMEOUT after ${TIMEOUT}s" >&2
     echo "--- last 60 lines of aider log ---" >&2
     tail -60 "$LOG" >&2 || true
@@ -217,16 +236,99 @@ if [ "$STATUS" -ne 0 ]; then
     exit 2
 fi
 
-# The correctness signal: does add.py now say ``return a + b``?
-# We accept either exact ``return a + b`` or the same expression with
-# extra whitespace. We reject anything that still contains ``return a - b``.
-if grep -qE '^\s*return\s+a\s*\+\s*b' "$WORKDIR/add.py" && \
-   ! grep -qE '^\s*return\s+a\s*-\s*b' "$WORKDIR/add.py"; then
-    echo "[test_aider.sh] PASS: add.py was corrected to 'return a + b'"
-    exit 0
-else
-    echo "[test_aider.sh] FAIL: add.py was NOT corrected" >&2
+# Correctness check. Codex #1047 round-2 finding #2: the previous
+# ``grep -qE '^\s*return\s+a\s*\+\s*b'`` gate was
+# (a) non-portable — ``\s`` is a Perl-regex escape, not ERE-POSIX, and
+#     BSD grep's -E happily ignores it, silently matching literal
+#     ``\s`` sequences instead of whitespace — meaning the same aider
+#     output could pass on GNU grep but fail on macOS grep at CI.
+# (b) semantically weak — a whole-file grep would pass if aider left
+#     ``add()`` broken but added ``return a + b`` in a helper or a
+#     docstring elsewhere in the file.
+#
+# Fix: import the rewritten module and execute ``add(2, 3) == 5``.
+# The scratch file was written by us (see the here-doc above) and
+# only mutated in-place by aider's SEARCH/REPLACE — no arbitrary code
+# is introduced, so a subprocess ``python3 -c 'import add; ...'`` is
+# safe. We also require the AST to contain a ``BinOp(op=Add)`` inside
+# the ``add`` function body, so a mischievous refactor like
+# ``def add(a, b): return sum([a, b])`` still passes (semantic add)
+# but a hard-coded ``return 5`` would not.
+if ! python3 - "$WORKDIR" <<'PYEOF'
+import ast
+import importlib.util
+import sys
+
+workdir = sys.argv[1]
+target = f"{workdir}/add.py"
+
+with open(target) as fh:
+    source = fh.read()
+
+# Load the module.
+spec = importlib.util.spec_from_file_location("_aider_test_add", target)
+mod = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod)
+except Exception as exc:  # noqa: BLE001 — diagnose whatever it was
+    print(f"[correctness] MODULE-LOAD-ERROR: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not hasattr(mod, "add") or not callable(mod.add):
+    print("[correctness] MODULE-SHAPE-ERROR: add() missing or not callable",
+          file=sys.stderr)
+    sys.exit(1)
+
+# Runtime check.
+try:
+    got = mod.add(2, 3)
+except Exception as exc:  # noqa: BLE001
+    print(f"[correctness] RUNTIME-ERROR: add(2, 3) raised {exc!r}",
+          file=sys.stderr)
+    sys.exit(1)
+
+if got != 5:
+    print(f"[correctness] VALUE-ERROR: add(2, 3) returned {got!r}, expected 5",
+          file=sys.stderr)
+    sys.exit(1)
+
+# Structural check — reject ``return 5`` and other hard-code cheats.
+tree = ast.parse(source)
+funcs = [n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "add"]
+if not funcs:
+    print("[correctness] AST-ERROR: no def add() in module", file=sys.stderr)
+    sys.exit(1)
+
+has_add_op = False
+for func in funcs:
+    for node in ast.walk(func):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            has_add_op = True
+            break
+        # sum([a, b]) / operator.add(a, b) also qualify as "semantic add".
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", "") or getattr(
+                getattr(node.func, "attr", None), "__str__", lambda: ""
+            )()
+            if name in ("sum", "add"):
+                has_add_op = True
+                break
+
+if not has_add_op:
+    print("[correctness] AST-ERROR: add() body has no + BinOp / sum(...) call",
+          file=sys.stderr)
+    sys.exit(1)
+
+print("[correctness] OK: add(2, 3) == 5, AST contains + BinOp")
+sys.exit(0)
+PYEOF
+then
+    echo "[test_aider.sh] FAIL: add.py correctness check failed" >&2
     echo "--- final add.py ---" >&2
     cat "$WORKDIR/add.py" >&2
     exit 3
 fi
+
+echo "[test_aider.sh] PASS: add(2, 3) == 5 after aider rewrite"
+exit 0
