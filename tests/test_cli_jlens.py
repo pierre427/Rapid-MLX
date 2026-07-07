@@ -267,6 +267,27 @@ def test_prefetch_via_mirror_skips_local_paths(tmp_path) -> None:
     fake.assert_not_called()
 
 
+def test_looks_like_hf_repo_id_rejects_non_hf_shapes() -> None:
+    """The tightened heuristic — HF ids are exactly ``owner/name``. Codex
+    nit on PR #1045: without this, ``./missing/model``, ``/tmp/model``,
+    ``foo/bar/baz`` and URLs would each incur a wasted
+    ``download_with_mirror_fallback`` → ``model_info`` HF round-trip
+    before ``mlx_lm.load`` had a chance to reject them locally."""
+    # Positive cases — canonical HF ids.
+    assert jlens._looks_like_hf_repo_id("mlx-community/Qwen3-1.7B-4bit")
+    assert jlens._looks_like_hf_repo_id("meta-llama/Llama-3.1-8B")
+    # Negative cases — everything else.
+    assert not jlens._looks_like_hf_repo_id("")
+    assert not jlens._looks_like_hf_repo_id("qwen3-1.7b")  # no slash
+    assert not jlens._looks_like_hf_repo_id("foo/bar/baz")  # too many parts
+    assert not jlens._looks_like_hf_repo_id("/tmp/model")  # absolute path
+    assert not jlens._looks_like_hf_repo_id("./missing/model")  # relative path
+    assert not jlens._looks_like_hf_repo_id("~/models/foo")  # home-relative
+    assert not jlens._looks_like_hf_repo_id("https://hf.co/mlx-community/X")
+    assert not jlens._looks_like_hf_repo_id("/only-name")  # empty owner
+    assert not jlens._looks_like_hf_repo_id("only-owner/")  # empty name
+
+
 def test_prefetch_via_mirror_prefers_mirror_for_hf_repos() -> None:
     """A ``mlx-community/Foo`` id must be handed to the mirror before HF."""
     from unittest.mock import MagicMock

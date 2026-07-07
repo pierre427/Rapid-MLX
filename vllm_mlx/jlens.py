@@ -73,7 +73,9 @@ def _prefetch_via_mirror(model_path: str) -> bool:
     Best-effort: any exception here is swallowed — the mirror is a UX
     optimization, not a correctness dependency for ``jlens``.
     """
-    if not model_path or "/" not in model_path or os.path.exists(model_path):
+    if not _looks_like_hf_repo_id(model_path):
+        return False
+    if os.path.exists(model_path):
         return False
     try:
         from ._mirror import download_with_mirror_fallback
@@ -88,6 +90,32 @@ def _prefetch_via_mirror(model_path: str) -> bool:
         # handle it via HF". Don't fail the whole jlens invocation over
         # a mirror hiccup.
         return False
+
+
+def _looks_like_hf_repo_id(model_path: str) -> bool:
+    """Return True if ``model_path`` is shaped like a HuggingFace ``owner/name``.
+
+    Codex nit on PR #1045: a bare ``"/" in model_path`` check treats
+    ``./missing/model``, ``/tmp/model``, ``foo/bar/baz``, and URLs like
+    ``https://hf.co/mlx-community/X`` as mirror-eligible. Each of those
+    would hit ``download_with_mirror_fallback`` → ``model_info`` (a real
+    HF API round-trip) before mlx_lm.load ever gets a chance to reject
+    them locally. Match HuggingFace's own repo-id shape here so garbage
+    inputs short-circuit.
+    """
+    if not model_path:
+        return False
+    if "://" in model_path:  # a URL
+        return False
+    if model_path.startswith(("/", ".", "~")):  # absolute / relative / home
+        return False
+    parts = model_path.split("/")
+    if len(parts) != 2:  # exactly one slash separating owner and name
+        return False
+    owner, name = parts
+    if not owner or not name:
+        return False
+    return True
 
 
 def _load_model(model_path: str):
