@@ -116,6 +116,10 @@ class JLensAnalyzer:
         self.unembed = _get_unembed(model, self.inner)
         self.n_layers = len(self.inner.layers)
         self._use_jvp = True
+        # Decoder blocks differ in call signature: some are layer(x, mask) with
+        # a defaulted cache, others require layer(x, mask, cache) explicitly
+        # (e.g. mlx_lm StableLM). Probed once on first use, then reused.
+        self._layer_mode = None
         try:
             from mlx_lm.models.base import create_attention_mask
 
@@ -132,6 +136,22 @@ class JLensAnalyzer:
         length = h.shape[1]
         return mx.triu(mx.full((length, length), -1e9, dtype=h.dtype), k=1)
 
+    def _run_layer(self, layer, h, mask):
+        """Call a decoder block, tolerating both cache-optional and
+        cache-required signatures. The working form is detected once."""
+        if self._layer_mode == "no_cache":
+            return layer(h, mask)
+        if self._layer_mode == "cache":
+            return layer(h, mask, None)
+        try:  # probe: cache-optional signature layer(x, mask)
+            out = layer(h, mask)
+            self._layer_mode = "no_cache"
+            return out
+        except TypeError:  # cache-required signature layer(x, mask, cache)
+            out = layer(h, mask, None)
+            self._layer_mode = "cache"
+            return out
+
     def _pre_states(self, text):
         """Return (pre, mask, seq_len) where pre[l] enters layer l (pre[0]=embed)."""
         mx = self._mx
@@ -142,7 +162,7 @@ class JLensAnalyzer:
             pre = []
             for layer in self.inner.layers:
                 pre.append(h)
-                h = layer(h, mask)
+                h = self._run_layer(layer, h, mask)
         except (TypeError, ValueError) as exc:  # linear-attn / hybrid masks
             raise UnsupportedArchitectureError(
                 f"forward pass is not J-lens compatible ({type(exc).__name__}: {exc})"
@@ -157,7 +177,7 @@ class JLensAnalyzer:
         def f(x):
             h = x
             for layer in layers[layer_idx:]:
-                h = layer(h, mask)
+                h = self._run_layer(layer, h, mask)
             return self.inner.norm(h)
 
         if self._use_jvp:

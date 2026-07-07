@@ -155,6 +155,29 @@ def test_render_text_survives_missing_completion() -> None:
     assert "answer 'Paris'" in out
 
 
+def test_run_layer_handles_both_cache_signatures() -> None:
+    """Some decoder blocks are layer(x, mask); others require an explicit
+    cache arg (mlx_lm StableLM). _run_layer probes and adapts to either."""
+
+    class CacheOptional:
+        def __call__(self, x, mask=None, cache=None):
+            return x + 1
+
+    class CacheRequired:
+        def __call__(self, x, mask, cache):  # no default → needs the arg
+            return x + 10
+
+    a = jlens.JLensAnalyzer.__new__(jlens.JLensAnalyzer)
+    a._layer_mode = None
+    assert a._run_layer(CacheOptional(), 0, "m") == 1
+    assert a._layer_mode == "no_cache"
+
+    b = jlens.JLensAnalyzer.__new__(jlens.JLensAnalyzer)
+    b._layer_mode = None
+    assert b._run_layer(CacheRequired(), 0, "m") == 10
+    assert b._layer_mode == "cache"
+
+
 def test_render_verbose_has_per_layer_table_and_rank_trajectory() -> None:
     out = jlens.render_verbose(_fake_result(), "Qwen3-1.7B-4bit")
     # includes the concise summary
