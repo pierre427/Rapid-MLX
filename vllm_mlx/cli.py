@@ -7721,6 +7721,12 @@ Examples:
         action="store_true",
         help="Emit machine-readable JSON instead of the rendered view",
     )
+    jlens_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show full per-layer readouts and the answer's rank trajectory",
+    )
 
     # Agents command
     agents_parser = subparsers.add_parser(
@@ -8150,7 +8156,7 @@ Examples:
     # NOT inherit the bypass. Codex round-2 BLOCKING #2.
     _chat_spawn_child = os.environ.pop("RAPID_MLX_CHAT_SPAWN", "") == "1"
 
-    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench"}
+    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench", "jlens"}
     if (
         getattr(args, "command", None) in _GATED_COMMANDS
         and hasattr(args, "model")

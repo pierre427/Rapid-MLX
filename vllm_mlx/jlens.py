@@ -162,8 +162,12 @@ class JLensAnalyzer:
 
         if self._use_jvp:
             try:
+                # mx.jvp returns (outputs, jvps) as lists, one entry per fn
+                # output; f returns a single [batch, seq, hidden] array, so we
+                # unwrap the length-1 list. jout[0] keeps the batch dim (it is
+                # the full 3-D array), matching the finite-difference path below.
                 _, jout = mx.jvp(f, (pre_l,), (tangent,))
-                return jout[0]
+                return jout[0] if isinstance(jout, (list, tuple)) else jout
             except Exception:  # autodiff unsupported → forward-mode fallback
                 self._use_jvp = False
         eps = 1e-3
@@ -215,12 +219,20 @@ class JLensAnalyzer:
         layers = list(range(0, self.n_layers, step))
         if layers[-1] != self.n_layers - 1:
             layers.append(self.n_layers - 1)
-        jl_top, ll_top = {}, {}
+        jl_top, ll_top, jl_vecs = {}, {}, {}
         for li in layers:
             h = pre[li][:, -1, :]
-            jl_top[li] = self._top(self._jlens(h, li))
+            jl_vec = self._jlens(h, li)
+            jl_vecs[li] = jl_vec
+            jl_top[li] = self._top(jl_vec)
             ll_top[li] = self._top(self._logit_lens(h))
-        answer = jl_top[layers[-1]][0]
+        # Anchor the answer to the final-layer argmax token id so its rank can
+        # be traced across layers (the Fig-5 "rank trajectory" view).
+        answer_id = int(mx.argmax(jl_vecs[layers[-1]]))
+        answer = self.tok.decode([answer_id]).strip()
+        answer_rank = {
+            li: int((jl_vecs[li] > jl_vecs[li][answer_id]).sum()) for li in layers
+        }
 
         def first(topd):
             for li in layers:
@@ -234,6 +246,7 @@ class JLensAnalyzer:
             "n_layers": self.n_layers,
             "layers": layers,
             "answer": answer,
+            "answer_rank_by_layer": answer_rank,
             "jlens_first_layer": first(jl_top),
             "logit_lens_first_layer": first(ll_top),
             "jlens_by_layer": jl_top,
@@ -320,8 +333,32 @@ def render_text(result, model_label):
     return "\n".join(out)
 
 
+def render_verbose(result, model_label):
+    """Fuller "Fig-5"-style view: the concise summary, then per-layer ranked
+    readouts and the answer token's rank trajectory across depth."""
+    layers = result["layers"]
+    jl = result["jlens_by_layer"]
+    ll = result["logit_lens_by_layer"]
+    ranks = result.get("answer_rank_by_layer", {})
+    ans = result["answer"]
+    out = [render_text(result, model_label).rstrip("\n"), ""]
+    out.append("per-layer readouts  (top tokens, ranked left→right)")
+    out.append(f"{'L':>4} | {'J-lens':<46} | logit lens")
+    for li in layers:
+        out.append(f"{li:>4} | {'  '.join(jl[li]):<46} | {'  '.join(ll[li])}")
+    if ranks:
+        out.append("")
+        out.append(f"rank trajectory of answer {ans!r}  (0 = top-1, lower is stronger)")
+        out.append("  " + "  ".join(f"L{li}:{ranks[li]}" for li in layers))
+    out.append("")
+    return "\n".join(out)
+
+
 def jlens_command(args):
     """Entry point for ``rapid-mlx jlens``."""
+    if getattr(args, "step", 1) < 1:
+        print(f"\n  Error: --step must be a positive integer (got {args.step}).\n")
+        sys.exit(2)
     model_path = args.model
     label = getattr(args, "_original_alias", None) or os.path.basename(model_path)
     try:
@@ -343,5 +380,7 @@ def jlens_command(args):
             result
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif getattr(args, "verbose", False):
+        print(render_verbose(result, label))
     else:
         print(render_text(result, label))

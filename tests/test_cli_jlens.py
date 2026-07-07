@@ -110,12 +110,17 @@ def _fake_result() -> dict:
     jl[27] = ["Paris", "France", "巴黎"]
     ll = {li: ["____", "a", ","] for li in layers}
     ll[24] = ["Paris", "____", "France"]
+    ranks = {li: 500 for li in layers}
+    ranks[21] = 2
+    ranks[24] = 0
+    ranks[27] = 0
     return {
         "prompt": "The capital of France is",
         "completion": "Paris, the",
         "n_layers": 28,
         "layers": layers,
         "answer": "Paris",
+        "answer_rank_by_layer": ranks,
         "jlens_first_layer": 21,
         "logit_lens_first_layer": 24,
         "jlens_by_layer": jl,
@@ -148,6 +153,16 @@ def test_render_text_survives_missing_completion() -> None:
     out = jlens.render_text(r, "m")
     assert "model continues" not in out
     assert "answer 'Paris'" in out
+
+
+def test_render_verbose_has_per_layer_table_and_rank_trajectory() -> None:
+    out = jlens.render_verbose(_fake_result(), "Qwen3-1.7B-4bit")
+    # includes the concise summary
+    assert "internal trajectory" in out
+    # plus the fuller per-layer readouts and the rank trajectory
+    assert "per-layer readouts" in out
+    assert "rank trajectory of answer 'Paris'" in out
+    assert "L24:0" in out  # answer is top-1 at layer 24
 
 
 # --- command wiring (mocked model, no weights) ------------------------------
@@ -195,3 +210,19 @@ def test_jlens_command_unsupported_architecture_exits_2() -> None:
         jlens.jlens_command(_make_args())
     assert exc.value.code == 2
     assert "does not support this model architecture" in buf.getvalue()
+
+
+def test_jlens_command_rejects_nonpositive_step_before_loading() -> None:
+    from unittest.mock import MagicMock
+
+    loader = MagicMock()
+    buf = io.StringIO()
+    with (
+        patch.object(jlens, "_load_model", loader),
+        patch.object(sys, "stdout", buf),
+        pytest.raises(SystemExit) as exc,
+    ):
+        jlens.jlens_command(_make_args(step=0))
+    assert exc.value.code == 2
+    assert "--step must be a positive integer" in buf.getvalue()
+    loader.assert_not_called()  # must fail before loading weights
