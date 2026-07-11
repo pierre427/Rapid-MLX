@@ -3918,9 +3918,21 @@ def _read_local_config_max_context(config_path: str) -> int | None:
     if isinstance(text_config, dict):
         candidates.append(text_config.get("max_position_embeddings"))
     for value in candidates:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
+        # JSON booleans are ``int`` subclasses in Python, and non-integral
+        # JSON numbers may decode to floats (including ``inf`` for a huge
+        # exponent). A context window is an integer schema field: accept an
+        # actual integer or decimal integer string and fail soft on every
+        # other shape.
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                continue
+        else:
             continue
         if parsed > 0:
             return parsed

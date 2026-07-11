@@ -171,6 +171,21 @@ def test_max_context_ignores_malformed_local_tokenizer_config(tmp_path):
     assert get_model_max_context(_StubEngine(tokenizer=tok)) == 4096
 
 
+@pytest.mark.parametrize("invalid_value", ["true", "1e10000"])
+def test_max_context_rejects_invalid_local_config_values(tmp_path, invalid_value):
+    """Boolean and non-finite numeric JSON values must fail soft."""
+    from vllm_mlx.service.helpers import get_model_max_context
+
+    checkpoint = tmp_path / f"invalid-context-{invalid_value}"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        f'{{"max_position_embeddings": {invalid_value}}}'
+    )
+    tok = _StubTokenizer(model_max_length=4096, name_or_path=str(checkpoint))
+
+    assert get_model_max_context(_StubEngine(tokenizer=tok)) == 4096
+
+
 def test_max_context_from_tokenizer_when_model_silent():
     """Engines whose loader doesn't propagate the config still
     surface a useful cap via ``tokenizer.model_max_length``."""
