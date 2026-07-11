@@ -215,6 +215,42 @@ async def test_chat_forwards_token_prompt_and_router_seed(engine, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generate_recovers_router_seed_from_build_prompt(engine, monkeypatch):
+    expected_seed = tuple(
+        _HARMONY_VOCAB[token] for token in _HARMONY_NO_THINKING_SUFFIX_TOKENS
+    )
+
+    class _CoreOutput:
+        output_text = "Plain"
+        output_token_ids = [_HARMONY_VOCAB["Plain"]]
+        prompt_tokens = 1
+        completion_tokens = 1
+        cached_tokens = 0
+        finish_reason = "stop"
+
+    class _Core:
+        async def generate(self, **_kwargs):
+            return _CoreOutput()
+
+    captured = {}
+
+    def _route(token_ids, *, fallback_text, seed_token_ids=None):
+        captured["token_ids"] = token_ids
+        captured["fallback_text"] = fallback_text
+        captured["seed_token_ids"] = seed_token_ids
+        return "", fallback_text, None
+
+    engine._engine = _Core()
+    monkeypatch.setattr(engine, "_route_tokens_for_channels", _route)
+    prepared_prompt = "<|start|>assistant" + "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+
+    output = await engine.generate(prepared_prompt)
+
+    assert output.text == "Plain"
+    assert captured["seed_token_ids"] == expected_seed
+
+
+@pytest.mark.asyncio
 async def test_stream_chat_primes_router_for_prompt_opened_final_channel(
     engine, monkeypatch
 ):

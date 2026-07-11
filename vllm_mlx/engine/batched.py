@@ -1682,6 +1682,23 @@ class BatchedEngine(BaseEngine):
         # below before the tool parser scans it.
         assistant_text_prefix = kwargs.pop("_assistant_text_prefix", "") or ""
         output_router_seed = kwargs.pop("_output_router_seed_token_ids", None)
+        if output_router_seed is None and isinstance(prompt, str):
+            # ``build_prompt(enable_thinking=False)`` is part of the public
+            # engine contract and returns the prepared Harmony string. A
+            # caller may feed that string back into ``generate()`` without
+            # going through ``chat()``, which is normally responsible for
+            # carrying the private router seed. Recover the seed from the
+            # exact prepared suffix so routing starts in the prompt-opened
+            # final channel on that composition path too.
+            suffix = "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+            if prompt.endswith(suffix):
+                base_prompt = prompt[: -len(suffix)]
+                _, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+                    base_prompt,
+                    enable_thinking=False,
+                    has_tools=False,
+                    as_token_ids=False,
+                )
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
