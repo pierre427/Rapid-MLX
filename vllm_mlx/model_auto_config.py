@@ -287,7 +287,7 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
     (
         re.compile(r"qwen3[-_]?(coder[-_]?next|next)", re.IGNORECASE),
         ModelConfig(
-            tool_call_parser="hermes",
+            tool_call_parser="qwen3_coder_xml",
             reasoning_parser=None,
             is_hybrid=True,
             supports_spec_decode=False,
