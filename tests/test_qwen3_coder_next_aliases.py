@@ -15,7 +15,7 @@ _CANONICAL_ALIASES = (
     ),
     (
         "qwen3-coder-next-80b-8bit",
-        "lmstudio-community/Qwen3-Next-80B-A3B-Instruct-MLX-8bit",
+        "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
     ),
 )
 
@@ -87,3 +87,4 @@ def test_qwen3_coder_next_direct_paths_use_xml_tools_without_reasoning(
     assert config.reasoning_parser is None
     assert config.is_hybrid is True
     assert config.supports_spec_decode is False
+    assert config.supports_dflash is False

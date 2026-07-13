@@ -498,7 +498,7 @@
     }
   },
   "qwen3-coder-next-80b-8bit": {
-    "hf_path": "lmstudio-community/Qwen3-Next-80B-A3B-Instruct-MLX-8bit",
+    "hf_path": "lmstudio-community/Qwen3-Coder-Next-MLX-8bit",
     "tool_call_parser": "qwen3_coder_xml",
     "reasoning_parser": null,
     "is_hybrid": true,
