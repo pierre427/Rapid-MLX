@@ -11,6 +11,9 @@ the observability added for that regime — ``PFlashResult.endpoints_only`` /
 and assert the normal compression path stays unflagged.
 """
 
+import logging
+
+import vllm_mlx.pflash as pflash
 from vllm_mlx.pflash import (
     PFlashConfig,
     compress_request_tokens,
@@ -71,3 +74,26 @@ class TestPFlashEndpointsOnly:
         assert result.compressed is True
         assert result.middle_tokens_kept > 0
         assert result.endpoints_only is False
+
+    def test_endpoints_only_warns_at_most_once_per_process(self, caplog):
+        # Reset the module-global warn-once flag so the assertion is independent
+        # of test ordering / prior process state.
+        pflash._ENDPOINTS_ONLY_WARNED = False
+        try:
+            with caplog.at_level(logging.WARNING, logger="vllm_mlx.pflash"):
+                # First endpoints-only collapse: must emit exactly one warning.
+                first = compress_tokens(list(range(3000)), PFlashConfig(mode="always"))
+                assert first.endpoints_only is True
+                # A second, separate collapse must NOT log again.
+                second = compress_tokens(list(range(4000)), PFlashConfig(mode="always"))
+                assert second.endpoints_only is True
+
+            endpoints_warnings = [
+                rec
+                for rec in caplog.records
+                if rec.levelno == logging.WARNING
+                and "PFlash endpoints-only" in rec.getMessage()
+            ]
+            assert len(endpoints_warnings) == 1
+        finally:
+            pflash._ENDPOINTS_ONLY_WARNED = False

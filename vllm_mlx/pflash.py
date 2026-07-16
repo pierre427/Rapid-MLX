@@ -25,6 +25,7 @@ This adaptation differs from the fork in three places:
 from __future__ import annotations
 
 import logging
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from math import ceil
@@ -37,7 +38,10 @@ logger = logging.getLogger(__name__)
 # middle span is dropped). It is a config-level footgun rather than a per-request
 # event, so one warning is the right dosage; per-request occurrences are still
 # exposed via the ``endpoints_only`` / ``middle_tokens_kept`` metadata for metrics.
+# The lock makes the check-then-set atomic so concurrent requests can't both
+# observe ``False`` and each emit the "once" warning.
 _ENDPOINTS_ONLY_WARNED = False
+_ENDPOINTS_ONLY_WARN_LOCK = threading.Lock()
 
 PFlashMode = Literal["off", "auto", "always"]
 
@@ -313,8 +317,16 @@ def compress_tokens(
         # middle span is dropped and mid-document recall falls to ~0. Warn once
         # (it is a config-level footgun) with the numbers an operator needs.
         global _ENDPOINTS_ONLY_WARNED
+        should_warn = False
         if not _ENDPOINTS_ONLY_WARNED:
-            _ENDPOINTS_ONLY_WARNED = True
+            # Double-checked locking: cheap unlocked read on the hot path, then
+            # take the lock only to atomically re-check and flip the flag so a
+            # single winner emits the once-per-process warning below.
+            with _ENDPOINTS_ONLY_WARN_LOCK:
+                if not _ENDPOINTS_ONLY_WARNED:
+                    _ENDPOINTS_ONLY_WARNED = True
+                    should_warn = True
+        if should_warn:
             logger.warning(
                 "PFlash endpoints-only: sink(%d)+tail(%d) meet or exceed the keep "
                 "budget (%d) for a %d-token prompt, so all %d middle tokens are "
