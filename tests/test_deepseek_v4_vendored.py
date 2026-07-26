@@ -62,7 +62,7 @@ def test_register_vendored_archs_is_idempotent():
 
 def test_deepseek_v4_rope_honors_explicit_yarn_attention_factor():
     """HF's explicit YaRN attention factor scales only rotary channels."""
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
 
     from vllm_mlx.models.deepseek_v4 import DeepseekV4RoPE
 
