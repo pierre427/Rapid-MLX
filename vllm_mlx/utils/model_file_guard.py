@@ -42,7 +42,7 @@ def validate_local_model_file(model_name: str | Path) -> None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Unable to read local model config at {config_path}") from exc
 
-    if not isinstance(config, dict) or "model_file" not in config:
+    if not isinstance(config, dict) or config.get("model_file") is None:
         return
 
     model_file = config["model_file"]

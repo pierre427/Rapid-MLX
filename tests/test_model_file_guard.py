@@ -11,7 +11,7 @@ import pytest
 from vllm_mlx.utils.model_file_guard import validate_local_model_file
 
 
-def _model_dir(tmp_path: Path, model_file: str) -> Path:
+def _model_dir(tmp_path: Path, model_file: str | None) -> Path:
     model_root = tmp_path / "model"
     model_root.mkdir()
     (model_root / "config.json").write_text(
@@ -33,6 +33,12 @@ def test_accepts_local_model_without_custom_model_file(tmp_path: Path) -> None:
     model_root = tmp_path / "model"
     model_root.mkdir()
     (model_root / "config.json").write_text("{}", encoding="utf-8")
+
+    validate_local_model_file(model_root)
+
+
+def test_accepts_null_model_file(tmp_path: Path) -> None:
+    model_root = _model_dir(tmp_path, None)
 
     validate_local_model_file(model_root)
 
