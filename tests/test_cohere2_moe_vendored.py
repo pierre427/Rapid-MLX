@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+from vllm_mlx.model_aliases import resolve_model
 from vllm_mlx.model_auto_config import detect_model_config
 from vllm_mlx.models import cohere2_moe
 from vllm_mlx.utils import tokenizer
@@ -96,5 +97,22 @@ def test_checkpoint_profile_uses_native_parser_and_conservative_capabilities() -
 
     assert profile is not None
     assert profile.tool_call_parser == "cohere"
+    assert profile.reasoning_parser == "cohere"
+    assert profile.is_moe is True
+    assert profile.supports_spec_decode is False
+
+
+def test_public_4bit_alias_uses_native_parser_and_conservative_capabilities() -> None:
+    assert (
+        resolve_model("north-mini-code-4bit")
+        == "mlx-community/North-Mini-Code-1.0-4bit"
+    )
+
+    profile = detect_model_config("north-mini-code-4bit")
+
+    assert profile is not None
+    assert profile.hf_path == "mlx-community/North-Mini-Code-1.0-4bit"
+    assert profile.tool_call_parser == "cohere"
+    assert profile.reasoning_parser == "cohere"
     assert profile.is_moe is True
     assert profile.supports_spec_decode is False
