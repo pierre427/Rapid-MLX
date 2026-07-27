@@ -103,9 +103,7 @@ def test_loader_registration_and_auto_profile_dispatch():
     # The official repository's outer config declares the multimodal wrapper
     # type, and that is the model_type the loader dispatches on.
     assert "apertus1p5" in tokenizer._VENDORED_MODEL_TYPES
-    wrapper_model_class, wrapper_args_class = _get_classes(
-        {"model_type": "apertus1p5"}
-    )
+    wrapper_model_class, wrapper_args_class = _get_classes({"model_type": "apertus1p5"})
     assert wrapper_model_class is module.Model
     assert wrapper_args_class is module.ModelArgs
 
