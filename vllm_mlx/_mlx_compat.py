@@ -131,3 +131,13 @@ def install() -> None:
     mx.new_thread_local_stream = patched_new_thread_local_stream
     mx._rapid_mlx_compat_installed = True
     logger.debug("MLX compat shim installed (#404 M5 single-stream guard).")
+
+    try:
+        from vllm_mlx.patches.switch_layers_gather_pad import (
+            install as _install_switch_layers_gather_pad,
+        )
+    except ImportError:
+        return
+
+    if _install_switch_layers_gather_pad():
+        logger.debug("MLX compat shim installed sorted gather row-alignment guard.")
