@@ -2587,9 +2587,7 @@ class TestCheckpointMetadataFallback:
         assert config.tool_call_parser is None
         assert config.is_moe is True
 
-    def test_granitemoe_swa_set_captured_marker_is_not_wire_evidence(
-        self, monkeypatch
-    ):
+    def test_granitemoe_swa_set_captured_marker_is_not_wire_evidence(self, monkeypatch):
         """A marker swallowed by a ``{% set %}`` capture is not rendered."""
         monkeypatch.setattr(
             auto_config_mod,
