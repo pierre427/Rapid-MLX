@@ -5,12 +5,6 @@ AXApplication title="Rapid-MLX"
       AXTextField id="ConversationSearch.Field" value=text enabled=true
       AXButton id="ConversationSearch.Clear" desc="Clear search" help="Clear search" enabled=true
       AXButton id="ConversationSearch.Close" desc="Close" help="Close — Esc" enabled=true
-      AXUnknown id="ConversationSearch.Panel" enabled=true
-      AXScrollArea
-        AXOpaqueProviderGroup subrole=AXOpaqueProviderList enabled=true
-          AXButton id="ConversationSearch.NewChat" desc="New chat" enabled=true
-          AXHeading desc="<relative-day>" enabled=true
-          AXButton id="ConversationSearch.Result.<uuid>" desc="golden restore marker" enabled=true
       AXSplitGroup id="main, SidebarNavigationSplitView"
         AXGroup subrole=AXHostingView
           AXButton id="Sidebar.NewChat" desc="New Chat" enabled=true
@@ -20,22 +14,32 @@ AXApplication title="Rapid-MLX"
           AXScrollArea
             AXHeading desc="<relative-day>" enabled=true
             AXButton id="Sidebar.Conversation.<uuid>" desc="golden restore marker" enabled=true
+          AXImage id="Sidebar.Residency" desc="memorychip" enabled=true
+          AXStaticText id="Sidebar.Residency" value=text enabled=true
+          AXStaticText id="Sidebar.Residency" value=text enabled=true
+          AXProgressIndicator id="Sidebar.Residency" value=number enabled=true
+          AXImage id="Sidebar.Residency" desc="Lock" enabled=true
+          AXStaticText id="Sidebar.Residency" value=text enabled=true
+          AXStaticText id="Sidebar.Residency" value=text enabled=true
         AXSplitter value=number enabled=false
         AXGroup subrole=AXHostingView
           AXStaticText value=text enabled=true
           AXStaticText value=text enabled=true
-          AXGroup desc="Starting <model>, Loading the model into memory…" enabled=true
-            AXStaticText value=text enabled=true
-            AXStaticText value=text enabled=true
           AXStaticText value=text enabled=true
           AXScrollArea
             AXTextArea id="rapid.chat.compose" desc="Message compose field" value=empty
-          AXButton id="ChatView.AddPhotos" desc="Add photos" help="This model doesn't support images" enabled=false
+          AXButton id="ChatView.AddAttachments" desc="Add attachments" help="Add PDF, CSV, or TXT files" enabled=true
           AXButton id="ChatView.ConversationInstructions" desc="Conversation instructions" help="Conversation instructions" enabled=true
           AXPopUpButton id="ModelPickerBar.ModelMenu" desc="Model" help="Choose which model to run" value=text enabled=true
-          AXButton id="info.circle" desc="Show model details" help="Show model details" enabled=true
-          AXButton id="ChatView.SendOrStopButton" desc="Send message" help="<model> is still starting." enabled=false
-      AXButton desc="Settings" help="Settings — ⌘," enabled=true
+          AXButton id="ModelPickerBar.ModelInfo" desc="Show model details" help="Show model details" enabled=true
+          AXButton id="ChatView.SendOrStopButton" desc="Send message" enabled=false
+      AXUnknown id="ConversationSearch.Panel" enabled=true
+      AXScrollArea
+        AXOpaqueProviderGroup subrole=AXOpaqueProviderList enabled=true
+          AXButton id="ConversationSearch.NewChat" desc="New chat" enabled=true
+          AXHeading desc="<relative-day>" enabled=true
+          AXButton id="ConversationSearch.Result.<uuid>" desc="golden restore marker" enabled=true
+      AXButton id="ContentView.Settings" desc="Settings" help="Settings — ⌘," enabled=true
       AXButton id="ContentView.ToggleLogs" desc="Show logs" help="Show logs" enabled=true
       AXUnknown desc="Server status" enabled=true
       AXUnknown desc="Tokens per second: no data yet" enabled=true
@@ -46,7 +50,6 @@ AXApplication title="Rapid-MLX"
     AXToolbar
       AXButton desc="Hide Sidebar" enabled=true
       AXButton id="Toolbar.SearchChats" desc="Search chats" enabled=true
-        AXButton id="Toolbar.SearchChats" desc="Search chats" help="Search chats - Command-K" enabled=true
     AXButton subrole=AXCloseButton enabled=true
     AXButton subrole=AXFullScreenButton help="this button also has an action to zoom the window" enabled=true
     AXButton subrole=AXMinimizeButton enabled=true

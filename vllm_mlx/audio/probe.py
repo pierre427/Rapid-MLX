@@ -387,12 +387,6 @@ def _dry_run_tts(model_name: str | None) -> tuple[bool, str | None]:
         return False, f"TTS dry-run failed: {type(e).__name__}: {e}"
 
 
-def _reset_lane_status() -> None:
-    """Test hook: clear recorded lane statuses."""
-    _LANE_STATUS.clear()
-    _LANE_REASON.clear()
-
-
 def _espeak_selftest_subprocess(
     lib: str | None = None, data: str | None = None, timeout: float = 30.0
 ) -> bool:
@@ -1197,7 +1191,7 @@ AUDIO_EXTRA_INSTALL_HINT = "Install with: pip install 'rapid-mlx[audio]'"
 # (``mlx-community/Kokoro-82M-bf16``, ``mlx-community/whisper-large-v3-mlx``)
 # — those are the canonical pass-through cases the STT/TTS routes
 # accept, so the boot guard MUST recognise them as audio too. Codex
-# review NIT: the previous comment claimed HF ids "fell through"; the
+# raised in review: the previous comment claimed HF ids "fell through"; the
 # code (and test ``test_is_audio_model_alias_recognises_common_aliases``)
 # disagree — they ARE matched, and intentionally so.
 #

@@ -349,9 +349,11 @@ struct ModelPickerBar: View {
                 Task { await runDeletion(of: entry) }
                 pendingDeletion = nil
             }
+            .accessibilityIdentifier("ModelPickerBar.Delete.Confirm")
             Button("Keep on disk", role: .cancel) {
                 pendingDeletion = nil
             }
+            .accessibilityIdentifier("ModelPickerBar.Delete.Cancel")
         } message: { entry in
             Text("Removes this model from your Mac. You can download it again later by selecting it.\(entry.sizeOnDisk.map { " Frees \($0)." } ?? "")")
         }
@@ -399,6 +401,7 @@ struct ModelPickerBar: View {
                 Text("Fetching models…")
                 Divider()
                 Button("Type a model name…") { showCustom = true }
+                    .accessibilityIdentifier("ModelPickerBar.CustomAlias.Open")
             } else if !hasSelectableRows {
                 // v0.4.29: previously this state was a dead end — a
                 // failed first-load (bootstrapper still installing
@@ -423,7 +426,9 @@ struct ModelPickerBar: View {
                 Button("Refresh catalog") {
                     Task { await refreshCatalog(force: true) }
                 }
+                .accessibilityIdentifier("ModelPickerBar.RefreshCatalog")
                 Button("Type a model name…") { showCustom = true }
+                    .accessibilityIdentifier("ModelPickerBar.CustomAlias.Open")
             } else {
                 // v0.6.9: dropped the separate "Cached" section. Users
                 // skim the picker by alias name, not by cache-state —
@@ -610,6 +615,7 @@ struct ModelPickerBar: View {
             Image(systemName: "info.circle")
                 .font(.system(size: 14))
         }
+        .accessibilityIdentifier("ModelPickerBar.ModelInfo")
         .buttonStyle(.plain)
         .disabled(alias.isEmpty)
         .help("Show model details")
@@ -714,6 +720,7 @@ struct ModelPickerBar: View {
                 systemImage: ModelPickerBar.cacheGlyph(cached: entry.cached)
             )
         }
+        .accessibilityIdentifier("ModelPickerBar.Quickstart.\(entry.alias)")
         .disabled(deleting == entry.alias)
         .help(ModelPickerBar.quickstartSubtitle)
         .accessibilityLabel(ModelPickerBar.quickstartRowAccessibilityLabel(
@@ -958,6 +965,7 @@ struct ModelPickerBar: View {
             // section where that matters most.
             Label(title, systemImage: ModelPickerBar.cacheGlyph(cached: entry.cached))
         }
+        .accessibilityIdentifier("ModelPickerBar.Recommended.\(entry.alias)")
         .disabled(deleting == entry.alias)
         // The recommendation shows only the curated capability / speed
         // tagline — the single source of truth for a pick. The per-axis
@@ -1082,6 +1090,7 @@ struct ModelPickerBar: View {
                 systemImage: ModelPickerBar.cacheGlyph(cached: entry.cached)
             )
         }
+        .accessibilityIdentifier("ModelPickerBar.Alias.\(entry.alias)")
         .disabled(deleting == entry.alias)
         // cycle-10: rows in the .tiny (< 1B) and .small (>= 1B,
         // cycle-11 < 3B) buckets get a richer hover tooltip surfacing
@@ -1128,6 +1137,7 @@ struct ModelPickerBar: View {
                         Text("Delete from disk")
                     }
                 }
+                .accessibilityIdentifier("ModelPickerBar.Context.Delete.\(entry.alias)")
             }
             // v0.5.7: side-car download affordance. Only offered when
             // the alias isn't cached and isn't already being pulled.
@@ -1141,6 +1151,7 @@ struct ModelPickerBar: View {
                 } label: {
                     Text("Download in background")
                 }
+                .accessibilityIdentifier("ModelPickerBar.Context.Download.\(entry.alias)")
             }
         }
     }
@@ -1474,7 +1485,10 @@ struct ModelPickerBar: View {
     }
 
     private var startButtonLabel: String {
-        selectedAliasIsCached ? "Start" : "Download & start"
+        // Two-step: name one action at a time. Uncached ⇒ "Download" (fetch
+        // only); once on disk the same button becomes "Start" (load). Matches
+        // the readiness banner so both controls speak the same verb.
+        selectedAliasIsCached ? "Start" : "Download"
     }
 
     private var startButtonIcon: String {
@@ -1506,7 +1520,7 @@ struct ModelPickerBar: View {
         }
         return selectedAliasIsCached
             ? "Start the model (cached locally)"
-            : "Download from Hugging Face, then start. Can take several minutes on first run."
+            : "Download the weights from Hugging Face. Start it once the download finishes. Can take several minutes on first run."
     }
 
     // MARK: - v0.6.9 tooBig Start guard
@@ -1527,6 +1541,18 @@ struct ModelPickerBar: View {
     private func handleStartTap() {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // Two-step: an uncached tap only DOWNLOADS. No .tooBig / memory guard
+        // here — those belong to Start, once the weights are on disk and the
+        // user asks to load them. The button flips to "Start" when the pull
+        // lands (``selectedAliasIsCached``). Matches the readiness banner's
+        // ``download`` action.
+        if !selectedAliasIsCached {
+            let hfPath = catalog.first(where: { $0.alias == trimmed })?.hfRepo
+            if !downloads.isDownloading(trimmed) {
+                _ = downloads.startDownload(alias: trimmed, hfPath: hfPath)
+            }
+            return
+        }
         let fit = ModelSizing.classify(
             ModelSizing.estimate(alias: trimmed),
             on: hardware
@@ -1625,17 +1651,20 @@ struct ModelPickerBar: View {
                 text: $customDraft,
                 onSubmit: commitCustomAlias
             )
+            .accessibilityIdentifier("ModelPickerBar.CustomAlias.Field")
 
             HStack(spacing: RapidTheme.Space.sm) {
                 Spacer()
                 Button("Cancel") { showCustom = false }
                     .buttonStyle(.rapidSecondary)
                     .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("ModelPickerBar.CustomAlias.Cancel")
                 Button("Use", action: commitCustomAlias)
                     .buttonStyle(RapidPrimaryButtonStyle(
                         height: RapidTheme.ControlHeight.medium
                     ))
                     .keyboardShortcut(.return, modifiers: [])
+                    .accessibilityIdentifier("ModelPickerBar.CustomAlias.Use")
             }
             .padding(.top, RapidTheme.Space.xs)
         }
@@ -1682,19 +1711,25 @@ struct ModelPickerBar: View {
 
     /// Pure helper: ``true`` iff a Quickstart flow currently owns
     /// the Start CTA. Disabled phases are ``.lowDiskWarning``,
-    /// ``.downloading``, ``.starting`` (everything between
-    /// "Get started" and "model ready to chat"). ``.idle`` /
-    /// ``.ready`` / ``.failed`` release the gate — ``.idle`` means
+    /// ``.downloading``, ``.starting`` and ``.ready`` (everything
+    /// between "Get started" and the user finishing setup). ``.idle`` /
+    /// ``.dismissed`` / ``.failed`` release the gate — ``.idle`` means
     /// the user hasn't clicked yet (or dismissed the card),
-    /// ``.ready`` means Quickstart finished and ChatView owns the
-    /// frame, ``.failed`` means the user can pick a different model
+    /// ``.dismissed`` means onboarding has released the frame,
+    /// ``.failed`` means the user can pick a different model
     /// from the picker to recover.
+    ///
+    /// ``.ready`` moved from released to in-flight with Onboarding V3.
+    /// It used to mean "Quickstart finished and ChatView owns the frame";
+    /// it now means the onboarding surface is still up, holding the whole
+    /// window, waiting for Start chatting. Releasing the gate there would
+    /// claim the picker owns a CTA the user cannot even see.
     static func isQuickstartInFlight(phase: QuickstartCoordinator.Phase?) -> Bool {
         guard let phase else { return false }
         switch phase {
-        case .lowDiskWarning, .downloading, .starting:
+        case .lowDiskWarning, .downloading, .starting, .ready:
             return true
-        case .idle, .ready, .failed:
+        case .idle, .dismissed, .failed:
             return false
         }
     }
@@ -2033,6 +2068,7 @@ struct ModelInfoPopover: View {
                 }
                 .help("Open on Hugging Face")
                 .accessibilityLabel("Open Hugging Face page")
+                .accessibilityIdentifier("ModelPickerBar.HuggingFace.\(repo)")
             }
         }
     }

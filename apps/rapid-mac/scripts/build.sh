@@ -3,8 +3,8 @@
 #
 # Naming (see issue #164): the .app bundle on disk is
 # ``Rapid-MLX Desktop.app`` for fresh installs. Existing 0.5.21 installs
-# auto-update in place — Installer.swift's helper preserves the
-# existing on-disk filename, so a user with ``/Applications/Rapid.app``
+# auto-update in place — the updater replaces the running bundle at its
+# existing path, so a user with ``/Applications/Rapid.app``
 # keeps that path forever (or until they manually re-install from the
 # DMG). The display name everywhere (Dock, About, menus) reads
 # "Rapid-MLX Desktop" via CFBundleDisplayName.
@@ -36,10 +36,40 @@ swift build -c "$CONFIG"
 
 echo "==> assembling Rapid-MLX Desktop.app"
 rm -rf "$APP"
-mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$CONTENTS/Frameworks"
 cp "$ROOT/.build/$CONFIG/Rapid" "$CONTENTS/MacOS/Rapid"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+
+# SwiftPM links Sparkle dynamically but this app is assembled by hand rather
+# than by Xcode, so its normal "Embed & Sign" phase does not run for us. Copy
+# the complete framework (including symlinks and installer helpers), then add
+# the conventional app-framework search path to the executable before any
+# code signing seals it.
+SPARKLE_FRAMEWORK_SRC="$ROOT/.build/$CONFIG/Sparkle.framework"
+SPARKLE_FRAMEWORK_DST="$CONTENTS/Frameworks/Sparkle.framework"
+if [[ ! -d "$SPARKLE_FRAMEWORK_SRC" ]]; then
+    echo "ERR: SwiftPM Sparkle.framework missing: $SPARKLE_FRAMEWORK_SRC" >&2
+    exit 1
+fi
+ditto "$SPARKLE_FRAMEWORK_SRC" "$SPARKLE_FRAMEWORK_DST"
+if ! otool -l "$CONTENTS/MacOS/Rapid" | grep -Fq '@executable_path/../Frameworks'; then
+    install_name_tool -add_rpath '@executable_path/../Frameworks' "$CONTENTS/MacOS/Rapid"
+fi
+
+# The EdDSA public key is release configuration, injected from an Actions
+# variable. A local build without it deliberately omits SUPublicEDKey and the
+# app keeps using the legacy updater fallback. Fail closed on a malformed key
+# instead of shipping a Sparkle client that can never validate an update.
+if [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
+    if ! printf '%s' "$SPARKLE_PUBLIC_ED_KEY" \
+        | openssl base64 -d -A 2>/dev/null \
+        | wc -c | tr -d ' ' | grep -qx '32'; then
+        echo "ERR: SPARKLE_PUBLIC_ED_KEY must be base64 for a 32-byte Ed25519 public key" >&2
+        exit 1
+    fi
+    plutil -replace SUPublicEDKey -string "$SPARKLE_PUBLIC_ED_KEY" "$CONTENTS/Info.plist"
+fi
 
 # Sentry is being removed from the monorepo app (SENTRY_DSN is no longer
 # a required/plumbed secret). This block is retained as an inert no-op:
@@ -466,6 +496,23 @@ if [[ "$SIGN_IDENTITY" == "-" ]]; then
     codesign --verify --deep --strict "$APP"
 else
     echo "==> Developer ID codesign ($SIGN_IDENTITY)"
+    # Xcode's CodeSignOnCopy phase normally re-signs Sparkle's nested code
+    # with the host application's Team ID. Reproduce that from the inside out
+    # so Sparkle's IPC team checks accept its helpers in this hand-built app.
+    SPARKLE_VERSION="$SPARKLE_FRAMEWORK_DST/Versions/B"
+    for nested in \
+        "$SPARKLE_VERSION/Autoupdate" \
+        "$SPARKLE_VERSION/Updater.app" \
+        "$SPARKLE_VERSION/XPCServices/Downloader.xpc" \
+        "$SPARKLE_VERSION/XPCServices/Installer.xpc"; do
+        codesign --force --options runtime --timestamp \
+            --preserve-metadata=identifier,entitlements,flags \
+            --sign "$SIGN_IDENTITY" "$nested"
+    done
+    codesign --force --options runtime --timestamp \
+        --preserve-metadata=identifier,entitlements,flags \
+        --sign "$SIGN_IDENTITY" "$SPARKLE_FRAMEWORK_DST"
+    codesign --verify --deep --strict "$SPARKLE_FRAMEWORK_DST"
     # No --deep: the sidecar's Mach-Os under Contents/Resources/rapid-mlx/
     # are already individually signed by build-sidecar.sh; this outer
     # (non-deep) codesign hashes their bytes into the .app's resource
@@ -478,12 +525,24 @@ else
     # (allow-jit, disable-library-validation, allow-unsigned-executable-
     # memory) the bundled Python/MLX sidecar needs — see the file's own
     # comments and scripts/sidecar-entitlements.plist (the per-Mach-O
-    # counterpart). No app-sandbox: Rapid is non-sandboxed. The keys are
-    # flagged informationally (not errors) in the notary report.
+    # counterpart) — plus device.audio-input, without which dictation's
+    # microphone request is silently refused in hardened builds (#2134).
+    # No app-sandbox: Rapid is non-sandboxed. The keys are flagged
+    # informationally (not errors) in the notary report.
     codesign --force --options runtime --timestamp \
         --entitlements "$ROOT/Resources/Rapid.entitlements" \
         --sign "$SIGN_IDENTITY" "$APP"
     codesign --verify --strict "$APP"
+    # Dictation is dead without the audio-input entitlement in the SEALED
+    # signature (not just the source plist) — 0.12.16 shipped that way
+    # (#2134). Fail the build rather than notarize another silent brick.
+    # Parse the value, don't grep the name: a sealed <false/> must fail too.
+    audio_input=$(codesign -d --entitlements :- "$APP" 2>/dev/null \
+        | plutil -extract 'com\.apple\.security\.device\.audio-input' raw -o - - 2>/dev/null || true)
+    if [[ "$audio_input" != "true" ]]; then
+        echo "ERROR: sealed entitlements lack com.apple.security.device.audio-input=true (got: '${audio_input:-absent}') — dictation would ship broken (#2134)" >&2
+        exit 1
+    fi
     codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Authority|TeamIdentifier|flags=' || true
 fi
 

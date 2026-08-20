@@ -101,8 +101,58 @@ struct SidebarView: View {
     /// a hover signal the row itself doesn't own.
     @State private var hoveredConversationID: UUID?
 
+    /// Which folders are expanded.
+    ///
+    /// Expanded-by-default (a folder id is absent until the user collapses
+    /// it — see ``isFolderExpanded(_:)``): the user filed those conversations
+    /// deliberately, so the useful default is being able to see them. This is
+    /// the opposite of Archived, which is collapsed by default precisely
+    /// because its whole purpose is getting rows out of the way.
+    @State private var collapsedFolderIDs: Set<UUID> = []
+
+    /// The folder-name prompt currently on screen, if any.
+    ///
+    /// A one-field `.alert` rather than the inline editor the conversation
+    /// rows use. The inline path (``renamingID`` / ``renameSession`` /
+    /// ``renameFieldDidFocus``) exists because a row rename has to happen in
+    /// place, and getting SwiftUI focus to arrive on a field that replaces a
+    /// list row took the whole state machine documented on ``renameField(_:)``.
+    /// Naming a folder has no such constraint, and paying that complexity a
+    /// second time — as a copy or as a risky generalisation of working code —
+    /// buys nothing the alert doesn't already give us, including keyboard
+    /// commit/cancel for free.
+    @State private var folderPrompt: FolderPrompt?
+    @State private var folderNameDraft = ""
+
+    /// The folder a "Delete" has staged for confirmation.
+    @State private var pendingFolderDeletion: ChatFolder?
+
+    /// The folder a dragged row is currently held over, if any. Drives the
+    /// drop highlight so the gesture says where it will land before release.
+    @State private var dropTargetFolderID: UUID?
+
+    /// What the folder-name prompt will do when committed.
+    enum FolderPrompt: Identifiable, Equatable {
+        /// Create a folder. When ``fileConversationID`` is set, the newly
+        /// created folder immediately adopts that conversation — this is the
+        /// "Move to Folder ▸ New Folder…" path, where making the folder and
+        /// filing the row are one user intention rather than two.
+        case create(fileConversationID: UUID?)
+        case rename(folder: ChatFolder)
+
+        var id: String {
+            switch self {
+            case let .create(conversationID):
+                return "create-\(conversationID?.uuidString ?? "none")"
+            case let .rename(folder):
+                return "rename-\(folder.id.uuidString)"
+            }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
+            brandLockup
             row(
                 title: "New Chat",
                 systemImage: "square.and.pencil",
@@ -132,12 +182,15 @@ struct SidebarView: View {
             )
             .accessibilityIdentifier("Sidebar.Launch")
 
-            if !chat.conversations.isEmpty {
+            // Folders can exist before any conversation does (create one, then
+            // file into it), so an empty history no longer means an empty rail.
+            if !chat.conversations.isEmpty || !chat.folders.isEmpty {
                 // Date-grouped history (#1470), titled with the shared
                 // SectionHeader so the groups match the refreshed visual
                 // system (#1460) instead of the PR's original inline caption.
                 ScrollView {
                     VStack(alignment: .leading, spacing: 1) {
+                        folderSectionsList
                         ForEach(historySections, id: \.title) { section in
                             SectionHeader(section.title)
                                 .padding(.horizontal, RapidTheme.Space.sm)
@@ -210,6 +263,160 @@ struct SidebarView: View {
         } message: { _ in
             Text("This permanently deletes the conversation. It can't be undone.")
         }
+        // Deleting a folder is NOT destructive to transcripts, so it gets a
+        // plainly-worded confirmation rather than the destructive-delete
+        // treatment above — the dialog's job here is to say what will happen
+        // to the conversations, which is the only thing the user is unsure of.
+        .confirmationDialog(
+            pendingFolderDeletion.map { "Delete “\($0.name)”?" } ?? "Delete folder?",
+            isPresented: Binding(
+                get: { pendingFolderDeletion != nil },
+                set: { if !$0 { pendingFolderDeletion = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingFolderDeletion
+        ) { folder in
+            Button("Delete Folder", role: .destructive) {
+                chat.deleteFolder(folder.id)
+                pendingFolderDeletion = nil
+            }
+            .accessibilityIdentifier("Sidebar.DeleteFolder.Confirm")
+            Button("Keep", role: .cancel) {
+                pendingFolderDeletion = nil
+            }
+            .accessibilityIdentifier("Sidebar.DeleteFolder.Keep")
+        } message: { _ in
+            Text("The conversations in it are kept and move back into the date list.")
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { folderPrompt != nil },
+                set: { if !$0 { folderPrompt = nil } }
+            )
+        ) {
+            folderPromptSheet
+        }
+    }
+
+    /// #2050: this prompt used to be a `.alert` with a TextField. SwiftUI
+    /// drops the accessibilityIdentifier from a text field inside an alert
+    /// (button identifiers propagate; the field's does not), and on the CI
+    /// runner an AX value write into an alert field never reaches the
+    /// SwiftUI binding — so the golden flow could neither find the field
+    /// nor enable Save. A plain sheet exposes the same controls as
+    /// ordinary views, where identifiers, value writes, and presses all
+    /// behave (fresh-install drives the consent sheet the same way on the
+    /// same runner). The three identifiers are the flow's contract — keep
+    /// them stable.
+    private var folderPromptSheet: some View {
+        VStack(alignment: .leading, spacing: RapidTheme.Space.lg) {
+            Text(folderPromptTitle)
+                .font(RapidFont.bodyEmphasis)
+            TextField("Folder name", text: $folderNameDraft)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("Sidebar.Folder.NameField")
+                .onSubmit { if canCommitFolderPrompt { commitFolderPrompt() } }
+            HStack(spacing: RapidTheme.Space.sm) {
+                Spacer()
+                Button("Cancel", role: .cancel) { folderPrompt = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("Sidebar.Folder.Prompt.Cancel")
+                Button("Save") { commitFolderPrompt() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canCommitFolderPrompt)
+                    .accessibilityIdentifier("Sidebar.Folder.Prompt.Confirm")
+            }
+        }
+        .padding(RapidTheme.Space.xl)
+        .frame(width: 320)
+    }
+
+    private var folderPromptTitle: String {
+        switch folderPrompt {
+        case .rename: return "Rename Folder"
+        case .create, .none: return "New Folder"
+        }
+    }
+
+    private var canCommitFolderPrompt: Bool {
+        guard let name = ChatFolder.normalizedName(folderNameDraft) else { return false }
+        switch folderPrompt {
+        case let .rename(folder):
+            return !chat.folderNameExists(name, excluding: folder.id)
+        case .create:
+            return !chat.folderNameExists(name)
+        case .none:
+            return false
+        }
+    }
+
+    /// Open the name prompt, seeding the draft with the current name for a
+    /// rename and blank for a new folder.
+    private func presentFolderPrompt(_ prompt: FolderPrompt) {
+        // Same reasoning as every mutating row action: the prompt takes
+        // keyboard focus, so an inline conversation rename must be resolved
+        // rather than left pending behind a modal.
+        cancelRename()
+        switch prompt {
+        case .create: folderNameDraft = ""
+        case let .rename(folder): folderNameDraft = folder.name
+        }
+        folderPrompt = prompt
+    }
+
+    /// Commit whatever the prompt was for. A blank name is rejected by the
+    /// model layer (``ChatFolder.normalizedName``), which leaves the folder
+    /// untouched — the same "don't commit an empty name" contract
+    /// ``renameConversation`` applies to rows.
+    private func commitFolderPrompt() {
+        defer {
+            folderPrompt = nil
+            folderNameDraft = ""
+        }
+        switch folderPrompt {
+        case let .create(conversationID):
+            guard let folder = chat.createFolder(named: folderNameDraft) else { return }
+            if let conversationID {
+                chat.moveConversation(conversationID, toFolder: folder.id)
+            }
+        case let .rename(folder):
+            chat.renameFolder(folder.id, to: folderNameDraft)
+        case .none:
+            break
+        }
+    }
+
+    /// The product lockup at the top of the rail: the official Rapid `R`
+    /// beside the product name.
+    ///
+    /// Purely decorative, and marked so. The window already carries the
+    /// app name in its title bar and in the menu bar, so announcing it a
+    /// third time would put a redundant element ahead of "New Chat" in
+    /// every VoiceOver traversal of the sidebar — the rail's first
+    /// element should be the first thing you can DO in it. It is also
+    /// what keeps this addition free of any new accessibility identifier
+    /// or AX node for the identifier inventory to account for.
+    ///
+    /// The mark is ``RapidRMark``'s template image — the same geometry
+    /// the menu-bar status item renders, so the two brand surfaces cannot
+    /// drift apart. Template rendering means it tracks the label colour
+    /// in both appearances rather than needing a second asset for Dark.
+    private var brandLockup: some View {
+        HStack(spacing: RapidTheme.Space.sm) {
+            if let mark = RapidRMark.menuBarTemplateImage(height: 15) {
+                Image(nsImage: mark)
+                    .renderingMode(.template)
+                    .foregroundStyle(RapidTheme.textPrimary)
+                    .frame(width: RapidTheme.Layout.iconSlot, alignment: .center)
+            }
+            Text("Rapid-MLX")
+                .font(RapidFont.bodyEmphasis)
+                .foregroundStyle(RapidTheme.textPrimary)
+        }
+        .padding(.horizontal, RapidTheme.Space.sm)
+        .padding(.top, RapidTheme.Space.xs)
+        .padding(.bottom, RapidTheme.Space.md)
+        .accessibilityHidden(true)
     }
 
     private func residencyFooter(
@@ -258,7 +465,18 @@ struct SidebarView: View {
             }
         }
         .padding(.horizontal, RapidTheme.Space.sm)
-        .padding(.vertical, RapidTheme.Space.sm)
+        .padding(.top, RapidTheme.Space.md)
+        .padding(.bottom, RapidTheme.Space.sm)
+        // A rule, not a gap. The residency block is the one part of the
+        // rail that describes the MACHINE rather than the app's
+        // navigation, and separating it by whitespace alone left it
+        // reading as a fifth, oddly-formatted nav group. A hairline says
+        // "different kind of thing" in the width of one pixel.
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(RapidTheme.hairline)
+                .frame(height: 1)
+        }
         .accessibilityIdentifier("Sidebar.Residency")
     }
 
@@ -318,7 +536,11 @@ struct SidebarView: View {
     /// Everything used to sit under a hard-coded "Older" heading, so a
     /// conversation five seconds old was filed as ancient history.
     private var historySections: [HistorySection] {
-        SidebarView.sections(for: chat.conversations, now: referenceDate)
+        SidebarView.sections(
+            for: chat.conversations,
+            folders: chat.folders,
+            now: referenceDate
+        )
     }
 
     /// Advance ``referenceDate`` at each calendar-day boundary for as long as
@@ -356,12 +578,24 @@ struct SidebarView: View {
     /// it", which a "Previous 7 Days" heading would immediately undo. Archived
     /// rows are excluded here — ``archivedConversations`` owns them.
     ///
+    /// Conversations filed into an existing folder are excluded too, and are
+    /// rendered by ``folderSections(for:folders:)`` instead. Every row appears
+    /// in exactly ONE place in the rail: a row showing up under both its
+    /// folder and "Yesterday" would make the selection highlight appear twice
+    /// and leave "which one does Delete act on?" genuinely ambiguous. Filing
+    /// is an explicit instruction about where a conversation lives, so it
+    /// outranks the buckets the app derives on its own.
+    ///
+    /// ``folders`` defaults to empty so the many existing call sites and tests
+    /// that predate folders keep compiling and keep their behaviour.
+    ///
     /// Uses `Calendar` (not a fixed 86 400s divisor) because the buckets are
     /// *calendar* days: something sent at 23:55 belongs to "Yesterday" once
     /// the clock passes midnight, even though barely any time has elapsed.
     /// Empty buckets produce no section, so no stray headings appear.
     static func sections(
         for conversations: [ChatConversation],
+        folders: [ChatFolder] = [],
         now: Date,
         calendar: Calendar = .current
     ) -> [HistorySection] {
@@ -377,7 +611,15 @@ struct SidebarView: View {
         let startOfToday = calendar.startOfDay(for: now)
         let weekCutoff = calendar.date(byAdding: .day, value: -7, to: startOfToday)
 
+        let liveFolderIDs = Set(folders.map(\.id))
+
         for conv in conversations where !conv.isArchived {
+            // A folderID pointing at a folder that no longer exists falls
+            // through to the date buckets rather than vanishing — see
+            // ``folderSections(for:folders:)``.
+            if let folderID = conv.folderID, liveFolderIDs.contains(folderID) {
+                continue
+            }
             if conv.isPinned {
                 pinned.append(conv)
             } else if calendar.isDate(conv.updatedAt, inSameDayAs: now) {
@@ -402,6 +644,53 @@ struct SidebarView: View {
         .map { HistorySection(title: $0.0, conversations: $0.1) }
     }
 
+    /// One user-created folder plus the conversations filed into it.
+    struct FolderSection: Identifiable {
+        let folder: ChatFolder
+        let conversations: [ChatConversation]
+        var id: UUID { folder.id }
+    }
+
+    /// Group conversations under their folders.
+    ///
+    /// Three deliberate behaviours:
+    ///
+    ///   * **Empty folders still render.** A folder is empty for the whole
+    ///     window between creating it and filing something into it; hiding it
+    ///     there would make creation look like it silently failed.
+    ///   * **Orphans are not dropped.** A ``folderID`` naming a folder that no
+    ///     longer exists is ignored here and the row falls through to
+    ///     ``sections(for:folders:now:calendar:)``. ``ChatViewModel.deleteFolder``
+    ///     already clears those ids eagerly, so this is the belt-and-braces
+    ///     path for a hand-edited or partially-written store — and the failure
+    ///     mode it prevents (a conversation that exists on disk but appears
+    ///     nowhere in the rail) reads exactly like data loss.
+    ///   * **Archived rows never appear**, matching the main list: the
+    ///     Archived disclosure owns them regardless of filing.
+    ///
+    /// Within a folder, pinned rows lead and the rest are newest-updated
+    /// first — the same ranking the main list uses, applied locally.
+    static func folderSections(
+        for conversations: [ChatConversation],
+        folders: [ChatFolder]
+    ) -> [FolderSection] {
+        guard !folders.isEmpty else { return [] }
+
+        var grouped: [UUID: [ChatConversation]] = [:]
+        for conv in conversations where !conv.isArchived {
+            guard let folderID = conv.folderID else { continue }
+            grouped[folderID, default: []].append(conv)
+        }
+
+        return ChatFolder.displayOrder(folders).map { folder in
+            let rows = (grouped[folder.id] ?? []).sorted { lhs, rhs in
+                if lhs.isPinned != rhs.isPinned { return lhs.isPinned }
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return FolderSection(folder: folder, conversations: rows)
+        }
+    }
+
     /// Archived rows, newest-updated first. Kept out of ``sections`` so the
     /// main list can never accidentally render one.
     ///
@@ -419,6 +708,145 @@ struct SidebarView: View {
 
     private var archivedConversations: [ChatConversation] {
         SidebarView.archived(for: chat.conversations)
+    }
+
+    private var folderSections: [FolderSection] {
+        SidebarView.folderSections(for: chat.conversations, folders: chat.folders)
+    }
+
+    /// Expanded unless explicitly collapsed — see ``collapsedFolderIDs``.
+    private func isFolderExpanded(_ id: UUID) -> Bool {
+        !collapsedFolderIDs.contains(id)
+    }
+
+    /// The user's folders, above the date buckets. Renders nothing at all
+    /// when the user has no folders, so the affordance stays invisible until
+    /// it's asked for — the same restraint ``archivedSection`` shows.
+    @ViewBuilder
+    private var folderSectionsList: some View {
+        let sections = folderSections
+        if !sections.isEmpty {
+            ForEach(sections) { section in
+                // The whole group is one drop target — header plus any rows
+                // it is showing. Restricting the target to the header would
+                // mean an expanded folder's own area rejects the drop, which
+                // is the part of it the pointer is most likely over.
+                VStack(alignment: .leading, spacing: 1) {
+                    folderHeader(section)
+                    if isFolderExpanded(section.folder.id) {
+                        if section.conversations.isEmpty {
+                            // A brand-new folder is empty, and an expanded
+                            // group showing nothing reads as a rendering bug.
+                            Text("No conversations yet")
+                                .font(RapidFont.caption)
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, RapidTheme.Space.sm)
+                                .padding(.leading, RapidTheme.Layout.iconSlot)
+                                .padding(.vertical, RapidTheme.Space.xs)
+                        }
+                        ForEach(section.conversations) { conv in
+                            conversationRow(conv)
+                        }
+                    }
+                }
+                .background(dropHighlight(for: section.folder.id))
+                .dropDestination(for: ConversationTransfer.self) { items, _ in
+                    file(items, into: section.folder.id)
+                } isTargeted: { targeted in
+                    dropTargetFolderID = targeted ? section.folder.id : nil
+                }
+            }
+        }
+    }
+
+    /// The amber wash + border a folder shows while a row is held over it.
+    /// Mirrors the composer's attachment drop affordance so the two drop
+    /// targets in the app read as the same gesture.
+    @ViewBuilder
+    private func dropHighlight(for folderID: UUID) -> some View {
+        if dropTargetFolderID == folderID {
+            RoundedRectangle(cornerRadius: RapidTheme.Radius.row)
+                .fill(RapidTheme.brandPrimary.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: RapidTheme.Radius.row)
+                        .strokeBorder(RapidTheme.brandPrimary, lineWidth: 1.5)
+                )
+        }
+    }
+
+    /// Apply a drop. Returns whether anything was filed, which is what tells
+    /// AppKit to animate the drag as accepted rather than snapping back.
+    private func file(_ items: [ConversationTransfer], into folderID: UUID) -> Bool {
+        // An open inline rename is resolved first: filing relocates the row
+        // between sections, taking any editor inside it off screen along with
+        // the focus observer that would have ended the edit.
+        cancelRename()
+        var filed = false
+        for item in items {
+            // Re-resolved against the live model — the payload is only an id,
+            // and dropping onto the folder a row already sits in is a no-op
+            // rather than a spurious save.
+            guard let conv = chat.conversations.first(where: { $0.id == item.conversationID }),
+                  conv.folderID != folderID || conv.isArchived
+            else { continue }
+            chat.moveConversation(item.conversationID, toFolder: folderID)
+            filed = true
+        }
+        return filed
+    }
+
+    private func folderHeader(_ section: FolderSection) -> some View {
+        Button {
+            // Collapsing takes any open editor inside the group off screen
+            // along with the focus observer that resolves it, leaving the
+            // rename pending — the same hazard the Archived toggle handles.
+            cancelRename()
+            let id = section.folder.id
+            if collapsedFolderIDs.contains(id) {
+                collapsedFolderIDs.remove(id)
+            } else {
+                collapsedFolderIDs.insert(id)
+            }
+        } label: {
+            HStack(spacing: RapidTheme.Space.xs) {
+                Image(
+                    systemName: isFolderExpanded(section.folder.id)
+                        ? "chevron.down" : "chevron.right"
+                )
+                .font(.system(size: 9, weight: .semibold))
+                SectionHeader("\(section.folder.name) (\(section.conversations.count))")
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, RapidTheme.Space.sm)
+        .padding(.top, RapidTheme.Space.lg)
+        .padding(.bottom, RapidTheme.Space.xs)
+        .accessibilityIdentifier("Sidebar.Folder.Toggle.\(section.folder.axSlug)")
+        .contextMenu { folderMenuItems(section.folder) }
+    }
+
+    @ViewBuilder
+    private func folderMenuItems(_ folder: ChatFolder) -> some View {
+        Group {
+            Button {
+                presentFolderPrompt(.rename(folder: folder))
+            } label: {
+                Label("Rename Folder", systemImage: "pencil")
+            }
+            .accessibilityIdentifier("Sidebar.Folder.Action.Rename")
+            Divider()
+            Button(role: .destructive) {
+                cancelRename()
+                pendingFolderDeletion = folder
+            } label: {
+                Label("Delete Folder", systemImage: "trash")
+            }
+            .accessibilityIdentifier("Sidebar.Folder.Action.Delete")
+        }
+        // Same template-image reasoning as ``rowMenuItems``.
+        .tint(nil)
     }
 
     /// The collapsed Archived group. Renders nothing at all when empty, so a
@@ -446,6 +874,7 @@ struct SidebarView: View {
             .padding(.horizontal, RapidTheme.Space.sm)
             .padding(.top, RapidTheme.Space.lg)
             .padding(.bottom, RapidTheme.Space.xs)
+            .accessibilityIdentifier("Sidebar.Archived.Toggle")
 
             if showArchived {
                 ForEach(archived) { conv in
@@ -490,7 +919,7 @@ struct SidebarView: View {
                     // inset as the nav rows above, so titles and nav labels
                     // align down one column instead of stepping in and out.
                     Text(conv.title)
-                        .font(RapidFont.body)
+                        .font(isActive ? RapidFont.bodyEmphasis : RapidFont.body)
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .padding(.leading, RapidTheme.Layout.iconSlot + RapidTheme.Space.sm)
@@ -505,6 +934,17 @@ struct SidebarView: View {
             }
             .onHover { hoveredConversationID = $0 ? conv.id : nil }
             .contextMenu { rowMenuItems(conv) }
+            // Drag to file into a folder. The preview is the title alone
+            // rather than a snapshot of the row: the row carries hover
+            // controls and a selection fill, and dragging a picture of those
+            // around looks like the control itself came loose.
+            .draggable(ConversationTransfer(conv.id)) {
+                Text(conv.title)
+                    .font(RapidFont.body)
+                    .lineLimit(1)
+                    .padding(.horizontal, RapidTheme.Space.sm)
+                    .padding(.vertical, RapidTheme.Space.xs)
+            }
         }
     }
 
@@ -605,6 +1045,13 @@ struct SidebarView: View {
                 Label("Rename", systemImage: "pencil")
             }
             .accessibilityIdentifier("Sidebar.Conversation.Action.Rename")
+            moveToFolderMenu(conv)
+            Button {
+                presentFolderPrompt(.create(fileConversationID: conv.id))
+            } label: {
+                Label("Move to New Folder…", systemImage: "folder.badge.plus")
+            }
+            .accessibilityIdentifier("Sidebar.Conversation.Action.MoveToNewFolder")
             Divider()
             Button {
                 cancelRename()
@@ -627,6 +1074,19 @@ struct SidebarView: View {
             }
             .accessibilityIdentifier(Self.archiveMenuItemIdentifier(for: conv))
             Divider()
+            Button {
+                ConversationExportPanel.export(conv, format: .markdown)
+            } label: {
+                Label("Export Markdown…", systemImage: "doc.richtext")
+            }
+            .accessibilityIdentifier("Sidebar.Conversation.Action.Export.Markdown")
+            Button {
+                ConversationExportPanel.export(conv, format: .json)
+            } label: {
+                Label("Export JSON…", systemImage: "curlybraces")
+            }
+            .accessibilityIdentifier("Sidebar.Conversation.Action.Export.JSON")
+            Divider()
             // Delete is the one item that does NOT need an explicit cancel: it only
             // stages a confirmation, and presenting that dialog takes keyboard
             // focus, which the editor's blur handler resolves. Keeping the action
@@ -645,6 +1105,49 @@ struct SidebarView: View {
             .accessibilityIdentifier("Sidebar.Conversation.Action.Delete")
         }
         .tint(nil)
+    }
+
+    /// The "Move to Folder" submenu for one conversation.
+    ///
+    /// Creating a folder is a first-level row action; this submenu stays
+    /// focused on choosing among existing destinations. "Remove from Folder"
+    /// appears only when the row is actually filed.
+    @ViewBuilder
+    private func moveToFolderMenu(_ conv: ChatConversation) -> some View {
+        if !chat.folders.isEmpty || conv.folderID != nil {
+            Menu {
+                ForEach(ChatFolder.displayOrder(chat.folders)) { folder in
+                    Button {
+                        cancelRename()
+                        chat.moveConversation(conv.id, toFolder: folder.id)
+                    } label: {
+                        // A checkmark rather than a disabled row: the current
+                        // folder still has to be visible in the list.
+                        Label(
+                            folder.name,
+                            systemImage: conv.folderID == folder.id
+                                ? "checkmark.circle.fill" : "folder"
+                        )
+                    }
+                    .accessibilityIdentifier(
+                        "Sidebar.Conversation.Action.MoveToFolder.\(folder.axSlug)"
+                    )
+                }
+                if !chat.folders.isEmpty, conv.folderID != nil { Divider() }
+                if conv.folderID != nil {
+                    Button {
+                        cancelRename()
+                        chat.moveConversation(conv.id, toFolder: nil)
+                    } label: {
+                        Label("Remove from Folder", systemImage: "folder.badge.minus")
+                    }
+                    .accessibilityIdentifier("Sidebar.Conversation.Action.MoveToFolder.Remove")
+                }
+            } label: {
+                Label("Move to Folder", systemImage: "folder")
+            }
+            .accessibilityIdentifier("Sidebar.Conversation.Action.MoveToFolder")
+        }
     }
 
     /// Inline rename editor, occupying the row it replaces.
@@ -700,6 +1203,7 @@ struct SidebarView: View {
                 endRename()
             }
             .onExitCommand { cancelRename() }
+            .accessibilityIdentifier("Sidebar.Conversation.Rename.\(conv.id.uuidString)")
             .task(id: renameSession) {
                 renameFieldDidFocus = false
                 // Defer the request to the next scheduling point, so it lands
@@ -762,10 +1266,14 @@ struct SidebarView: View {
         ) {
             HStack(spacing: RapidTheme.Space.sm) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 13, weight: .medium))
+                    // Semibold when selected, matching the label. The
+                    // glyph and its word are one object; letting only the
+                    // text thicken made the icon look like it belonged to
+                    // the row above.
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
                     .frame(width: RapidTheme.Layout.iconSlot, alignment: .center)
                 Text(title)
-                    .font(RapidFont.body)
+                    .font(isSelected ? RapidFont.bodyEmphasis : RapidFont.body)
                     .lineLimit(1)
             }
         }
@@ -773,13 +1281,29 @@ struct SidebarView: View {
 }
 
 /// Shared chrome for every sidebar row: fixed height, one row radius,
-/// amber selection, neutral hover.
+/// one selected treatment, neutral hover.
 ///
-/// The selected treatment is the product's canonical "this is chosen"
-/// signal — amber tint fill plus the deep-amber label. Deep amber (not
-/// raw ``brandPrimary``) because a 13pt label in #EFA23A on the light
-/// tint is under 3:1; the deeper shade of the same hue clears AA while
-/// reading as the same colour.
+/// ## The selected treatment
+///
+/// A 3×18pt amber bar in the leading gutter, a neutral fill, and a
+/// graphite SEMIBOLD label. Three signals, none of which is a colour
+/// difference small enough to miss.
+///
+/// It replaces the v1.0 pairing of an amber TINT fill plus a deep-amber
+/// label, which failed for a reason worth recording: the tint
+/// (``brandPrimaryTint``) and the rail it sat on
+/// (``surfaceSidebar``) were within a few percent of each other, so on
+/// the rail — the one place selection matters most — the fill was
+/// effectively invisible, and the whole signal came down to a hue shift
+/// in a 13pt label. That is the single least robust way to encode state:
+/// it is the first thing lost to colour-blindness, to a dim display, and
+/// to peripheral vision.
+///
+/// The bar is a hard-edged shape, so it survives Increase Contrast and
+/// reads at a glance from across the desk; the semibold weight carries
+/// the row even in a screenshot with no colour at all. Amber is spent
+/// here rather than on the fill because the rail's whole budget is one
+/// small brand moment, and a bar is a smaller, sharper one than a slab.
 private struct SidebarRow<Content: View>: View {
     let isSelected: Bool
     let action: () -> Void
@@ -788,6 +1312,7 @@ private struct SidebarRow<Content: View>: View {
     @State private var hovering = false
 
     var body: some View {
+        // ax-exempt: each caller attaches its entity-specific identifier to SidebarRow
         Button(action: action) {
             content
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -797,19 +1322,38 @@ private struct SidebarRow<Content: View>: View {
                     RoundedRectangle(cornerRadius: RapidTheme.Radius.row, style: .continuous)
                         .fill(fill)
                 )
+                // The bar is an OVERLAY on the leading edge rather than a
+                // sibling in an HStack: as a sibling it would take layout
+                // width, so every label in the rail would shift sideways
+                // the moment a row became selected. An overlay marks the
+                // row without moving anything in it.
+                .overlay(alignment: .leading) {
+                    if isSelected {
+                        Capsule(style: .continuous)
+                            .fill(RapidTheme.selectionBar)
+                            .frame(
+                                width: RapidTheme.Layout.selectionBarWidth,
+                                height: RapidTheme.Layout.selectionBarHeight
+                            )
+                    }
+                }
                 .contentShape(
                     RoundedRectangle(cornerRadius: RapidTheme.Radius.row, style: .continuous)
                 )
         }
         .buttonStyle(.plain)
-        .foregroundStyle(isSelected ? RapidTheme.brandPrimaryDeep : Color.primary)
+        // Graphite in both states. The label's WEIGHT now carries
+        // selection (see ``SidebarView.row`` and ``conversationRow``),
+        // which keeps every row in the rail at full reading contrast
+        // instead of tinting the selected one down to a brand hue.
+        .foregroundStyle(Color.primary)
         .onHover { hovering = $0 }
         .rapidAnimation(RapidMotion.quick, value: hovering)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     private var fill: Color {
-        if isSelected { return RapidTheme.brandPrimaryTint }
+        if isSelected { return RapidTheme.selectionFill }
         return hovering ? RapidTheme.hoverFill : .clear
     }
 }
@@ -834,6 +1378,10 @@ struct LaunchView: View {
             port: server.activePort,
             bearer: server.activeBearer ?? "",
             alias: alias,
+            // The sidecar binary this app owns lives off-PATH (see
+            // ``ServerLocator``); pass its absolute path so the launch/agent
+            // commands this page generates actually run in a terminal.
+            binaryPath: server.binaryPath,
             // Page context: the sidebar owns navigation, so there is no sheet
             // to dismiss. Hide the close ✕ (it used to render as a dead
             // no-op button). A dedicated page-mode header lands with the

@@ -52,6 +52,18 @@ enum ImageModelCapability: String, Sendable, Hashable {
     }
 }
 
+/// Audited speculative-decoding preset advertised by the alias registry.
+/// `nil` on ``ModelEntry`` means the alias explicitly has no usable preset
+/// (or an older sidecar did not advertise one), so Settings fails closed.
+struct SpeculativeDecodingPreset: Codable, Sendable, Hashable {
+    enum Method: String, Codable, Sendable, Hashable { case suffix, mtp }
+    let method: Method
+    let model: String?
+    let tokens: Int?
+
+    var displayName: String { method == .mtp ? "MTP" : "Suffix decoding" }
+}
+
 /// One model in the rapid-mlx catalog. The picker UI groups cached vs.
 /// uncached so the user knows which aliases boot instantly vs. which
 /// trigger an HF download on first ``serve``.
@@ -90,6 +102,9 @@ struct ModelEntry: Identifiable, Hashable, Sendable {
 
     /// Image-only operation metadata. `nil` for chat/audio/video rows.
     var imageCapability: ImageModelCapability? = nil
+
+    /// Chat-only speculative preset parsed from the engine's alias SSOT.
+    var speculativeDecodingPreset: SpeculativeDecodingPreset? = nil
 
     var id: String { alias }
 }
@@ -176,14 +191,18 @@ enum ModelCatalog {
         binary: URL,
         hubCacheOverride: URL? = ModelsFolderPreference.validatedOverrideURL()
     ) async -> [ModelEntry] {
-        async let availableTask: (entries: [(String, String?)], excluded: Set<String>) =
+        async let availableTask: (
+            entries: [(String, String?)],
+            excluded: Set<String>,
+            speculative: [String: SpeculativeDecodingPreset]
+        ) =
             listAvailableWithExclusions(binary: binary)
         async let cachedTask: [(String, String?, String?)] = listCached(
             binary: binary,
             hubCacheOverride: hubCacheOverride
         )
 
-        let (available, excludedAliases) = await availableTask
+        let (available, excludedAliases, speculativeCapabilities) = await availableTask
         let cached = await cachedTask
 
         var entries = mergeAvailableAndCached(
@@ -206,6 +225,14 @@ enum ModelCatalog {
         // extra subprocesses) and re-mark them cached when the repo
         // matches a cached row.
         entries = await remarkSiblingsCachedByRepo(entries, binary: binary)
+
+        // Apply capability metadata after cache reconciliation, whose pure
+        // rebuilds intentionally know nothing about the CLI profile table.
+        entries = entries.map { entry in
+            var enriched = entry
+            enriched.speculativeDecodingPreset = speculativeCapabilities[entry.alias]
+            return enriched
+        }
 
         // Sort: cached first, then alphabetic within each group. The
         // user is most likely to pick something they already have on
@@ -469,9 +496,17 @@ enum ModelCatalog {
     /// the side door. Pairing the two parses closes that (#1603).
     private static func listAvailableWithExclusions(
         binary: URL
-    ) async -> (entries: [(String, String?)], excluded: Set<String>) {
+    ) async -> (
+        entries: [(String, String?)],
+        excluded: Set<String>,
+        speculative: [String: SpeculativeDecodingPreset]
+    ) {
         let output = await runRapidMlx(binary: binary, args: ["models"])
-        return (parseAvailable(output), parseExcludedAliases(output))
+        return (
+            parseAvailable(output),
+            parseExcludedAliases(output),
+            parseSpeculativeCapabilities(output)
+        )
     }
 
     /// Image aliases with explicit generation/edit capabilities for the Images tab's
@@ -770,10 +805,51 @@ enum ModelCatalog {
         return entries
     }
 
-    /// Log/banner lines the engine or its HTTP server can interleave
-    /// with table output. None of these are catalog rows, and every one
-    /// of them would otherwise yield a phantom alias from its first
-    /// token ("Loading", "INFO:", "Uvicorn", …).
+    /// Parse the final `Preset` column emitted by `rapid-mlx models`. Keeping
+    /// this separate preserves the long-standing lightweight tuple contract
+    /// of ``parseAvailable`` while still carrying alias-profile capability
+    /// metadata into Settings. Unknown/missing values fail closed.
+    static func parseSpeculativeCapabilities(
+        _ output: String
+    ) -> [String: SpeculativeDecodingPreset] {
+        // Older sidecars do not have this column. Do not reinterpret a
+        // reasoning-parser or alias token named "Suffix" as capability data.
+        let advertisesPresetColumn = output.split(separator: "\n").contains { line in
+            let fields = line.split(whereSeparator: { $0.isWhitespace })
+            return fields.first == "Alias" && fields.last == "Preset"
+        }
+        guard advertisesPresetColumn else { return [:] }
+        let chatAliases = Set(parseAvailable(output).map(\.0))
+        var capabilities: [String: SpeculativeDecodingPreset] = [:]
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let fields = rawLine.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard let alias = fields.first, chatAliases.contains(alias),
+                  let preset = fields.last else { continue }
+            if preset.caseInsensitiveCompare("Suffix") == .orderedSame {
+                capabilities[alias] = SpeculativeDecodingPreset(
+                    method: .suffix, model: nil, tokens: nil
+                )
+                continue
+            }
+            let parts = preset.split(separator: "@", omittingEmptySubsequences: false)
+            guard parts.count == 3,
+                  String(parts[0]).caseInsensitiveCompare("MTP") == .orderedSame,
+                  let model = sanitizedHuggingFaceRepo(String(parts[1])),
+                  let tokens = Int(parts[2]), tokens > 0 else { continue }
+            capabilities[alias] = SpeculativeDecodingPreset(
+                method: .mtp, model: model, tokens: tokens
+            )
+        }
+        return capabilities
+    }
+
+    /// Log/banner and catalog-notice lines the engine or its HTTP server
+    /// can share stdout with the table. None of these are catalog rows, and
+    /// every one of them would otherwise yield a phantom alias from its
+    /// first token ("Loading", "INFO:", "Uvicorn", "No", …).
+    ///
+    /// Shared by `parseCached` and `parseAvailable`, so a single entry here
+    /// fixes every consumer of the catalog (picker, Onboarding, Settings).
     ///
     /// Pure + `static` so the set is one list rather than a chain of
     /// `hasPrefix` calls buried in the parse loop.
@@ -793,6 +869,16 @@ enum ModelCatalog {
             "ERROR:",
             "Uvicorn running",
             "Traceback (",
+            // The empty-cache notice `rapid-mlx ls` prints in place of a
+            // "Cached models" table when the disk is cold:
+            //   "No models cached yet. Run 'rapid-mlx pull …' …"
+            // Its single-space prose tokenizes (parseCached splits on ANY
+            // whitespace) into alias "No", repo "models", size "cached yet." —
+            // a selectable phantom that dead-ends model start
+            // (raullenchai/Rapid-MLX#1918). Matching the full "No models
+            // cached yet" prefix (not the bare word "No") keeps a genuine
+            // alias named "No" — whose row is "No" + 2+ spaces + repo — safe.
+            "No models cached yet",
         ]
         return bannerPrefixes.contains { line.hasPrefix($0) }
     }

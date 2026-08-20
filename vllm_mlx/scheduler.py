@@ -13,6 +13,7 @@ The scheduler follows vLLM's design with:
 
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -53,6 +54,72 @@ from .kv_estimation import (  # noqa: E402
     estimate_kv_footprint,
     rotating_cache_slots,
 )
+
+
+def _read_kv_dims(model):
+    """Permissively resolve ``(num_layers, kv_heads, head_dim, struct_cfg)``
+    from a loaded model, or ``None``.
+
+    mlx-lm models expose the HF dims on ``.args`` (a ModelArgs dataclass), not
+    a ``.config``; multimodal checkpoints nest the text tower under
+    ``text_config`` and may carry DECOY vision dims on the outer config. This
+    only runs when the scheduler's own config-based terms could not resolve,
+    but it still mirrors the admission path's tower selection so it can't pick
+    the wrong one: a config whose OWN ``layer_types`` validates against its OWN
+    ``num_hidden_layers`` (``_pick_structural_config``'s rule) wins, then the
+    nested ``text_config``, then the outer holder (dense: neither validates and
+    only the outer carries dims). Returns the triple plus the config the dims
+    came from, so ``estimate_kv_footprint`` reads its hybrid structural fields
+    from the SAME place.
+    """
+
+    def _pos_int(value):
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
+    def _dims_of(cfg):
+        if cfg is None:
+            return None
+        layers = _pos_int(_cfg_get(cfg, "num_hidden_layers"))
+        kv_heads = _pos_int(_cfg_get(cfg, "num_key_value_heads")) or _pos_int(
+            _cfg_get(cfg, "num_attention_heads")
+        )
+        head_dim = _pos_int(_cfg_get(cfg, "head_dim"))
+        if head_dim is None:
+            hidden = _pos_int(_cfg_get(cfg, "hidden_size"))
+            heads = _pos_int(_cfg_get(cfg, "num_attention_heads"))
+            if hidden and heads:
+                head_dim = hidden // heads
+        if layers and kv_heads and head_dim:
+            return layers, kv_heads, head_dim, cfg
+        return None
+
+    for holder in (getattr(model, "config", None), getattr(model, "args", None)):
+        if holder is None:
+            continue
+        text_cfg = _cfg_get(holder, "text_config")
+        # 1) The structural tower: the config whose own layer_types validates
+        #    against its own num_hidden_layers (the text tower for a hybrid).
+        for cfg in (holder, text_cfg):
+            if cfg is None:
+                continue
+            n = _pos_int(_cfg_get(cfg, "num_hidden_layers"))
+            if n and _valid_layer_types(_cfg_get(cfg, "layer_types"), n):
+                dims = _dims_of(cfg)
+                if dims is not None:
+                    return dims
+        # 2) No validating layer_types (dense / non-hybrid multimodal): prefer
+        #    the nested text tower over the outer (possibly-decoy) config.
+        for cfg in (text_cfg, holder):
+            dims = _dims_of(cfg)
+            if dims is not None:
+                return dims
+    return None
+
+
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
@@ -71,6 +138,21 @@ logger = logging.getLogger(__name__)
 # barrier. Eight steps bounds that graph to a few hundred live Metal handles on
 # current 40-layer families while amortizing the synchronization cost.
 _RECURRENT_CACHE_MATERIALIZE_INTERVAL = 8
+# Handle-budget for the recurrent-state barrier (#1834/#1827). The lazy
+# graph retains at most ``active_seqs × interval`` un-materialized updates
+# between barriers, so the Metal handle count scales with that product, NOT
+# with the interval alone. The flat every-8 barrier holds it at ``B × 8``;
+# at batch 8 that is 64 handle-units, a load the engine already sustains in
+# production. A single stream pays the barrier's ``mx.eval`` host sync as a
+# visible decode-rate tax (≈3% at B=1), so at low batch we widen the interval
+# to keep ``active_seqs × interval`` at that same 64-unit steady-state budget
+# — far fewer host stalls. A batch-GROWTH boundary (e.g. B=1 depth 63 → B=8)
+# can transiently reach ``MAX_INTERVAL + active − 1`` units for the single
+# step before the depth-keyed barrier fires; that spike is bounded and cleared
+# in one step, and even at its worst (~71 units → a few thousand handles) sits
+# ~150× below the 499000-handle ceiling — only UNBOUNDED chains exhaust Metal.
+_RECURRENT_MATERIALIZE_HANDLE_BUDGET = 64
+_RECURRENT_MATERIALIZE_MAX_INTERVAL = 64
 
 
 def _pflash_compressed(request: Request) -> bool:
@@ -295,7 +377,8 @@ class SchedulerConfig:
     # slabs. Expressed as a fraction of the hard cap. Default 0.9 keeps
     # a 10% safety margin below the cap, wide enough that one large
     # prefill on a half-empty cache will not trigger a thrash loop.
-    # See D-METAL-PFX in 0.8TODO for the regression repro.
+    # The D-METAL-PFX regression repro was tracked in the 0.8-era
+    # local TODO, since removed — see git history.
     metal_pressure_evict_fraction: float = 0.9
 
     # D-METAL-CAP (codex round 3 BLOCKING #1): conservative per-token
@@ -360,11 +443,9 @@ class SchedulerConfig:
 
     # 0.9.13 PR-B: Ollama-style EV depth controller knobs. ``mtp_max_k``
     # is the hard ceiling on the per-round draft depth the controller
-    # may select. The current generator body implements K∈{0,1}, so
-    # values >1 are clamped at the generator; the default of 3 anticipates
-    # PR-B follow-up work that lifts the K≥2 chain-of-K verify.
-    # ``mtp_disable_auto_k`` bypasses the controller entirely and keeps
-    # the pre-PR-B fixed-K=1 chain-of-1 behavior (used for A/B benching).
+    # may select. K=0 parks the drafter; K=1..3 use chained MTP with
+    # per-position rollback on hybrid SSM targets.
+    # ``mtp_disable_auto_k`` fixes depth at ``mtp_max_k`` for A/B benching.
     mtp_max_k: int = 3
     mtp_disable_auto_k: bool = False
 
@@ -403,10 +484,9 @@ class SchedulerConfig:
     adaptive_prefill_min_tokens: int = 32_768
     adaptive_prefill_min_chunk_size: int = 256
 
-    # APPENDED AT THE END DELIBERATELY: this dataclass is constructed
-    # positionally by external callers, so a field inserted mid-list
-    # silently rebinds every argument after it (see the note above
-    # ``mtp_sidecar``).
+    # APPEND-ONLY TAIL: this dataclass is constructed positionally by
+    # external callers, so every new field from here onward must stay at
+    # the end (see the note above ``mtp_sidecar``).
     #
     # Checkpoint identity for the MTP depth-controller registry, which is
     # process-global and survives a model swap. Without it the key falls
@@ -418,9 +498,32 @@ class SchedulerConfig:
     # ``rapid_mlx_spec_decode_k_cost_ms``.
     model_name: str | None = None
 
+    # Opt-in dynamic-resolution bounds for MLLM image preprocessing.
+    # Appended to preserve positional SchedulerConfig compatibility.
+    # Zero preserves the processor/model defaults exactly.
+    vision_min_pixels: int = 0
+    vision_max_pixels: int = 0
+
+    # Opt-in idle prefix-cache release. ``None`` lets the engine read
+    # RAPID_MLX_IDLE_CACHE_CLEAR_SECONDS; 0 explicitly disables it.
+    idle_cache_clear_seconds: float | None = None
+
     def __post_init__(self) -> None:
+        if self.vision_min_pixels < 0 or self.vision_max_pixels < 0:
+            raise ValueError("vision pixel bounds must be non-negative")
+        if (
+            self.vision_min_pixels
+            and self.vision_max_pixels
+            and self.vision_min_pixels > self.vision_max_pixels
+        ):
+            raise ValueError("vision_min_pixels must not exceed vision_max_pixels")
         if self.response_cache_entries < 0:
             raise ValueError("response_cache_entries must be >= 0")
+        if self.idle_cache_clear_seconds is not None and (
+            not math.isfinite(self.idle_cache_clear_seconds)
+            or self.idle_cache_clear_seconds < 0
+        ):
+            raise ValueError("idle_cache_clear_seconds must be finite and >= 0")
         if self.enable_mtp:
             import warnings
 
@@ -655,17 +758,16 @@ def _install_mtp_vendored(
     ``() -> (List[int], List[mx.array])``). Per-step, exactly one primary
     token is returned to keep the mlx-lm ``next()`` contract intact.
     Multi-token gains come from the generator's internal batched
-    backbone+MTP passes (up to 2 tokens per pass), not from returning
+    backbone+MTP passes (up to K+1 tokens per pass), not from returning
     multiple tokens per ``_step`` call. Extra tokens produced by the
     generator are queued and drained on the following ``_step`` calls.
 
-    K=1 chain-of-1 scope (PR-A of 0.9.13 stack):
+    Adaptive chain-of-K scope:
 
     * Single-request only (``len(gb.uids) == 1``). Multi-request batches
       fall through to ``_orig_step`` — Gemma 4's MTP fast-path is
       batch=1-only (``mtp_forward`` raises on B>1) and the vendored
-      generator maintains its own per-request state. Auto-K controller
-      lives in PR-B; batched residual+bonus sync lives in PR-C.
+      generator maintains its own per-request state.
 
     * Greedy sampling only (temperature == 0). Non-greedy falls through
       to ``_orig_step`` — the byte-lossless verify contract lives in the
@@ -868,7 +970,7 @@ def _install_mtp_vendored(
     def _is_greedy_for_uid(uid: int) -> bool:
         """Return True when the request behind ``uid`` sampled at temp=0.
 
-        K=1 MVP: matches the greedy contract that
+        Matches the greedy contract that
         ``vllm_mlx/spec_decode/mtp/generator.py::mtp_generate_step``
         implements with ``temp=0.0``. Under temp>0, the vendored
         generator can still preserve the lossless marginal via its
@@ -1458,7 +1560,7 @@ def _install_mtp_vendored(
 
     logger.info(
         "[MTP-vendored] installed on GenerationBatch._step "
-        "(single-request greedy K=1 chain-of-1; falls through on B>1 / "
+        "(single-request greedy adaptive chain-of-K; falls through on B>1 / "
         "non-greedy / logits-processors)."
     )
     return True
@@ -2847,6 +2949,18 @@ class Scheduler:
     # __init__ still step cleanly; __init__ resolves the real value once
     # (an os.environ lookup per step would sit on the decode hot path).
     _step_timing_enabled = False
+    # Decode steps accumulated since the last recurrent-state barrier. The
+    # barrier fires off THIS depth (not the global step counter) so a batch
+    # size change re-evaluates the interval against the actual live chain:
+    # a deep low-batch chain materializes immediately when concurrency rises
+    # instead of waiting for the next global-step multiple.
+    _recurrent_chain_depth = 0
+    # Running-sequence count at the previous barrier check. An idle->active
+    # edge (this was 0, now >0) arms the barrier so a sequence admitted to a
+    # fresh OR long-idle scheduler materializes its prefill-inherited graph
+    # on its first decode step — the #1834 step-zero barrier generalized to
+    # every activation, not just construction (codex #1895 r2+r3).
+    _recurrent_prev_running = 0
 
     def __init__(
         self,
@@ -2910,6 +3024,11 @@ class Scheduler:
         # step would put dict access on the decode hot path advertised
         # as zero-cost when off.
         self._step_timing_enabled = bool(os.environ.get("RAPID_STEP_TIMING"))
+        # prev_running = 0 means the first activation is an idle->active edge,
+        # so the first decode step arms the barrier (materializes any
+        # prefill-inherited recurrent graph) — see the class-level comment.
+        self._recurrent_chain_depth = 0
+        self._recurrent_prev_running = 0
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -3626,9 +3745,7 @@ class Scheduler:
         # by ``dispatch_mtp_inject`` (which runs during engine boot in
         # ``BatchedEngine._start_llm`` before this scheduler is built).
         #
-        # K=1 chain-of-1 only for PR-A. Auto-K controller lands in PR-B
-        # (``feat/mtp-ev-controller-0.9.13``); batched residual+bonus
-        # sync lands in PR-C (``feat/mtp-batched-sync-0.9.14``).
+        # Single-request adaptive chain-of-K with batched verify.
         if getattr(self.config, "spec_decode", "none") == "mtp":
             mtp_model_type = getattr(self.config, "mtp_model_type", None)
             config_vetted_mtp = _config_vetted_mtp_supports_spec_decode(mtp_model_type)
@@ -4833,6 +4950,134 @@ class Scheduler:
         """
         self._resolve_kv_bytes_per_token()
         return self._kv_fixed_baseline_bytes
+
+    def projected_memory_max_context(
+        self, native_context: int | None = None
+    ) -> int | None:
+        """Largest context length whose projected KV footprint fits this
+        device's memory budget right now, or ``None`` when it can't be
+        estimated.
+
+        This is the number behind the ``max_model_len`` model-card field:
+        vLLM/SGLang expose ``max_model_len`` as the served ceiling but crash
+        if it won't fit KV memory; on unified-memory Apple silicon we can go
+        one better and REPORT the memory-fitted ceiling instead of aborting.
+
+        The footprint is the exact per-request projection the admission gate
+        uses (``_estimate_request_kv_bytes``), so the advertised number lines
+        up with what the scheduler would actually admit::
+
+            footprint(T) = fixed_baseline
+                           + per_token_growth * T
+                           + sliding_slot_bytes * rotating_cache_slots(window, T)
+
+        Budget = device working set × utilization − currently-resident bytes.
+        Utilization is the operator's ``gpu_memory_utilization`` when a Metal
+        cap is configured, else a conservative reporting default so the field
+        is populated on the default (cap-disabled) config too. Residency is a
+        point-in-time ``get_active_memory()`` reading — weights plus any live
+        KV/prefix cache — so the number reflects what could be added NOW; it
+        is advisory, re-derived per call, and capped at ``native_context``.
+
+        Returns ``None`` (not a guess) on any failure — a stub/unknown model
+        with no resolvable footprint, no Metal device, or a non-positive
+        budget — so the ``/v1/models`` builder falls through to leaving the
+        field absent rather than advertising a fabricated cap.
+        """
+        try:
+            # Prefer the scheduler's OWN resolved footprint terms so the
+            # advertised ceiling can never diverge from what admission would
+            # actually charge: these honor the operator
+            # ``metal_cap_kv_bytes_per_token`` override and use
+            # ``_pick_structural_config`` to select the right tower on
+            # multimodal/hybrid configs. They are populated whenever the model
+            # exposes a ``.config`` (the admission path's own source).
+            per_tok = self._resolve_kv_bytes_per_token()
+            fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
+            sliding_slot_bytes = self._kv_sliding_slot_bytes
+            sliding_window = self._kv_sliding_window
+            if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
+                # The scheduler could not resolve terms — mlx-lm models expose
+                # dims on ``.args``, not ``.config``, so its config-only read
+                # yields 0 (and the admission cap is likewise a no-op there, so
+                # there is nothing to diverge from). Fall back to reading the
+                # dims off the model and running the SAME hybrid-aware
+                # estimator, preferring the text tower over any decoy outer
+                # config (``_read_kv_dims``).
+                dims = _read_kv_dims(self.model)
+                if dims is None:
+                    return None
+                num_layers, kv_heads, head_dim, struct_cfg = dims
+                dtype_bytes = self._infer_kv_dtype_bytes(struct_cfg)
+                uniform_per_token = 2 * num_layers * kv_heads * head_dim * dtype_bytes
+                if uniform_per_token <= 0:
+                    return None
+                estimate = estimate_kv_footprint(
+                    struct_cfg,
+                    dtype_bytes=dtype_bytes,
+                    uniform_per_token_bytes=uniform_per_token,
+                    base_num_layers=num_layers,
+                    base_kv_heads=kv_heads,
+                    base_head_dim=head_dim,
+                )
+                per_tok = estimate.per_token_growth_bytes
+                fixed_baseline = estimate.fixed_baseline_bytes
+                sliding_slot_bytes = estimate.sliding_slot_bytes
+                sliding_window = estimate.sliding_window
+                if per_tok <= 0 and fixed_baseline <= 0 and sliding_slot_bytes <= 0:
+                    return None
+
+            if not mx.metal.is_available():
+                return None
+            info = mx.device_info()
+            base = int(
+                info.get("max_recommended_working_set_size", info.get("memory_size", 0))
+                or 0
+            )
+            if base <= 0:
+                return None
+
+            util = float(getattr(self.config, "gpu_memory_utilization", 0.0) or 0.0)
+            if util <= 0.0:
+                # The Metal admission cap is disabled by default, but the
+                # reporting field should still be populated. 0.90 mirrors the
+                # engine's allocation-side default working-set fraction.
+                util = 0.90
+            budget = int(base * util)
+            resident = int(mx.get_active_memory())
+            available = budget - resident
+            if available <= 0:
+                return None
+
+            def _footprint(tokens: int) -> int:
+                return (
+                    fixed_baseline
+                    + per_tok * tokens
+                    + sliding_slot_bytes * rotating_cache_slots(sliding_window, tokens)
+                )
+
+            # Search up to the native window when known (the field is capped
+            # there anyway), else a generous ceiling covering 1M-context models.
+            upper = (
+                native_context
+                if isinstance(native_context, int) and native_context > 0
+                else 8_000_000
+            )
+            if _footprint(upper) <= available:
+                # Memory is not the binding constraint — the native window fits.
+                return upper
+            # Monotonic non-decreasing footprint → binary-search the largest T.
+            lo, hi = 0, upper
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _footprint(mid) <= available:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo if lo > 0 else None
+        except Exception:  # noqa: BLE001
+            # Never let a memory-probe failure break the models endpoint.
+            return None
 
     def _estimate_request_kv_bytes(self, request: Request) -> int:
         """Project KV-cache memory the new request would consume.
@@ -7535,11 +7780,34 @@ class Scheduler:
                     else:
                         raw_next = self.batch_generator.next()
                     # Bound functional recurrent-state graphs without forcing
-                    # a host synchronization on every token. Step zero arms
-                    # the barrier for a newly-created scheduler; thereafter a
-                    # live chain can retain at most eight decode updates.
-                    if self._step_count % _RECURRENT_CACHE_MATERIALIZE_INTERVAL == 0:
+                    # a host synchronization on every token. The barrier fires
+                    # off the live chain DEPTH (steps since the last barrier),
+                    # evaluated against an interval that widens at low batch so
+                    # a single stream stops paying the host sync ~8× more often
+                    # than a batch of eight. Keying off depth (not the global
+                    # step counter) makes a batch-size change re-check the
+                    # accumulated chain immediately: a deep B=1 chain that
+                    # meets the tighter high-concurrency interval materializes
+                    # on the very next step instead of drifting to the next
+                    # global-step multiple (codex #1895).
+                    _active_seqs = len(self.running) if self.running else 1
+                    _raw_running = len(self.running) if self.running else 0
+                    if self._recurrent_prev_running == 0 and _raw_running > 0:
+                        # Idle -> active edge: a sequence just entered an empty
+                        # batch and may carry an unmaterialized prefill graph.
+                        # Seed the depth to the interval so THIS step arms the
+                        # barrier (fresh scheduler or long-idle one alike).
+                        self._recurrent_chain_depth = (
+                            self._recurrent_materialize_interval(_active_seqs)
+                        )
+                    self._recurrent_prev_running = _raw_running
+                    self._recurrent_chain_depth += 1
+                    if (
+                        self._recurrent_chain_depth
+                        >= self._recurrent_materialize_interval(_active_seqs)
+                    ):
                         self._materialize_active_recurrent_cache()
+                        self._recurrent_chain_depth = 0
                     output.has_work = True
 
                     # mlx-lm 0.31+ returns (prompt_responses, generation_responses) tuple
@@ -7672,6 +7940,27 @@ class Scheduler:
                 pass
 
         return output
+
+    def _recurrent_materialize_interval(self, active_seqs: int) -> int:
+        """Steps between recurrent-state barriers for the current batch depth.
+
+        The barrier's cost is a host ``mx.eval`` sync that cannot overlap
+        the decode pipeline; at B=1 it is a visible ~3% decode-rate tax.
+        Its *purpose* is to cap the lazy-graph handle count, which grows as
+        ``active_seqs × steps_since_barrier``. Holding that product at the
+        same 64-unit budget the flat every-8 barrier already sustains at
+        batch 8 lets a single stream materialize every 64 steps instead of
+        every 8 — 8× fewer stalls, identical peak handles. Concurrency keeps
+        the #1834 every-8 floor.
+        """
+        if active_seqs < 1:
+            active_seqs = 1
+        interval = _RECURRENT_MATERIALIZE_HANDLE_BUDGET // active_seqs
+        if interval < _RECURRENT_CACHE_MATERIALIZE_INTERVAL:
+            return _RECURRENT_CACHE_MATERIALIZE_INTERVAL
+        if interval > _RECURRENT_MATERIALIZE_MAX_INTERVAL:
+            return _RECURRENT_MATERIALIZE_MAX_INTERVAL
+        return interval
 
     def _materialize_active_recurrent_cache(self) -> int:
         """Detach lazy recurrent-cache updates from prior decode steps.
@@ -7976,6 +8265,22 @@ class Scheduler:
         elif self.prefix_cache is not None:
             return self.prefix_cache.get_stats()
         return None
+
+    def clear_prefix_cache(self, *, reset_stats: bool = True) -> bool:
+        """Clear scheduler-owned reusable KV state without touching requests."""
+        if self.has_requests():
+            raise RuntimeError("cannot clear prefix cache while requests are active")
+        cleared = False
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear(reset_stats=reset_stats)
+            cleared = True
+        elif self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear(reset_stats=reset_stats)
+            cleared = True
+        elif self.prefix_cache is not None:
+            self.prefix_cache.clear(reset_stats=reset_stats)
+            cleared = True
+        return cleared
 
     def reset(self) -> None:
         """Reset the scheduler state.

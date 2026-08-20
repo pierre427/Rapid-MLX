@@ -20,6 +20,47 @@ let updateReleaseHostAllowlist: Set<String> = [
     "www.rapidmlx.com",
 ]
 
+/// Hosts a manifest's `dmg_url` is allowed to name. Sparkle owns the
+/// actual download now (its own appcast, its own EdDSA verification), so
+/// nothing in-process fetches this URL any more — the check survives as a
+/// manifest-shape gate: a payload naming an unexpected download host is
+/// treated as a malformed manifest rather than quietly accepted into the
+/// version status the UI renders.
+///
+/// The ``UpdateCheckerTests`` superset invariant requires every host in
+/// ``updateReleaseHostAllowlist`` to appear here too; keep the two in sync.
+/// Lower-cased ASCII hostnames only.
+let updateDownloadHostAllowlist: Set<String> = [
+    "github.com",
+    "www.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "dl.rapidmlx.com",
+    "rapidmlx.com",
+    "www.rapidmlx.com",
+]
+
+/// The main window's size on a launch that has no saved frame.
+///
+/// Named rather than inline because the width is not a taste choice: Direction
+/// D's onboarding enters its two-column layout at
+/// ``OnboardingD/columnsMinWidth`` (1290pt), and the previous default of
+/// 1200×820 sat below it — so every fresh install met Step 2 in the medium
+/// STACKED layout and no user ever saw the composition Paper 05.1.A specifies
+/// until they resized the window themselves. 1440×900 is Paper's own desktop
+/// frame, and it is the smallest round size that clears the breakpoint.
+///
+/// This is a DEFAULT, not a policy. It applies only where SwiftUI has no frame
+/// to restore: ``AppDelegate/attachMainWindow(_:)`` sets the
+/// `Rapid.MainWindow` autosave name, which restores a saved frame synchronously
+/// and therefore wins for every returning user. Nothing resizes the window when
+/// onboarding appears or changes state, and narrowing it still reaches the
+/// medium and compact tiers exactly as before.
+enum MainWindowDefaults {
+    static let width: CGFloat = 1440
+    static let height: CGFloat = 900
+}
+
 struct RapidApp: App {
     @Environment(\.openWindow) private var openWindow
 
@@ -36,11 +77,17 @@ struct RapidApp: App {
     /// Local speech-to-text and text-to-speech workflows. Like Images, this
     /// shares the one embedded server and swaps models only on explicit work.
     @State private var audio: AudioViewModel
+    /// Owned by the app, not the Audio tab: dictation must keep working
+    /// while Rapid's own window is closed.
+    @State private var dictation: DictationController
     /// Self-update poller. GETs a public static manifest on R2 at
     /// `https://dl.rapidmlx.com/latest.json`. See ``UpdateChecker``.
     @State private var updater: UpdateChecker
-    /// In-app DMG installer that drives download → mount → swap → relaunch.
-    @State private var installer: Installer
+    /// Sparkle owns the whole update pipeline — check, download, EdDSA
+    /// verification, install-on-quit — for release builds carrying an injected
+    /// public key. ``UpdateChecker`` above no longer installs anything; it is
+    /// the read-only version/status source the pill and Settings render.
+    @State private var sparkleUpdater: SparkleUpdateController
     /// Persisted sampling knobs exposed via Settings → Sampling.
     @State private var sampling: SamplingConfig
     /// App-wide custom instructions shared by Settings and every chat turn.
@@ -207,26 +254,31 @@ struct RapidApp: App {
             customInstructions: customInstructionsConfig,
             server: manager
         )
-        let updateChecker: UpdateChecker
-        if ProcessInfo.processInfo.environment["RAPID_GUI_UPDATE_CURRENT"] == "1" {
-            // Deterministic GUI-golden fixture: exercise the restored update
-            // window while the published release equals the running build.
-            // Production launches never set this harness-only variable.
-            let current = UpdateChecker.bundleVersion()
-            let fixture = UpdateChecker.Release(
-                schemaVersion: 1,
-                version: current,
-                tagName: "rapid-mac-v\(current)",
-                htmlURL: "https://github.com/machinefi/rapid-desktop/releases/tag/rapid-mac-v\(current)",
-                notes: "",
-                publishedAt: "2026-08-10T00:00:00Z",
-                dmgURL: "https://dl.rapidmlx.com/rapid-mac/\(current)/rapid-mlx-desktop.dmg"
-            )
-            updateChecker = UpdateChecker(currentVersion: current) { fixture }
+        // Deterministic AX fixture for the otherwise release-only state where
+        // Sparkle is already downloading in the background. Requiring both
+        // variables keeps this inert in every normal/dev launch.
+        let updateBusyFixture = ProcessInfo.processInfo.environment["RAPID_GUI_GOLDEN_MODE"] == "1"
+            && ProcessInfo.processInfo.environment["RAPID_GUI_UPDATE_BUSY_FIXTURE"] == "1"
+        let updateFetcher: UpdateChecker.Fetcher?
+        if updateBusyFixture {
+            updateFetcher = {
+                UpdateChecker.Release(
+                    schemaVersion: 1,
+                    version: "99.0.0",
+                    tagName: "rapid-mac-v99.0.0",
+                    htmlURL: "https://rapidmlx.com/desktop",
+                    notes: "Golden-flow update fixture.",
+                    publishedAt: "2026-08-19T00:00:00Z",
+                    dmgURL: "https://dl.rapidmlx.com/rapid-mac-v99.0.0.dmg"
+                )
+            }
         } else {
-            updateChecker = UpdateChecker()
+            updateFetcher = nil
         }
-        let installerInstance = Installer()
+        let updateChecker = UpdateChecker(fetcher: updateFetcher)
+        let sparkleUpdateController = SparkleUpdateController(
+            fixtureState: updateBusyFixture ? .busy : nil
+        )
         let downloadsInstance = DownloadManager(binaryPath: manager.binaryPath)
         // #253: let ``ServerManager.start(alias:)`` await any in-flight
         // background pull for the same alias before spawning serve.
@@ -241,8 +293,9 @@ struct RapidApp: App {
         _chatViewModel = State(initialValue: chat)
         _imageGen = State(initialValue: ImageGenViewModel(server: manager))
         _audio = State(initialValue: AudioViewModel(server: manager))
+        _dictation = State(initialValue: DictationController(server: manager))
         _updater = State(initialValue: updateChecker)
-        _installer = State(initialValue: installerInstance)
+        _sparkleUpdater = State(initialValue: sparkleUpdateController)
         _sampling = State(initialValue: samplingConfig)
         _customInstructions = State(initialValue: customInstructionsConfig)
         _appearance = State(initialValue: appearanceConfig)
@@ -253,7 +306,7 @@ struct RapidApp: App {
         AppDelegate.shared.server = manager
         AppDelegate.shared.downloads = downloadsInstance
         AppDelegate.shared.updater = updateChecker
-        AppDelegate.shared.installer = installerInstance
+        AppDelegate.shared.sparkleUpdater = sparkleUpdateController
         AppDelegate.shared.chat = chat
         AppDelegate.shared.appearance = appearanceConfig
     }
@@ -270,7 +323,9 @@ struct RapidApp: App {
                 .environment(chatViewModel)
                 .environment(imageGen)
                 .environment(audio)
+                .environment(dictation)
                 .environment(updater)
+                .environment(sparkleUpdater)
                 .environment(sampling)
                 .environment(customInstructions)
                 .environment(appearance)
@@ -286,6 +341,11 @@ struct RapidApp: App {
                 .environment(mcpTools)
                 .environment(perfConfig)
                 .task {
+                    // Dictation is a background service: arm it at launch so
+                    // the hotkey works without ever opening the Audio tab.
+                    await dictation.bootstrap()
+                }
+                .task {
                     // DEV-ONLY: render real screens to PNG when
                     // RAPID_DEV_SNAPSHOT_DIR is set, then quit. Inert
                     // (returns immediately) in normal use.
@@ -298,12 +358,9 @@ struct RapidApp: App {
                 .task {
                     // Register the AppKit→SwiftUI bridges so the Dock
                     // reopen hook and the menu-bar tray can materialise
-                    // the main / update scenes through ``openWindow``.
+                    // the main / settings scenes through ``openWindow``.
                     AppDelegate.openMainWindow = {
                         openWindow(id: "main")
-                    }
-                    AppDelegate.openUpdateWindow = {
-                        openWindow(id: "update-install")
                     }
                     AppDelegate.openSettingsWindow = {
                         openWindow(id: "settings")
@@ -316,19 +373,29 @@ struct RapidApp: App {
                             openWindow(id: "settings")
                         }
                     }
-                    if ProcessInfo.processInfo.environment["RAPID_GUI_OPEN_UPDATE_WINDOW"] == "1" {
-                        openWindow(id: "update-install")
-                    }
                 }
                 .task {
-                    // First update check on launch, then re-check every
-                    // 6 hours while the app is open.
-                    await updater.check()
-                    while !Task.isCancelled {
-                        try? await Task.sleep(nanoseconds: 6 * 60 * 60 * 1_000_000_000)
-                        if Task.isCancelled { break }
-                        await updater.check()
+                    if sparkleUpdater.isEnabled {
+                        // Sparkle owns the six-hour schedule, background
+                        // download, signature validation, and install-on-quit.
+                        sparkleUpdater.start()
                     }
+                    // ONE check, at launch — deliberately not a timer.
+                    //
+                    // Sparkle owns "is there a newer version", and running a
+                    // second six-hour poll beside its own was pure duplication.
+                    // This single call still earns its keep: it refreshes the
+                    // version pill and the Settings status, and it is the only
+                    // thing that reports this build's version to the update
+                    // endpoint, which is where the per-version install
+                    // distribution comes from. Losing that would mean losing
+                    // the only answer to "how many installs are still on an old
+                    // build" (see #1944).
+                    //
+                    // A relaunch re-runs it, which is frequent enough for a
+                    // distribution metric and for a status pill nobody watches
+                    // continuously.
+                    await updater.check()
                 }
                 .task(id: server.servingAlias) {
                     // When the server transitions to ``.ready(alias)``,
@@ -360,7 +427,7 @@ struct RapidApp: App {
                     await TelemetrySession.sendStartIfNeeded()
                 }
         }
-        .defaultSize(width: 1200, height: 820)
+        .defaultSize(width: MainWindowDefaults.width, height: MainWindowDefaults.height)
         .windowResizability(.contentMinSize)
         .commands {
             // Replace the system-default "About" item with our own.
@@ -368,6 +435,19 @@ struct RapidApp: App {
                 Button("About Rapid-MLX") {
                     AboutPanel.show(server: server)
                 }
+            }
+            // File → Export All Chats…  The per-conversation export lives on
+            // the sidebar row menu; this is the whole-library backup, and the
+            // menu bar is where a user looks for "get my data out" when they
+            // don't have one particular chat in mind.
+            CommandGroup(after: .newItem) {
+                Button("Export All Chats…") {
+                    ConversationExportPanel.exportAll(
+                        conversations: chatViewModel.conversations,
+                        folders: chatViewModel.folders
+                    )
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
             }
             // ⌘, → our Window-based Settings (replaces the default that
             // targeted the removed ``Settings`` scene).
@@ -401,9 +481,14 @@ struct RapidApp: App {
                 .environment(appearance)
                 .environment(settingsRouter)
                 .environment(server)
+                // Settings → Developer resets the wizard, and SwiftUI traps
+                // rather than warns when an @Environment observable is
+                // missing — so the Settings scene needs this even though the
+                // panel that reads it only exists in a debug build.
+                .environment(quickstart)
                 .environment(downloads)
                 .environment(updater)
-                .environment(installer)
+                .environment(sparkleUpdater)
                 .environment(dockPromptStore)
                 .environment(webSearch)
                 .environment(browseApproval)
@@ -415,15 +500,6 @@ struct RapidApp: App {
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 900, height: 720)
-
-        // Dedicated window for the in-app update flow.
-        Window("Update Rapid-MLX", id: "update-install") {
-            UpdateInstallView()
-                .environment(updater)
-                .environment(installer)
-        }
-        .windowResizability(.contentSize)
-        .defaultSize(width: 480, height: 360)
     }
 
     /// Walk ``NSApp.windows`` and flip the main chat window's level to
@@ -473,7 +549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// like ``server`` / ``sessionStore`` above; weak because the SwiftUI
     /// ``@State`` on ``RapidApp`` owns each for the app's lifetime.
     weak var updater: UpdateChecker?
-    weak var installer: Installer?
+    weak var sparkleUpdater: SparkleUpdateController?
     /// The single AppKit menu-bar (tray) surface. Installed in
     /// ``applicationDidFinishLaunching`` and held strongly so the
     /// ``NSStatusItem`` slot stays alive for the app's lifetime —
@@ -724,7 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 25.x / Tahoe), so it was removed entirely rather than run
         // alongside this one — two surfaces at once is the #475
         // double-icon bug. The controller reads its live state
-        // (server / updater / installer / sessionStore / quickAsk)
+        // (server / updater / sparkleUpdater / sessionStore / quickAsk)
         // through ``AppDelegate.shared``, all populated by
         // ``RapidApp.init`` above.
         menuBarController = MenuBarController()
@@ -741,13 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // write inline so the data lands before this delegate hook
         // returns to AppKit.
         MainActor.assumeIsolated {
-            AppDelegate.runTerminationSequence(
-                stopStream: { AppDelegate.shared.chat?.stopAndPersist() },
-                signalServer: { AppDelegate.shared.server?.beginShutdown() },
-                signalDownloads: { AppDelegate.shared.downloads?.beginShutdown() },
-                reapServer: { AppDelegate.shared.server?.shutdownSync() },
-                reapDownloads: { AppDelegate.shared.downloads?.finishShutdown() }
-            )
+            AppDelegate.runStandardTermination()
         }
         // Last write before AppKit pulls the plug — clears this
         // launch's crash marker so the NEXT launch doesn't
@@ -815,12 +885,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// once — guarded with ``?.()`` so a reopen click before first
     /// launch is a no-op, not a crash.
     static var openMainWindow: (@MainActor () -> Void)?
-
-    /// Companion bridge for the update window, driven from the menu-bar
-    /// tray's "Update available" / "Updating…" item. Same contract as
-    /// ``openMainWindow``: written from the main scene's ``.task``,
-    /// invoked from ``MenuBarController`` via ``?.()``.
-    static var openUpdateWindow: (@MainActor () -> Void)?
 
     /// Bridge for the Settings window, driven from the tray's
     /// "Settings…" item AND the ⌘, command. Uses a real ``Window``
@@ -900,7 +964,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reapDownloads()
         // Drain any queued conversation-history write so the last turn /
         // edit / deletion isn't lost when the process exits before the
-        // async save lands.
+        // async save lands. Folders drain alongside it — the two files are
+        // written in the same user actions (deleting a folder unfiles the
+        // conversations in it), so flushing only one can leave the pair
+        // disagreeing about where a row lives.
         ConversationStore.flush()
+        ConversationFolderStore.flush()
+    }
+
+    /// The single clean-shutdown wiring, shared by ``applicationWillTerminate``
+    /// and the re-onboarding relaunch (``ReonboardingReset``). Both paths end
+    /// the process, so both must persist the chat, reap the server, and stop
+    /// the download children — keeping this in one place stops the two from
+    /// drifting (the re-onboarding path originally teardown only the server
+    /// and orphaned in-flight downloads / lost the last chat edit, #1973).
+    @MainActor
+    static func runStandardTermination() {
+        runTerminationSequence(
+            stopStream: { AppDelegate.shared.chat?.stopAndPersist() },
+            signalServer: { AppDelegate.shared.server?.beginShutdown() },
+            signalDownloads: { AppDelegate.shared.downloads?.beginShutdown() },
+            reapServer: { AppDelegate.shared.server?.shutdownSync() },
+            reapDownloads: { AppDelegate.shared.downloads?.finishShutdown() }
+        )
     }
 }

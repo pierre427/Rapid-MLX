@@ -42,8 +42,6 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
-_MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
-
 # #1100 codex round 6 (#3): replace-mode stage-then-swap transiently holds BOTH
 # the existing live cache AND the fully-staged new blob until the atomic swap
 # (the DELIBERATE cost of the "corrupt source leaves existing cache intact"
@@ -109,7 +107,6 @@ _TOKENS_FORMAT_VERSION_IN_INDEX = 3  # bumped from 2
 # wire-format width is the only sound way to make tokens.bin portable
 # across the heterogeneous fleet (codex r10-D systematic fix). Writer
 # uses struct.pack into bytes; reader uses struct.unpack_from a slice.
-_TOKEN_STRUCT_FMT = "<i"
 _TOKEN_BYTES = 4
 
 # mlx-lm's prompt-cache serializer forwards the flattened cache state directly
@@ -1218,7 +1215,7 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any] | None:
     (keys/values are 3-tuples of arrays). Returns ``None`` when a DeepSeek V4
     wrapper's nested pooling state cannot rewind by exactly ``trim_by`` tokens.
     """
-    from mlx_lm.models.cache import KVCache
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
 
     try:
         from mlx_lm.models.cache import QuantizedKVCache
@@ -1265,6 +1262,32 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any] | None:
             return None
         return tc if trim(trim_by) == trim_by else None
 
+    def trim_rotating(layer: RotatingKVCache) -> RotatingKVCache | None:
+        """Rewind a ``RotatingKVCache`` via its OWN ``trim``, keeping its class.
+
+        A sliding-window layer carries bookkeeping beyond ``offset``
+        (``max_size`` / ``keep`` / the ring write cursor ``_idx``), and its
+        ``trim`` moves that cursor in lockstep with ``offset``. Rebuilding it as
+        a plain ``KVCache`` would both drop the sliding-window identity (the
+        layer would later merge into a ``BatchKVCache`` instead of a
+        ``BatchRotatingKVCache`` — the #1863 crash) and leave the cursor stale,
+        so delegate instead of reconstructing.
+
+        ``is_trimmable()`` is rotation-aware: it reports False once the ring has
+        wrapped and the front of the window has been overwritten, at which point
+        no offset arithmetic can reconstruct the shorter prefix. Both call sites
+        already refuse such an entry via ``_layer_forbids_trim`` before reaching
+        here, so this check is defense-in-depth for a future caller — refusing
+        (``None``) makes the caller fall back to a correct full prefill.
+        """
+        if not layer.is_trimmable():
+            return None
+        # Shallow copy: keys/values are immutable MLX arrays that can be
+        # shared, while the scalar bookkeeping we mutate below must NOT be
+        # written back into the retained cache entry.
+        tc = copy.copy(layer)
+        return tc if tc.trim(trim_by) == trim_by else None
+
     trimmed: list[Any] = []
     for layer_cache in cache:
         if layer_cache is None:
@@ -1288,11 +1311,30 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any] | None:
             and hasattr(layer_cache, "keys")
             and not isinstance(layer_cache.keys, (list, tuple))
         ):
-            tc = KVCache.__new__(KVCache)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
-            trimmed.append(tc)
+            # Sliding-window layers are the ONLY class routed away from the
+            # rebuild below (#1863). Deliberately narrow: a duck-typed "has a
+            # trim() method" test would also capture ``ChunkedKVCache`` /
+            # ``ConcatenateKVCache`` / the quantized ``_QuantizableKVCache``,
+            # whose semantics this function has never applied and which the
+            # trim-liar denylist above handles separately. ``isinstance`` (not
+            # an exact type check) mirrors how ``mlx_lm.generate._make_cache``
+            # dispatches a layer to ``BatchRotatingKVCache``, so any vendored
+            # subclass that batches as rotating is trimmed as rotating too.
+            if isinstance(layer_cache, RotatingKVCache):
+                tc = trim_rotating(layer_cache)
+                if tc is None:
+                    return None
+                trimmed.append(tc)
+            else:
+                # Plain full-attention ``KVCache`` (append-only, so ``offset``
+                # alone governs the reusable length) and every other duck-typed
+                # keys/offset layer. Rebuilt directly, sharing the immutable
+                # key/value arrays — behaviour unchanged from before #1863.
+                tc = KVCache.__new__(KVCache)
+                tc.keys = layer_cache.keys
+                tc.values = layer_cache.values
+                tc.offset = max(layer_cache.offset - trim_by, 0)
+                trimmed.append(tc)
         else:
             if has_deepseek_pooling(layer_cache):
                 # DeepSeek pooling state must rewind with the local KV state;
@@ -2443,7 +2485,7 @@ class MemoryAwarePrefixCache:
             self._stats.current_memory_bytes = self._current_memory
         return True
 
-    def clear(self) -> None:
+    def clear(self, *, reset_stats: bool = True) -> None:
         """Clear all cached entries.
 
         R10-D codex round 2 HIGH: ``load_skipped`` is cumulative —
@@ -2469,15 +2511,25 @@ class MemoryAwarePrefixCache:
                 except Exception as exc:  # pragma: no cover — defensive
                     logger.warning(f"[radix] clear failed: {exc}")
             self._current_memory = 0
-            carried_load_skipped = self._stats.load_skipped
-            carried_save_drift_drops = self._stats.save_drift_drops
-            carried_non_trimmable_skips = self._stats.non_trimmable_skips
-            self._stats = CacheStats(
-                max_memory_bytes=self._max_memory,
-                load_skipped=carried_load_skipped,
-                save_drift_drops=carried_save_drift_drops,
-                non_trimmable_skips=carried_non_trimmable_skips,
-            )
+            previous = self._stats
+            if reset_stats:
+                self._stats = CacheStats(
+                    max_memory_bytes=self._max_memory,
+                    load_skipped=previous.load_skipped,
+                    save_drift_drops=previous.save_drift_drops,
+                    non_trimmable_skips=previous.non_trimmable_skips,
+                )
+            else:
+                self._stats = CacheStats(
+                    hits=previous.hits,
+                    misses=previous.misses,
+                    evictions=previous.evictions,
+                    tokens_saved=previous.tokens_saved,
+                    max_memory_bytes=self._max_memory,
+                    load_skipped=previous.load_skipped,
+                    save_drift_drops=previous.save_drift_drops,
+                    non_trimmable_skips=previous.non_trimmable_skips,
+                )
         logger.debug("Cache cleared")
 
     def get_stats(self) -> dict[str, Any]:

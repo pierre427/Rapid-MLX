@@ -35,12 +35,14 @@ exec /usr/bin/env python3 - "$@" <<'PYEOF'
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import struct
 import sys
 import threading
 import time
+import wave
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -74,6 +76,17 @@ except (OSError, ValueError):
 
 def _setting(name, default=None):
     return os.environ.get(name, FILE_CONFIG.get(name, default))
+
+
+def _pulled_audio_aliases():
+    state_path = _setting("FAKE_AUDIO_PULL_STATE")
+    if not state_path:
+        return set()
+    try:
+        with open(state_path) as stream:
+            return {line.strip() for line in stream if line.strip()}
+    except OSError:
+        return set()
 
 
 def _parse_args(argv):
@@ -152,6 +165,8 @@ RESPONSE_SHAPES = {
         "The Gaussian integral is\n\n",
         "$$\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}$$",
         "\n\nand inline it reads $e^{i\\pi} + 1 = 0$.",
+        "\n\nA bridged congruence is $$a^{p-1} \\equiv 1 \\mod p$$.",
+        "\n\nA bridged alignment is $$\\begin{align}x &= 1 \\\\ y &= \\boxed{2}\\end{align}$$.",
     ],
     "shape:list": [
         "Three things, in order:\n\n",
@@ -370,8 +385,149 @@ class _ImageRenders:
                 "elapsed_ms": elapsed,
             }
 
-
 RENDERS = _ImageRenders()
+
+
+def _extract_image_part(raw_body, content_type):
+    """The raw image bytes carried by the ``name="image"`` part of a multipart
+    edit request.
+
+    ``raw_body`` is the full request body and ``content_type`` is the request's
+    ``Content-Type`` header. The image part's own headers end at the first
+    blank line after ``name="image"``; the bytes run from there until the
+    CRLF + the next ``--<boundary>`` separator, so a stray ``\r\n--`` that
+    happens to occur inside PNG pixel data cannot truncate it. Returns the
+    image bytes, or ``None`` when no image part is present (parsing is
+    best-effort and is not the authority on image validity — hermetic unit
+    tests are).
+    """
+    boundary = None
+    for token in (content_type or "").split(";"):
+        token = token.strip()
+        if token.startswith("boundary="):
+            boundary = token.split("=", 1)[1].strip('"')
+            break
+    marker = b'name="image"'
+    i = raw_body.find(marker)
+    if i < 0:
+        return None
+    hdr = raw_body.find(b"\r\n\r\n", i)
+    if hdr < 0:
+        return None
+    start = hdr + 4
+    if boundary:
+        sep = ("\r\n--" + boundary).encode()
+        j = raw_body.find(sep, start)
+        end = j if j >= 0 else len(raw_body)
+    else:
+        j = raw_body.find(b"\r\n--", start)
+        end = j if j >= 0 else len(raw_body)
+    return raw_body[start:end]
+
+
+def _png_rgba_sha256(png_bytes):
+    """SHA-256 of the DECODED RGBA pixels of a PNG (including its
+    width and height, so geometry is pinned as well as pixels).
+
+    The app's ``EditImageImporter.pngData`` decodes and re-encodes an import
+    through ``NSBitmapImageRep``, so the uploaded PNG is not byte-identical
+    to the file the user picked — ancillary chunks (iCCP, eXIf ...) and the
+    IDAT zlib stream can legitimately differ. Comparing raw bytes against the
+    fixture would be fragile across macOS encoder versions. Comparing the
+    decoded pixel payload instead pins the user contract that matters: the
+    same pixels reached the wire. Returns the hex digest, or ``None`` when the
+    PNG cannot be decoded.
+
+    Supports 8-bit, non-interlaced PNGs of color types 0 (gray), 2 (RGB),
+    3 (palette), 4 (gray+alpha) and 6 (RGBA); everything else is normalized
+    to 8-bit RGBA before hashing. This is the same code the ``png-rgba-sha``
+    subcommand runs, so the golden flow and the request fake agree exactly.
+    """
+    try:
+        if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None
+        pos = 8
+        width = height = bit_depth = color_type = interlace = None
+        palette = None
+        idat = bytearray()
+        while pos < len(png_bytes):
+            length = int.from_bytes(png_bytes[pos:pos + 4], "big")
+            ctype = png_bytes[pos + 4:pos + 8]
+            data = png_bytes[pos + 8:pos + 8 + length]
+            if ctype == b"IHDR":
+                width, height, bit_depth, color_type, _, _, interlace = struct.unpack(
+                    ">IIBBBBB", data
+                )
+            elif ctype == b"PLTE":
+                palette = data
+            elif ctype == b"IDAT":
+                idat += data
+            pos += 12 + length
+        if not (width and height and bit_depth == 8 and interlace == 0):
+            return None
+        channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
+        if channels is None:
+            return None
+        raw = bytearray(zlib.decompress(bytes(idat)))
+        stride = width * channels
+        prev = bytearray(stride)
+        rows = bytearray()
+        row_len = stride + 1
+        for y in range(height):
+            filter_type = raw[y * row_len]
+            line = bytearray(raw[y * row_len + 1:(y + 1) * row_len])
+            for x in range(stride):
+                a = line[x - channels] if x >= channels else 0
+                b = prev[x]
+                c = prev[x - channels] if x >= channels else 0
+                if filter_type == 0:
+                    value = line[x]
+                elif filter_type == 1:
+                    value = line[x] + a
+                elif filter_type == 2:
+                    value = line[x] + b
+                elif filter_type == 3:
+                    value = line[x] + (a + b) // 2
+                elif filter_type == 4:
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    value = line[x] + (a if pa <= pb and pa <= pc else (b if pb <= pc else c))
+                else:
+                    return None
+                line[x] = value & 0xFF
+            prev = line
+            rows += line
+        rgba = bytearray()
+        if color_type == 6:
+            rgba = rows
+        elif color_type == 2:
+            for i in range(0, len(rows), 3):
+                rgba += rows[i:i + 3] + b"\xff"
+        elif color_type == 4:
+            for i in range(0, len(rows), 2):
+                rgba += rows[i:i + 1] * 3 + rows[i + 1:i + 2]
+        elif color_type == 0:
+            for value in rows:
+                rgba += bytes((value, value, value, 255))
+        elif color_type == 3:
+            if palette is None:
+                return None
+            for entry in rows:
+                r, g, b = palette[entry * 3:entry * 3 + 3]
+                rgba += bytes((r, g, b, 255))
+        else:
+            return None
+        # Include the decoded width/height in the digest. Hashing only the
+        # flattened RGBA stream would let two images with identical pixels
+        # but different dimensions (e.g. 1×4 vs 2×2) collide, so a golden
+        # flow could pass even if import/re-encoding corrupted the geometry.
+        h = hashlib.sha256()
+        h.update(width.to_bytes(4, "big"))
+        h.update(height.to_bytes(4, "big"))
+        h.update(bytes(rgba))
+        return h.hexdigest()
+    except (zlib.error, struct.error, IndexError):
+        return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -402,12 +558,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models/residency":
             self._json(200, self._residency_snapshot())
             return
-        if self.path == "/v1/images/progress":
+        if self.path.partition("?")[0] == "/v1/images/progress":
             # Polled every few hundred ms while a render is in flight. Answer
             # it even when nothing is running: the client treats a transport
             # failure and "idle" identically, so a 404 here would be
             # indistinguishable from the daemon being down.
             self._json(200, RENDERS.snapshot())
+            return
+        if self.path.partition("?")[0] == "/v1/audio/voices":
+            _event("audio_voices")
+            self._json(200, {"voices": ["Golden", "Harbor"]})
             return
         self._json(404, {"error": "not_found"})
 
@@ -473,6 +633,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
         target = body.get("model") if isinstance(body.get("model"), str) else ""
         _event("model_load", alias=target)
+        delay_ms = int(_setting("FAKE_RESIDENT_LOAD_DELAY_MS", "0") or "0")
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
         if _setting("FAKE_REJECT_IMAGE_LOAD") == "1" and target == FAKE_IMAGE_ALIAS:
             # The engine refuses to admit this model (missing Python extra).
             # Mirror the real server's rejection envelope so
@@ -544,6 +707,8 @@ class Handler(BaseHTTPRequestHandler):
             n=count,
             operation="edit" if editing else "generation",
             has_image=(b'name="image"; filename="input.png"' in raw_body) if editing else False,
+            image_rgba_sha256=(_png_rgba_sha256(_extract_image_part(raw_body, self.headers.get("content-type")))
+                               if editing else None),
         )
         cancelled = False
         for _ in range(total):
@@ -551,6 +716,10 @@ class Handler(BaseHTTPRequestHandler):
             if RENDERS.advance():
                 cancelled = True
                 break
+        # Real image engines still perform VAE decode / PNG encoding after the
+        # last denoise step. Keep that tail observable for GUI phase coverage.
+        finish_ms = max(0, int(_setting("FAKE_IMAGE_FINISH_MS", 0)))
+        time.sleep(finish_ms / 1000)
         RENDERS.end()
         png = _one_pixel_png(((index * 70) % 256, (index * 130) % 256, (index * 190) % 256))
         encoded = base64.b64encode(png).decode("ascii")
@@ -584,6 +753,42 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/images/edits":
             self._images_generate(editing=True)
+            return
+        if self.path == "/v1/audio/speech":
+            length = int(self.headers.get("content-length", "0") or "0")
+            body = json.loads(self.rfile.read(length) or b"{}")
+            _event(
+                "audio_speech",
+                model=body.get("model"),
+                voice=body.get("voice"),
+                speed=body.get("speed"),
+                text=body.get("input"),
+            )
+            audio = io.BytesIO()
+            with wave.open(audio, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                # Long enough for the AX flow to observe Play -> Stop, while
+                # still tiny and silent for unattended GUI tests.
+                wav.writeframes(b"\x00\x00" * 32000)
+            payload = audio.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path == "/v1/audio/transcriptions":
+            length = int(self.headers.get("content-length", "0") or "0")
+            if length:
+                self.rfile.read(length)
+            _event("audio_transcription")
+            self._json(200, {
+                "text": "Golden transcription result.",
+                "language": "en",
+                "duration": 0.1,
+            })
             return
         if self.path != "/v1/chat/completions":
             self._json(404, {"error": "not_found"})
@@ -730,10 +935,22 @@ def _emit_catalog(subcommand, alias):
     """
     if subcommand == "models":
         print("Available models")
-        print("Alias                  Parser           Reasoning")
-        print("---------------------  ---------------  ---------")
+        print("Alias                  Parser           Reasoning        Preset")
+        print("---------------------  ---------------  ---------------  --------")
+        if _setting("FAKE_INCLUDE_STARTER") == "1":
+            # A production catalog always contains the onboarding starter.
+            # Most flows deliberately keep the compact single-chat-row
+            # fixture, but fresh-install must exercise the real default
+            # selection contract rather than falling back to fake-alias.
+            print("lfm2.5-1b-4bit        hermes           none")
+        if _setting("FAKE_CACHED_CURATED_TRADEUP") == "1":
+            for index in range(6):
+                print(f"a-cached-{index}             hermes           none")
+            print("qwen3.5-4b-4bit       hermes           qwen3")
         print("fake-alias             hermes           qwen3")
         print("fake-external-alias    hermes           qwen3")
+        if _setting("FAKE_SETTINGS_MTP") == "1":
+            print("qwen3.8-27b-4bit       hermes           qwen3           MTP@rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX@3")
         # A video-generation row, in the tagged section the real engine
         # emits (#1607). It has no tokenizer and cannot answer a chat
         # request, so the desktop must filter it out of every catalog
@@ -755,16 +972,42 @@ def _emit_catalog(subcommand, alias):
         print("Alias                  Size       Kind        HF id")
         print("---------------------  ---------  ----------  ------")
         print(f"{FAKE_IMAGE_ALIAS}       4.6 GiB    [image:both] {FAKE_IMAGE_REPO}")
+        print()
+        print("Audio models (2 aliases)")
+        print("Alias                  Size       Kind        Family      HF id")
+        print("---------------------  ---------  ----------  ----------  ------")
+        print("fake-qwen3-tts         1.1 GiB    [audio:tts] qwen3_tts   fake/qwen3-tts")
+        print("fake-whisper-small     461 MiB    [audio:stt] whisper     fake/whisper-small")
         return True
     if subcommand == "ls":
+        if _setting("FAKE_EMPTY_CACHE_NOTICE") == "1":
+            print("No models cached yet. Run 'rapid-mlx pull <alias>' or 'rapid-mlx chat <alias>' to download one.")
         print("Cached models")
         print("Alias                  Repo                   Size")
         print("---------------------  ---------------------  ------")
-        print(f"fake-alias             {FAKE_REPO}        1.2 GB")
-        print("(external)             fake-external-alias     2.4 GB")
+        if _setting("FAKE_SETTINGS_MTP") != "1":
+            print(f"fake-alias             {FAKE_REPO}        1.2 GB")
+            print("(external)             fake-external-alias     2.4 GB")
+        if _setting("FAKE_CACHED_CURATED_TRADEUP") == "1":
+            for index in range(6):
+                print(f"a-cached-{index}             fake-org/a-cached-{index}        100 MB")
+            print("qwen3.5-4b-4bit       mlx-community/Qwen3.5-4B-MLX-4bit  2.9 GB")
+        if _setting("FAKE_SETTINGS_MTP") == "1":
+            print("qwen3.8-27b-4bit       rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX  15.2 GB")
         # Cached, so the Images tab resolves to it without a download path —
         # ``ImageGenViewModel.resolveAlias`` prefers a cached entry.
         print(f"{FAKE_IMAGE_ALIAS}       {FAKE_IMAGE_REPO}  4.6 GB")
+        pulled_audio = _pulled_audio_aliases()
+        if "fake-qwen3-tts" in pulled_audio:
+            print("fake-qwen3-tts         fake/qwen3-tts        1.1 GiB")
+        elif _setting("FAKE_PARTIAL_AUDIO_CACHE") == "1":
+            # A real interrupted multi-shard pull remains visible in `ls` for
+            # disk cleanup, but its status alias must never make Audio render
+            # Start. The audio-readiness flow clicks through this row and
+            # requires a resumptive `pull fake-qwen3-tts`.
+            print("(incomplete)           fake/qwen3-tts        633 MB")
+        if "fake-whisper-small" in pulled_audio:
+            print("fake-whisper-small     fake/whisper-small    461 MiB")
         return True
     if subcommand == "info":
         # Per-alias, not a constant: `ls`/`models` map fake-image-alias to its
@@ -775,6 +1018,9 @@ def _emit_catalog(subcommand, alias):
         repo = {
             FAKE_IMAGE_ALIAS: FAKE_IMAGE_REPO,
             "fake-video-alias": "fake/video-mlx",
+            "fake-qwen3-tts": "fake/qwen3-tts",
+            "fake-whisper-small": "fake/whisper-small",
+            "qwen3.8-27b-4bit": "rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX",
         }.get(alias, FAKE_REPO)
         print(f"Alias: {alias} -> {repo}")
         return True
@@ -804,6 +1050,22 @@ def main():
     # output rather than falling through to the server, so a future
     # ``ModelCatalog`` subcommand can't resurrect the hang.
     if args.subcommand != "serve":
+        # Utility subcommand: print the SHA-256 of a PNG file's DECODED RGBA
+        # pixels and exit. The golden flow shells out to this to get the
+        # fixture's expected hash, so it shares the EXACT decoder the request
+        # fake uses (``_png_rgba_sha256``) — one source of truth, no drift
+        # between the upload assertion and the fixture expectation.
+        if args.subcommand == "png-rgba-sha":
+            try:
+                with open(args.alias, "rb") as stream:
+                    digest = _png_rgba_sha256(stream.read())
+            except OSError:
+                digest = None
+            if digest is None:
+                print("error: cannot decode PNG", file=sys.stderr)
+                sys.exit(1)
+            print(digest)
+            sys.exit(0)
         _event(
             "command",
             subcommand=args.subcommand,
@@ -817,6 +1079,10 @@ def main():
             # for the AX flow to inspect the in-flight progress card.
             print("[bytes] 663748608/590348288", flush=True)
             time.sleep(5)
+            state_path = _setting("FAKE_AUDIO_PULL_STATE")
+            if state_path and args.alias in {"fake-qwen3-tts", "fake-whisper-small"}:
+                with open(state_path, "a") as stream:
+                    stream.write(f"{args.alias}\n")
             sys.exit(0)
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)

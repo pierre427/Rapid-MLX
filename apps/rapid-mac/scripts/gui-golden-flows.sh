@@ -36,17 +36,17 @@ usage() {
     cat <<'EOF'
 Usage: gui-golden-flows.sh [--flow NAME] [--keep] [--update-baselines]
 
-Flows: fresh-install, cached-quickstart, download-progress, settings-persistence, chat-restore, restored-tools, tool-loop-budget, chat-depth, math-rendering, launch-integrations,
+Flows: fresh-install, cached-quickstart, cached-curated-tradeup, download-progress, settings-persistence, settings-mtp, chat-restore, message-actions, restored-tools, tool-loop-budget, chat-depth, math-rendering, launch-integrations,
        slow-stream-stop,
        model-crash-recovery, low-memory-choice,
-       update-state, window-close-prompt, no-dead-controls, catalog-integrity,
-       browse-all-destination, image-generation, all
+       update-state, update-busy, window-close-prompt, no-dead-controls, catalog-integrity,
+       browse-all-destination, chat-document-attachment, image-generation, dictation, audio-readiness, all
 
-download-progress, chat-restore, chat-depth, slow-stream-stop, model-crash-recovery,
-restored-tools, tool-loop-budget and image-generation drive the app through
-the accessibility API alone. They need no peekaboo and no Screen Recording, which is what lets
-them run unattended in CI (see the gui-golden-flows job in
-.github/workflows/rapid-mac-ci.yml). Every other flow needs peekaboo.
+Most named regression flows drive the app through the accessibility API alone.
+The preflight contract tests keep the exact allowlist in sync with
+flow_requires_peekaboo below. Those flows need neither Peekaboo nor Screen
+Recording, which lets them run unattended in CI (see the gui-golden-flows job
+in .github/workflows/rapid-mac-ci.yml).
 
 Options:
   --update-baselines  rewrite the committed AX structural baselines instead of
@@ -76,7 +76,7 @@ die() { printf '[gui-golden] FAIL: %s\n' "$*" >&2; exit 1; }
 pb() { peekaboo "$@" --bridge-socket "$BRIDGE"; }
 flow_requires_screen_recording() {
     case "$FLOW" in
-        all|fresh-install|low-memory-choice|browse-all-destination) return 0 ;;
+        all) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -99,8 +99,8 @@ flow_requires_screen_recording() {
 # unattended without taking on any of that.
 flow_requires_peekaboo() {
     case "$FLOW" in
-        cached-quickstart|download-progress|settings-persistence|chat-restore|restored-tools|tool-loop-budget|chat-depth|math-rendering) return 1 ;;
-        slow-stream-stop|model-crash-recovery|image-generation|window-close-prompt|resident-load-rejected) return 1 ;;
+        fresh-install|cached-quickstart|cached-curated-tradeup|download-progress|settings-persistence|settings-mtp|chat-restore|message-actions|restored-tools|tool-loop-budget|chat-depth|math-rendering|browse-all-destination|no-dead-controls|catalog-integrity|update-state|launch-integrations) return 1 ;;
+        slow-stream-stop|model-crash-recovery|low-memory-choice|chat-document-attachment|image-generation|dictation|audio-readiness|window-close-prompt|resident-load-rejected) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -340,6 +340,50 @@ wait_identifier() {
     die "timed out waiting for AX identifier $identifier"
 }
 
+wait_identifier_enabled() {
+    local identifier="$1" destination="$2" attempts="${3:-80}"
+    for ((i=0; i<attempts; i++)); do
+        see_main "$destination"
+        if jq -e --arg id "$identifier" \
+            '.data.ui_elements[]? | select(.identifier == $id and .enabled == true)' \
+            "$destination" >/dev/null; then
+            return
+        fi
+        sleep 0.25
+    done
+    die "timed out waiting for enabled AX identifier $identifier"
+}
+
+wait_tree_text() {
+    local needle="$1" destination="$2" attempts="${3:-80}"
+    for ((i=0; i<attempts; i++)); do
+        see_main "$destination"
+        if jq -e --arg needle "$needle" \
+            '(.data.ui_elements | tostring) | contains($needle)' \
+            "$destination" >/dev/null; then
+            return
+        fi
+        sleep 0.25
+    done
+    die "timed out waiting for AX text: $needle"
+}
+
+wait_selected() {
+    local identifier="$1" destination="$2" attempts="${3:-80}"
+    for ((i=0; i<attempts; i++)); do
+        see_main "$destination"
+        if jq -e --arg id "$identifier" \
+            '.data.ui_elements[]?
+             | select(.identifier == $id)
+             | select(.selected == true or .value == 1 or .value == "1")' \
+            "$destination" >/dev/null; then
+            return
+        fi
+        sleep 0.25
+    done
+    die "timed out waiting for AX selection: $identifier"
+}
+
 # Is a window with this title in the app's OWN accessibility tree?
 #
 # ``peekaboo list windows`` is NOT an oracle for this. It reports a window that
@@ -396,27 +440,62 @@ ax_window_present() {
 # Give the field one `title` and the ordering assertion starts reading the
 # sidebar instead, silently.
 #
-# The transcript is the AXOpaqueProviderList subtree, so scope to the
-# contiguous run of elements deeper than it.
+# Scope by the app's stable message-action identifiers. The old MarkdownUI
+# implementation happened to insert an AXOpaqueProviderList, but TextKit's
+# custom views correctly expose native AXStaticText nodes without that private
+# provider wrapper. Start at the first user message text (immediately before
+# its Copy/Edit controls) and end at the last assistant Retry control.
 transcript_only() {
     python3 - "$1" "$2" <<'PYEOF'
 import json, sys
 src, dst = sys.argv[1], sys.argv[2]
 els = json.load(open(src))["data"]["ui_elements"]
+action_indexes = [
+    i for i, e in enumerate(els)
+    if str(e.get("identifier", "")).startswith("ChatView.Message.")
+]
+if not action_indexes:
+    sys.exit("no transcript message actions in this dump")
+first_action, last_action = min(action_indexes), max(action_indexes)
+# Include the nearest preceding static text: that is the first prompt. Keep
+# the search local so sidebar text can never satisfy transcript assertions.
 start = next(
-    (i for i, e in enumerate(els) if e.get("subrole") == "AXOpaqueProviderList"),
-    None,
+    (i for i in range(first_action - 1, max(-1, first_action - 8), -1)
+     if els[i].get("role") == "AXStaticText"),
+    first_action,
 )
-if start is None:
-    sys.exit("no transcript container (AXOpaqueProviderList) in this dump")
-root_depth = els[start].get("depth", 0)
-scoped = []
-for element in els[start + 1:]:
-    if element.get("depth", 0) <= root_depth:
-        break
-    scoped.append(element)
+scoped = els[start:last_action + 1]
 if not scoped:
     sys.exit("the transcript container has no children — nothing to assert on")
+json.dump({"data": {"ui_elements": scoped}}, open(dst, "w"))
+PYEOF
+}
+
+# Extract the first complete AX subtree whose root has ROLE. The rapid-ax dump
+# is flat pre-order plus `depth`; taking the root and every following element
+# until depth returns to the root level preserves the hierarchy while excluding
+# covered background windows. Modal-sheet baselines must use this — AppKit keeps
+# the underlying split view in the application tree even though a user cannot
+# interact with it.
+role_subtree_only() {
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, sys
+src, role, dst = sys.argv[1:]
+els = json.load(open(src))["data"]["ui_elements"]
+start = next((i for i, e in enumerate(els) if e.get("role") == role), None)
+if start is None:
+    sys.exit(f"AX tree has no {role} subtree")
+root_depth = int(els[start].get("depth", 0))
+end = len(els)
+for i in range(start + 1, len(els)):
+    if int(els[i].get("depth", 0)) <= root_depth:
+        end = i
+        break
+scoped = []
+for element in els[start:end]:
+    element = dict(element)
+    element["depth"] = int(element.get("depth", root_depth)) - root_depth
+    scoped.append(element)
 json.dump({"data": {"ui_elements": scoped}}, open(dst, "w"))
 PYEOF
 }
@@ -532,7 +611,9 @@ els = json.load(open(sys.argv[1]))["data"]["ui_elements"]
 # in its own node ("-" next to "a nested point") are the same regression on
 # screen, and the second slips past a line-prefix check while also satisfying
 # an exact-match check on the item text.
-LEADING = re.compile(r"^\s*(?:[-*+]\s+|\d+\.\s+)")
+# A tab after the marker is TextKit's accessible representation of a real
+# NSTextList item, not raw markdown. Raw source uses ordinary spaces.
+LEADING = re.compile(r"^\s*(?:[-*+] +|\d+\. +)")
 BARE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s*$")
 offenders = []
 for e in els:
@@ -636,9 +717,18 @@ assert_rendered_shapes() {
     assert_tree_text "$m3" "Both fit comfortably in 16 GB."
 
     assistant_message_only "$transcript" 4 "$m4"
-    assert_rendered_as_separate_nodes "$m4" "list items" \
-        "First, read the prompt." "Second, plan the answer." \
-        "a nested point" "another one" "Third, write it down."
+    # TextKit exposes one native AXStaticText for a paragraph/list group. Its
+    # NSTextList markers are tabs (`1.\t`), while raw markdown markers are
+    # ordinary spaces and are rejected above. Pin every item and the native
+    # marker shape without requiring MarkdownUI's former one-node-per-item
+    # implementation detail.
+    for item in "First, read the prompt." "Second, plan the answer." \
+                "a nested point" "another one" "Third, write it down."; do
+        assert_tree_text "$m4" "$item"
+    done
+    jq -e '[.data.ui_elements[]? | (.value // "") | tostring]
+            | any(.[]; contains("1.\tFirst, read the prompt."))' "$m4" >/dev/null \
+        || die "ordered list lost TextKit native list semantics"
 
     assistant_message_only "$transcript" 5 "$m5"
     assert_tree_text "$m5" "🎯🚀"
@@ -681,11 +771,8 @@ if prose_el is None:
     sys.exit(f"prose not found: {prose}")
 if code_el is None:
     sys.exit(f"code not found: {code}")
-if code_el["depth"] <= prose_el["depth"]:
-    sys.exit(
-        f"code block is not nested below its paragraph "
-        f"(code depth {code_el['depth']} <= prose depth {prose_el['depth']})"
-    )
+if code_el is prose_el:
+    sys.exit("code block was flattened into the prose accessibility node")
 if "\n" not in str(code_el.get("value", "")):
     sys.exit("code block lost its line breaks")
 PYEOF
@@ -773,9 +860,58 @@ press() {
     local tree="$1" identifier="$2" evidence="$3"
     jq -e --arg id "$identifier" '.data.ui_elements[]? | select(.identifier == $id)' "$tree" >/dev/null \
         || { printf '[gui-golden] AX identifier missing: %s\n' "$identifier" >&2; return 1; }
-    "$AX_DRIVER" press "$APP_PID" "$identifier" > "$evidence" || return 1
-    jq -e '.success' "$evidence" >/dev/null \
-        || { printf '[gui-golden] AXPress failed: %s\n' "$identifier" >&2; return 1; }
+    # Retry the press itself. SwiftUI can replace the accessibility element
+    # backing a control between the dump above and the AXPress below, and the
+    # press then fails with a transient invalid-element / cannot-complete error
+    # (#2009 identified this and fixed three call sites inline; there are 126).
+    # A single transient miss on ANY of them failed the whole gate, which is why
+    # three consecutive runs of this suite failed at three DIFFERENT controls —
+    # Choose File twice, then Check for updates. The identifier precheck stays
+    # OUTSIDE the loop: a genuinely absent control must still fail immediately
+    # rather than costing three attempts.
+    local attempt
+    for attempt in 1 2 3; do
+        if "$AX_DRIVER" press "$APP_PID" "$identifier" > "$evidence" 2>/dev/null \
+            && jq -e '.success' "$evidence" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.4
+    done
+    printf '[gui-golden] AXPress failed after 3 attempts: %s\n' "$identifier" >&2
+    return 1
+}
+
+round_trip_toggle() {
+    local identifier="$1" stem="$2"
+    local before after restored
+    see_main "$OUT/$stem-before.json"
+    before="$(element_field "$OUT/$stem-before.json" "$identifier" value)"
+    [[ -n "$before" ]] || die "$identifier exposes no AX value before its press"
+    press "$OUT/$stem-before.json" "$identifier" "$OUT/$stem-press.json" \
+        || die "$identifier is not pressable"
+    see_main "$OUT/$stem-after.json"
+    after="$(element_field "$OUT/$stem-after.json" "$identifier" value)"
+    [[ -n "$after" && "$after" != "$before" ]] \
+        || die "$identifier accepted AXPress but did not change value"
+    press "$OUT/$stem-after.json" "$identifier" "$OUT/$stem-restore-press.json" \
+        || die "$identifier could not be restored"
+    see_main "$OUT/$stem-restored.json"
+    restored="$(element_field "$OUT/$stem-restored.json" "$identifier" value)"
+    [[ "$restored" == "$before" ]] \
+        || die "$identifier did not round-trip to its original value"
+}
+
+press_and_require_selected() {
+    local identifier="$1" stem="$2"
+    see_main "$OUT/$stem-before.json"
+    press "$OUT/$stem-before.json" "$identifier" "$OUT/$stem-press.json" \
+        || die "$identifier is not pressable"
+    see_main "$OUT/$stem-after.json"
+    jq -e --arg identifier "$identifier" \
+        '.data.ui_elements[]? | select(.identifier == $identifier)
+         | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/$stem-after.json" >/dev/null \
+        || die "$identifier accepted AXPress but did not become selected"
 }
 
 dismiss_first_run() {
@@ -808,7 +944,23 @@ dismiss_first_run() {
 }
 
 open_settings() {
-    pb menu click --app "PID:$APP_PID" --item 'Settings…' --json > "$OUT/open-settings.json"
+    if flow_requires_peekaboo; then
+        pb menu click --app "PID:$APP_PID" --item 'Settings…' --json > "$OUT/open-settings.json"
+    else
+        # Settings persistence is deliberately part of the unattended,
+        # AX-only suite. Use the standard macOS shortcut so that flow does
+        # not quietly depend on Peekaboo just to open the window.
+        osascript - "$APP_PID" > "$OUT/open-settings.json" <<'APPLESCRIPT'
+on run argv
+    set targetPID to (item 1 of argv) as integer
+    tell application "System Events"
+        set frontmost of first application process whose unix id is targetPID to true
+        keystroke "," using command down
+    end tell
+    return "{\"success\":true,\"method\":\"command-comma\"}"
+end run
+APPLESCRIPT
+    fi
     local probe=2 opened=0
     for _ in {1..40}; do
         probe=0
@@ -1002,11 +1154,15 @@ wait_send_idle() {
 
 flow_fresh_install() {
     log "1/6 fresh install and onboarding"
-    start_persona fresh-install
+    # The real engine registry always contains the starter. Without this row,
+    # the fake catalog makes the app correctly fall back to its only chat row
+    # and the assertion below can never prove the production first-run rule.
+    start_persona fresh-install FAKE_INCLUDE_STARTER=1
     see_main "$OUT/consent-visible.json"
     jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' "$OUT/consent-visible.json" >/dev/null \
         || die "fresh install did not show telemetry consent"
-    baseline fresh-install.consent "$OUT/consent-visible.json"
+    role_subtree_only "$OUT/consent-visible.json" AXSheet "$OUT/consent-sheet.json"
+    baseline fresh-install.consent "$OUT/consent-sheet.json"
     # #1560: merely launching a fresh install must not inspect model caches
     # behind the consent sheet. Give both SwiftUI catalog tasks time to run;
     # the fake sidecar records every non-serve command before it exits.
@@ -1016,7 +1172,34 @@ flow_fresh_install() {
         "$OUT/fake-events.jsonl" >/dev/null; then
         die "#1560: first launch probed the model catalog before user interaction"
     fi
-    dismiss_first_run
+    press "$OUT/consent-visible.json" TelemetryConsent.DontShare "$OUT/consent-dismiss.json"
+    wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
+
+    # Direction D owns the window rather than mounting production controls
+    # behind a sheet. Pin all three responsive tiers before continuing the
+    # pre-existing fresh-install journey into the production shell.
+    for hidden in Sidebar.NewChat Sidebar.Launch rapid.chat.compose; do
+        if jq -e --arg id "$hidden" '.data.ui_elements[]? | select(.identifier == $id)' \
+            "$OUT/welcome.json" >/dev/null; then
+            die "Direction D mounted production control $hidden behind onboarding"
+        fi
+    done
+    "$AX_DRIVER" set-window-size "$APP_PID" Rapid-MLX 1400x850 > "$OUT/wide-size.json"
+    see_main "$OUT/wide.json"
+    baseline onboarding-direction-d.wide "$OUT/wide.json"
+    "$AX_DRIVER" set-window-size "$APP_PID" Rapid-MLX 1000x760 > "$OUT/medium-size.json"
+    see_main "$OUT/medium.json"
+    baseline onboarding-direction-d.medium "$OUT/medium.json"
+    "$AX_DRIVER" set-window-size "$APP_PID" Rapid-MLX 720x700 > "$OUT/compact-size.json"
+    see_main "$OUT/compact.json"
+    baseline onboarding-direction-d.compact "$OUT/compact.json"
+    press "$OUT/compact.json" Quickstart.GetStarted "$OUT/get-started.json"
+    wait_tree_text "~633 MB" "$OUT/chooser-settled.json"
+    baseline onboarding-direction-d.compact-chooser "$OUT/chooser-settled.json"
+    press "$OUT/chooser-settled.json" Quickstart.Footer.Back "$OUT/chooser-back.json"
+    wait_identifier Quickstart.Skip "$OUT/welcome-returned.json"
+    press "$OUT/welcome-returned.json" Quickstart.Skip "$OUT/quickstart-skip.json"
+    wait_identifier rapid.chat.compose "$OUT/steady.json"
     selected_model="$(element_field "$OUT/steady.json" ModelPickerBar.ModelMenu value)"
     [[ "$selected_model" == *"lfm2.5-1b-4bit"* ]] \
         || die "#1564: skipping Quickstart selected '$selected_model' instead of the small starter"
@@ -1025,30 +1208,94 @@ flow_fresh_install() {
             || die "post-onboarding shell missing $id"
     done
     baseline fresh-install.steady "$OUT/steady.json"
-    pb image --window-id "$MAIN_WINDOW_ID" --path "$OUT/final.png" --json > "$OUT/final-image.json"
+    # Exercise the scene/content contract, not only the constant. Before the
+    # fix the declared floor was never applied and AppKit accepted ~616pt.
+    # Asking for 500pt must be clamped by the live window to at least 720pt.
+    "$AX_DRIVER" set-window-size "$APP_PID" Rapid-MLX 500x500 \
+        > "$OUT/window-floor.json" \
+        || die "the main window rejected a native resize request"
+    jq -e '.actual.width >= 720 and .actual.height >= 560' \
+        "$OUT/window-floor.json" >/dev/null \
+        || die "the live main window did not enforce its 720x560 floor: $(jq -c .actual "$OUT/window-floor.json")"
     cleanup_persona
 }
 
 flow_cached_quickstart() {
     log "cached Quickstart starts without downloading (#1793)"
     # Reproduce #1618, not merely its configuration strings: an
-    # operator-owned rapid-mlx-shaped listener is alive on the default port
+    # operator-owned rapid-mlx-shaped listener is alive in the default port
+    # window
     # before the dogfood app launches. The isolated persona must bind its own
     # high port without sweeping or terminating this process.
+    # A server started in another Terminal owns a different process group.
+    # Non-interactive CI shells disable job control, though, so a bare `&`
+    # would put this fixture in the runner shell's group alongside the app and
+    # its child.  That makes an ownership-safe group shutdown look like it
+    # killed the operator fixture.  Give the fixture the same isolation a real
+    # operator-owned process has; `$!` remains its pid because Python execs the
+    # fake in place after setsid().
+    local operator_port=""
+    local candidate
+    for candidate in {8000..8009}; do
+        if ! /usr/sbin/lsof -nP -sTCP:LISTEN -ti :"$candidate" 2>/dev/null \
+            | grep -q .; then
+            operator_port="$candidate"
+            break
+        fi
+    done
+    [[ -n "$operator_port" ]] \
+        || die "no free port in the operator's default 8000-8009 window"
+
     FAKE_EVENT_LOG="$OUT_ROOT/operator-events.jsonl" \
+        /usr/bin/env python3 -c \
+        'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
         "$ROOT/scripts/fake-rapid-mlx.sh" serve operator-owned \
-        --host 127.0.0.1 --port 8000 > "$OUT_ROOT/operator-server.log" 2>&1 &
+        --host 127.0.0.1 --port "$operator_port" \
+        > "$OUT_ROOT/operator-server.log" 2>&1 &
     OPERATOR_SERVER_PID=$!
+    local operator_bound=0
     for _ in {1..40}; do
-        curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1 && break
+        if kill -0 "$OPERATOR_SERVER_PID" 2>/dev/null \
+            && curl -fsS "http://127.0.0.1:$operator_port/healthz" >/dev/null 2>&1; then
+            # The port was observed free immediately before spawn. Give a
+            # failed bind enough time to unwind before accepting the health
+            # response, so a racing listener cannot impersonate this fixture.
+            sleep 0.1
+            if kill -0 "$OPERATOR_SERVER_PID" 2>/dev/null; then
+                operator_bound=1
+                break
+            fi
+        fi
         sleep 0.1
     done
-    curl -fsS http://127.0.0.1:8000/healthz >/dev/null \
-        || die "operator-shaped server did not bind :8000 for the isolation repro"
-    kill -0 "$OPERATOR_SERVER_PID" 2>/dev/null \
-        || die ":8000 was already occupied; cannot establish the owned-server isolation repro"
+    [[ "$operator_bound" == 1 ]] \
+        || die "operator fixture did not own :$operator_port; cannot establish the isolation repro"
 
-    start_persona cached-quickstart
+    start_persona operator-isolation
+
+    # #1618 is specifically a launch-sweep regression. Prove the operator's
+    # listener survived the isolated app launch, then release the canonical
+    # port window and this probe persona before exercising cached model
+    # startup. Keeping an unrelated server — or the app launched beside it —
+    # alive throughout onboarding adds no ownership coverage and couples two
+    # otherwise independent regression shapes.
+    if ! kill -0 "$OPERATOR_SERVER_PID" 2>/dev/null; then
+        echo "=== isolated app log ===" >&2
+        tail -n 120 "$OUT/app.log" >&2 || true
+        echo "=== operator server log ===" >&2
+        tail -n 120 "$OUT_ROOT/operator-server.log" >&2 || true
+        die "dogfood launch terminated the operator-owned :$operator_port server (#1618)"
+    fi
+    curl -fsS "http://127.0.0.1:$operator_port/healthz" >/dev/null \
+        || die "operator-owned :$operator_port server stopped responding after dogfood launch"
+    cleanup_operator_server
+
+    # Include the real cold-cache notice alongside the deterministic cached
+    # fixture. Catalog output can be interleaved with prose; the chooser must
+    # never promote that notice into a selectable model named "No" (#1918).
+    # A fresh persona keeps this onboarding assertion independent from the
+    # launch-sweep assertion above.
+    start_persona cached-quickstart FAKE_EMPTY_CACHE_NOTICE=1
 
     see_main "$OUT/consent.json"
     if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
@@ -1058,13 +1305,18 @@ flow_cached_quickstart() {
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     jq -e '.data.ui_elements[]?
             | select(.identifier == "Quickstart.Progress")
-            | select(.description == "Setup progress, step 1 of 3")' "$OUT/welcome.json" >/dev/null \
+            | select(.description == "Setup progress, step 1 of 4")' "$OUT/welcome.json" >/dev/null \
         || die "Quickstart welcome does not expose honest step progress"
     press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
     wait_identifier "Quickstart.CachedModel.$FAKE_ALIAS" "$OUT/chooser.json"
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Quickstart.CachedModel.No")' \
+        "$OUT/chooser.json" >/dev/null; then
+        die "empty-cache notice surfaced as a selectable model named No (#1918)"
+    fi
     jq -e '.data.ui_elements[]?
             | select(.identifier == "Quickstart.Progress")
-            | select(.description == "Setup progress, step 2 of 3")' "$OUT/chooser.json" >/dev/null \
+            | select(.description == "Setup progress, step 2 of 4")' "$OUT/chooser.json" >/dev/null \
         || die "Quickstart chooser does not advance its honest step progress"
     press "$OUT/chooser.json" "Quickstart.CachedModel.$FAKE_ALIAS" "$OUT/select-cached.json"
     see_main "$OUT/selected.json"
@@ -1078,17 +1330,73 @@ flow_cached_quickstart() {
               and .port >= 49152 and .port <= 65535)' \
         "$OUT/fake-events.jsonl" >/dev/null \
         || die "isolated persona did not bind its selected high port"
-    kill -0 "$OPERATOR_SERVER_PID" 2>/dev/null \
-        || die "dogfood launch terminated the operator-owned :8000 server (#1618)"
-    curl -fsS http://127.0.0.1:8000/healthz >/dev/null \
-        || die "operator-owned :8000 server stopped responding after dogfood launch"
+    local sidecar_port
+    sidecar_port="$(jq -rs 'map(select(.event == "server_started" and .alias == "fake-alias")) | last | .port // empty' "$OUT/fake-events.jsonl")"
+    local sidecar_healthy=0
+    for _ in {1..40}; do
+        if curl -fsS "http://127.0.0.1:$sidecar_port/healthz" >/dev/null 2>&1; then
+            sidecar_healthy=1
+            break
+        fi
+        sleep 0.1
+    done
+    [[ "$sidecar_healthy" == 1 ]] \
+        || die "cached Quickstart sidecar started but never served health on :$sidecar_port"
+    # Ready is no longer completion: onboarding must hold the window until
+    # the user explicitly confirms the final step. Pin both halves so a
+    # future regression cannot silently restore the old auto-dismiss path.
+    wait_identifier Quickstart.Ready.StartChatting "$OUT/ready-confirmation.json"
+    jq -e '.data.ui_elements[]?
+            | select(.identifier == "Quickstart.Progress")
+            | select(.description == "Setup progress, step 4 of 4")' \
+        "$OUT/ready-confirmation.json" >/dev/null \
+        || die "Quickstart Ready does not report the final onboarding step"
+    # SwiftUI sheets expose the covered window's AX descendants as well, so
+    # the background composer may still be present in this tree. The Ready
+    # action itself is the reliable contract: old auto-dismiss builds never
+    # expose it, and this press is the only route that completes onboarding.
+    press "$OUT/ready-confirmation.json" Quickstart.Ready.StartChatting \
+        "$OUT/start-chatting.json"
     wait_identifier rapid.chat.compose "$OUT/ready.json"
+    assert_tree_text "$OUT/ready.json" "chatting with fake-alias, running entirely on your Mac."
+    [[ "$(jq '[.data.ui_elements[]? | select(.value? | strings | startswith("You’re chatting with fake-alias, running entirely on your Mac."))] | length' "$OUT/ready.json")" == 1 ]] \
+        || die "Quickstart welcome was not seeded exactly once after confirmation"
     if jq -e -s 'any(.[]; .event == "command" and .subcommand == "pull")' \
         "$OUT/fake-events.jsonl" >/dev/null; then
         die "cached Quickstart invoked rapid-mlx pull instead of the start-only path"
     fi
     cleanup_persona
     cleanup_operator_server
+}
+
+flow_cached_curated_tradeup() {
+    log "cached curated trade-up keeps its on-disk state past the six-row cap"
+    start_persona cached-curated-tradeup FAKE_CACHED_CURATED_TRADEUP=1
+    see_main "$OUT/consent.json"
+    if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.DontShare")' \
+        "$OUT/consent.json" >/dev/null; then
+        press "$OUT/consent.json" TelemetryConsent.DontShare "$OUT/consent-dismiss.json"
+    fi
+
+    # Six alphabetically earlier cached rows consume the bounded "Already on
+    # this Mac" presentation. Qwen remains a native curated trade-up, so this
+    # pins the exact seam where cached provenance used to be discarded.
+    wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
+    press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
+    wait_identifier Quickstart.Choice.qwen3.5-4b-4bit "$OUT/chooser.json"
+    jq -e '.data.ui_elements[]?
+            | select(.identifier == "Quickstart.Choice.qwen3.5-4b-4bit")
+            | select((.description // "") | contains("on disk 2.9 GB"))
+            | select(((.description // "") | contains("download")) | not)' \
+        "$OUT/chooser.json" >/dev/null \
+        || die "cached curated trade-up still advertises a download"
+    press "$OUT/chooser.json" Quickstart.Choice.qwen3.5-4b-4bit "$OUT/select.json"
+    # Verify the action's semantic result, not footer copy. The cached model's
+    # provenance is pinned above; after the press the durable contract is that
+    # this exact card becomes selected. Footer wording is presentation copy and
+    # is not required for the cached trade-up behavior under test.
+    wait_selected Quickstart.Choice.qwen3.5-4b-4bit "$OUT/selected.json"
+    cleanup_persona
 }
 
 flow_download_progress() {
@@ -1102,9 +1410,21 @@ flow_download_progress() {
     fi
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     press "$OUT/welcome.json" Quickstart.GetStarted "$OUT/get-started.json"
-    wait_identifier Quickstart.Footer.Primary "$OUT/chooser.json"
-    assert_tree_text "$OUT/chooser.json" "~633 MB"
-    press "$OUT/chooser.json" Quickstart.Footer.Primary "$OUT/download-start.json"
+    # The footer exists while Step 2 is still asynchronously reading the
+    # catalogue. Waiting for that shared identifier can capture the transient
+    # "Matching models" state before the recommendation and its size land.
+    wait_tree_text "~633 MB" "$OUT/chooser.json"
+    press "$OUT/chooser.json" Quickstart.Footer.Primary "$OUT/review-open.json"
+    wait_identifier Quickstart.Review.Alias "$OUT/review.json"
+    assert_tree_text "$OUT/review.json" "Download & start"
+    # AXPress is normally immediate, but AppKit can synchronously hold the
+    # accessibility action until the pull task yields.  In the full suite the
+    # fake pull can therefore finish before a synchronous `press` returns,
+    # making the harness miss the exact in-flight state it exists to verify.
+    # Drive the action concurrently with observation, then still require the
+    # action itself to have succeeded.
+    press "$OUT/review.json" Quickstart.Footer.Primary "$OUT/download-start.json" &
+    local press_pid=$!
 
     local observed=0
     for _ in {1..40}; do
@@ -1126,6 +1446,31 @@ flow_download_progress() {
     jq -e -s 'any(.[]; .event == "command" and .subcommand == "pull")' \
         "$OUT/fake-events.jsonl" >/dev/null \
         || die "download-progress flow never exercised the pull subprocess"
+
+    # Onboarding covers the global DownloadStrip, so Step 3 must provide its
+    # own reachable cancellation path. Exercise the live process rather than
+    # accepting a source-level identifier: cancellation must become a notice,
+    # never fabricated network advice, and Back must return to the Review
+    # micro-stage that launched this transfer.
+    jq -e '.data.ui_elements[]?
+            | select(.identifier == "Quickstart.Download.Cancel")
+            | select(.enabled == true)' "$OUT/downloading.json" >/dev/null \
+        || die "an active onboarding download exposes no enabled Cancel action"
+    press "$OUT/downloading.json" Quickstart.Download.Cancel \
+        "$OUT/download-cancel.json" \
+        || die "onboarding Cancel download is not pressable"
+    wait "$press_pid" \
+        || die "AXPress failed while starting the download-progress fixture"
+    wait_identifier Quickstart.Retry "$OUT/download-cancelled.json"
+    assert_tree_text "$OUT/download-cancelled.json" "Download stopped"
+    if jq -e '(.data.ui_elements | tostring) | contains("Check your connection")' \
+        "$OUT/download-cancelled.json" >/dev/null; then
+        die "a user-cancelled download was misdiagnosed as a network failure"
+    fi
+    press "$OUT/download-cancelled.json" Quickstart.Failure.BackToModelSelection \
+        "$OUT/download-back.json" \
+        || die "cancelled download recovery has no working Back action"
+    wait_identifier Quickstart.Review.Alias "$OUT/download-review-restored.json"
     cleanup_persona
 }
 
@@ -1230,6 +1575,59 @@ PY
     cleanup_persona
 }
 
+flow_settings_mtp() {
+    log "settings Qwen3.8 MTP opt-in"
+    start_persona settings-mtp FAKE_SETTINGS_MTP=1
+    dismiss_first_run
+    open_settings
+    wait_settings_stable "$OUT/settings-root.json"
+    press "$OUT/settings-root.json" Settings.Category.performance "$OUT/performance-open-press.json"
+    wait_identifier Settings.Performance.SpeculativeDecoding.Enabled "$OUT/performance-mtp-off.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Performance.ModelPicker"
+                    and .value == "qwen3.8-27b-4bit")' \
+        "$OUT/performance-mtp-off.json" >/dev/null \
+        || die "Performance did not select the cached Qwen3.8 MTP fixture"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Performance.SpeculativeDecoding.Enabled"
+                    and .enabled == true and .value == 0)' \
+        "$OUT/performance-mtp-off.json" >/dev/null \
+        || die "Qwen3.8 MTP switch was missing, disabled, or defaulted on"
+    press "$OUT/performance-mtp-off.json" Settings.Performance.SpeculativeDecoding.Enabled \
+        "$OUT/performance-mtp-press.json"
+    wait_settings_stable "$OUT/performance-mtp-on.json" Settings.Performance.SpeculativeDecoding.Enabled
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Performance.SpeculativeDecoding.Enabled" and .value == 1)' \
+        "$OUT/performance-mtp-on.json" >/dev/null \
+        || die "Qwen3.8 MTP switch did not stay enabled after pressing"
+    baseline settings-mtp.enabled "$OUT/performance-mtp-on.json"
+    cleanup_persona
+
+    # Every chat model gets the same stable control surface. An alias without
+    # an audited registry preset must fail closed instead of hiding the row or
+    # letting the user enable an unverified combination.
+    start_persona settings-spec-unsupported
+    dismiss_first_run
+    open_settings
+    wait_settings_stable "$OUT/settings-unsupported-root.json"
+    press "$OUT/settings-unsupported-root.json" Settings.Category.performance \
+        "$OUT/performance-unsupported-open-press.json"
+    wait_identifier Settings.Performance.SpeculativeDecoding.Enabled \
+        "$OUT/performance-spec-unsupported.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Performance.ModelPicker"
+                    and .value == "fake-alias")' \
+        "$OUT/performance-spec-unsupported.json" >/dev/null \
+        || die "Performance did not select the unsupported chat fixture"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Performance.SpeculativeDecoding.Enabled"
+                    and .enabled == false and .value == 0)' \
+        "$OUT/performance-spec-unsupported.json" >/dev/null \
+        || die "Unsupported alias did not expose a disabled speculative control"
+    baseline settings-mtp.unsupported "$OUT/performance-spec-unsupported.json"
+    cleanup_persona
+}
+
 flow_chat_restore() {
     log "3/6 basic chat and session restore"
     start_persona chat-restore
@@ -1260,6 +1658,10 @@ flow_chat_restore() {
     dismiss_first_run
     wait_identifier Sidebar.NewChat "$OUT/chat-restored.json"
     assert_tree_text "$OUT/chat-restored.json" "golden restore marker"
+    # Relaunch restarts the fake model too. Search results are a modal overlay
+    # on the whole window, so its structural baseline otherwise races the
+    # transient readiness band and residency controls behind the panel.
+    wait_send_idle "$OUT/chat-restored-ready.json"
 
     # Conversation search is a window-level recovery path, including for
     # history that is not currently visible in the sidebar. Exercise the real
@@ -1307,6 +1709,83 @@ flow_chat_restore() {
     sleep 0.2
     see_main "$OUT/chat-restored-transcript.json"
     assert_tree_text "$OUT/chat-restored-transcript.json" "deterministic content"
+
+    # Conversation folders are a visible sidebar workflow, not just a data
+    # model. Exercise the real row-menu path that creates a folder and files
+    # this conversation in one intention.
+    local conversation_menu_id
+    conversation_menu_id="Sidebar.Conversation.Menu.${conversation_id##*.}"
+    press "$OUT/chat-restored-transcript.json" "$conversation_menu_id" \
+        "$OUT/folder-row-menu.json"
+    wait_identifier Sidebar.Conversation.Action.MoveToNewFolder "$OUT/folder-menu.json"
+    press "$OUT/folder-menu.json" Sidebar.Conversation.Action.MoveToNewFolder \
+        "$OUT/folder-new-press.json"
+    wait_identifier Sidebar.Folder.NameField "$OUT/folder-prompt.json"
+    "$AX_DRIVER" set-value "$APP_PID" Sidebar.Folder.NameField "Golden Work" \
+        > "$OUT/folder-name.json"
+    # AXValue changes reach the native field before SwiftUI has necessarily
+    # propagated the binding and rebuilt the alert action as enabled. Pressing
+    # during that gap is a real disabled-button interaction, not a transient
+    # stale-element failure, so wait for the observable enabled state first.
+    wait_identifier_enabled Sidebar.Folder.Prompt.Confirm "$OUT/folder-name-set.json"
+    press "$OUT/folder-name-set.json" Sidebar.Folder.Prompt.Confirm \
+        "$OUT/folder-save.json"
+    wait_identifier Sidebar.Folder.Toggle.Golden-Work "$OUT/folder-created.json"
+    for _ in {1..40}; do
+        see_main "$OUT/folder-filed.json"
+        if jq -e '(.data.ui_elements | tostring) | contains("Golden Work (1)")' \
+            "$OUT/folder-filed.json" >/dev/null; then break; fi
+        sleep 0.1
+    done
+    assert_tree_text "$OUT/folder-filed.json" "Golden Work (1)"
+    assert_tree_text "$OUT/folder-filed.json" "golden restore marker"
+
+    # The renderer/encoder are unit-tested; this GUI assertion owns the other
+    # half of the feature contract: the export action is reachable from a real
+    # conversation row and presents the native save surface.
+    press "$OUT/folder-filed.json" "$conversation_menu_id" "$OUT/export-row-menu.json"
+    wait_identifier Sidebar.Conversation.Action.Export.Markdown "$OUT/export-menu.json"
+    press "$OUT/export-menu.json" Sidebar.Conversation.Action.Export.Markdown \
+        "$OUT/export-markdown.json"
+    local export_panel_visible=0
+    for _ in {1..40}; do
+        if ax_window_present "Export Conversation" "$OUT/export-panel.json"; then
+            export_panel_visible=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$export_panel_visible" == 1 ]] \
+        || die "Markdown export did not present its save panel"
+    # #2050: the save panel's window object publishes neither AXCloseButton
+    # nor AXCancelButton, so `close-window` can never dismiss it. Its
+    # content IS bridged into the app's AX tree, and AppKit gives the
+    # cancel affordance a stable identifier — press that instead.
+    press "$OUT/export-panel.json" CancelButton "$OUT/export-panel-close.json" \
+        || die "export save panel could not be cancelled"
+
+    local conversation_suffix pin_id unpin_id
+    conversation_suffix="${conversation_id##*.}"
+    pin_id="Sidebar.Conversation.Pin.$conversation_suffix"
+    unpin_id="Sidebar.Conversation.Unpin.$conversation_suffix"
+    if jq -e --arg identifier "$pin_id" \
+        '.data.ui_elements[]? | select(.identifier == $identifier)' \
+        "$OUT/chat-restored-transcript.json" >/dev/null; then
+        press "$OUT/chat-restored-transcript.json" "$pin_id" "$OUT/pin-press.json" \
+            || die "Pin conversation is not pressable"
+        wait_identifier "$unpin_id" "$OUT/pinned.json"
+        press "$OUT/pinned.json" "$unpin_id" "$OUT/unpin-press.json" \
+            || die "Unpin conversation is not pressable"
+        wait_identifier "$pin_id" "$OUT/unpinned.json"
+    else
+        jq -e --arg identifier "$unpin_id" \
+            '.data.ui_elements[]? | select(.identifier == $identifier)' \
+            "$OUT/chat-restored-transcript.json" >/dev/null \
+            || die "active conversation exposes neither Pin nor Unpin"
+        press "$OUT/chat-restored-transcript.json" "$unpin_id" "$OUT/unpin-first-press.json"
+        wait_identifier "$pin_id" "$OUT/unpinned-first.json"
+        press "$OUT/unpinned-first.json" "$pin_id" "$OUT/pin-restore-press.json"
+        wait_identifier "$unpin_id" "$OUT/pinned-restored.json"
+    fi
     wait_send_idle "$OUT/chat-restored-settled.json"
     press "$OUT/chat-restored-settled.json" ChatView.ConversationInstructions \
         "$OUT/conversation-instructions-reopen-press.json"
@@ -1354,11 +1833,255 @@ flow_chat_restore() {
         sleep 0.1
     done
     assert_tree_text "$OUT/select-text-sheet.json" "Selection here crosses paragraphs"
+    press "$OUT/select-text-sheet.json" SelectText.Done "$OUT/select-text-done.json" \
+        || die "Select text Done button is not pressable"
+
+    wait_identifier Toolbar.SearchChats "$OUT/search-actions-ready.json"
+    press "$OUT/search-actions-ready.json" Toolbar.SearchChats "$OUT/search-actions-open-press.json"
+    wait_identifier ConversationSearch.Field "$OUT/search-actions-open.json"
+    "$AX_DRIVER" set-value "$APP_PID" ConversationSearch.Field "golden" \
+        > "$OUT/search-actions-type.json"
+    wait_identifier ConversationSearch.Clear "$OUT/search-actions-filtered.json"
+    press "$OUT/search-actions-filtered.json" ConversationSearch.Clear \
+        "$OUT/search-actions-clear-press.json" \
+        || die "conversation search Clear is not pressable"
+    see_main "$OUT/search-actions-cleared.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "ConversationSearch.Field" and .value == "")' \
+        "$OUT/search-actions-cleared.json" >/dev/null \
+        || die "conversation search Clear did not empty the query"
+    press "$OUT/search-actions-cleared.json" ConversationSearch.Close \
+        "$OUT/search-actions-close-press.json" \
+        || die "conversation search Close is not pressable"
+    wait_identifier Toolbar.SearchChats "$OUT/search-actions-closed.json"
+
+    press "$OUT/search-actions-closed.json" Toolbar.SearchChats \
+        "$OUT/search-new-chat-open-press.json"
+    wait_identifier ConversationSearch.NewChat "$OUT/search-new-chat-open.json"
+    press "$OUT/search-new-chat-open.json" ConversationSearch.NewChat \
+        "$OUT/search-new-chat-press.json" \
+        || die "conversation search New chat is not pressable"
+    wait_identifier Sidebar.NewChat "$OUT/search-new-chat-landed.json"
+    jq -e '[.data.ui_elements[]? | select(.identifier == "ConversationSearch.Field")]
+           | length == 0' "$OUT/search-new-chat-landed.json" >/dev/null \
+        || die "New chat did not dismiss conversation search"
+    log "  conversation Pin/Unpin and search Clear/Close/New chat all produced effects"
+    cleanup_persona
+}
+
+flow_message_actions() {
+    # Every inline message action must produce its advertised result. Dynamic
+    # UUID suffixes are discovered from the live tree so this drives the same
+    # controls a user sees instead of a test-only entry point.
+    start_persona message-actions
+    dismiss_first_run
+    start_model
+    see_main "$OUT/message-actions-model-info-before.json"
+    press "$OUT/message-actions-model-info-before.json" ModelPickerBar.ModelInfo \
+        "$OUT/message-actions-model-info-press.json" \
+        || die "Model info button is not pressable"
+    wait_tree_text "Parameters" "$OUT/message-actions-model-info-open.json" 40
+    assert_tree_text "$OUT/message-actions-model-info-open.json" "$FAKE_ALIAS"
+    # Clicking the anchor again dismisses its popover and proves it is not a
+    # one-way overlay that traps the rest of the composer.
+    press "$OUT/message-actions-model-info-open.json" ModelPickerBar.ModelInfo \
+        "$OUT/message-actions-model-info-close-press.json" \
+        || die "Model info popover cannot be dismissed from its anchor"
+    send_prompt "original message action prompt" message-actions
+    wait_send_idle "$OUT/message-actions-settled.json"
+    see_main "$OUT/message-actions-before.json"
+
+    local assistant_copy assistant_select assistant_retry user_edit suffix
+    assistant_copy="$(jq -r '.data.ui_elements[]? | (.identifier // "")
+        | select(startswith("ChatView.Message.Copy."))' \
+        "$OUT/message-actions-before.json" | tail -1)"
+    assistant_select="${assistant_copy/Message.Copy./Message.SelectText.}"
+    assistant_retry="${assistant_copy/Message.Copy./Message.Retry.}"
+    user_edit="$(jq -r '.data.ui_elements[]? | (.identifier // "")
+        | select(startswith("ChatView.Message.Edit."))' \
+        "$OUT/message-actions-before.json" | head -1)"
+    [[ -n "$assistant_copy" && -n "$user_edit" ]] \
+        || die "completed turn exposes no assistant and user message actions"
+
+    pbcopy < /dev/null
+    press "$OUT/message-actions-before.json" "$assistant_copy" \
+        "$OUT/message-actions-copy-press.json" \
+        || die "Copy response is not pressable"
+    [[ -n "$(pbpaste)" ]] || die "Copy response left the pasteboard empty"
+
+    see_main "$OUT/message-actions-after-copy.json"
+    press "$OUT/message-actions-after-copy.json" "$assistant_select" \
+        "$OUT/message-actions-select-press.json" \
+        || die "Select text is not pressable"
+    wait_identifier SelectText.Done "$OUT/message-actions-select-sheet.json"
+    press "$OUT/message-actions-select-sheet.json" SelectText.Done \
+        "$OUT/message-actions-select-done-press.json" \
+        || die "Select text sheet cannot be dismissed"
+    for _ in {1..40}; do
+        see_main "$OUT/message-actions-select-closed.json"
+        if jq -e '.data.walk.complete == true
+                  and ([.data.ui_elements[]? | .identifier // ""]
+                       | index("SelectText.Done")) == null' \
+            "$OUT/message-actions-select-closed.json" >/dev/null; then break; fi
+        sleep 0.1
+    done
+    jq -e '([.data.ui_elements[]? | .identifier // ""]
+            | index("SelectText.Done")) == null' \
+        "$OUT/message-actions-select-closed.json" >/dev/null \
+        || die "Done did not dismiss the Select text sheet"
+
+    # Copy's checkmark reverts after 1.2s. SwiftUI may replace the action-row
+    # backing elements during that symbol transition; wait for the stable copy
+    # state so this journey measures Edit itself rather than an intentionally
+    # transient sibling animation.
+    for _ in {1..40}; do
+        see_main "$OUT/message-actions-copy-settled.json"
+        if jq -e --arg identifier "$assistant_copy" \
+            '.data.ui_elements[]? | select(.identifier == $identifier)
+             | select(.selected != true)' \
+            "$OUT/message-actions-copy-settled.json" >/dev/null; then break; fi
+        sleep 0.1
+    done
+    see_main "$OUT/message-actions-before-edit.json"
+    suffix="${user_edit##*.}"
+    if ! press "$OUT/message-actions-before-edit.json" "$user_edit" \
+        "$OUT/message-actions-edit-press.json"; then
+        # AXUIElementPerformAction may report cannotComplete even if SwiftUI
+        # committed the synchronous state mutation. Read the outcome before
+        # calling it dead; if no editor appeared, this is a product failure.
+        sleep 0.2
+        see_main "$OUT/message-actions-edit-failed-outcome.json"
+        jq -e --arg identifier "ChatView.Message.EditField.$suffix" \
+            '.data.ui_elements[]? | select(.identifier == $identifier)' \
+            "$OUT/message-actions-edit-failed-outcome.json" >/dev/null \
+            || die "Edit message is not pressable"
+    fi
+    wait_identifier "ChatView.Message.EditField.$suffix" \
+        "$OUT/message-actions-editor.json"
+    "$AX_DRIVER" set-value "$APP_PID" "ChatView.Message.EditField.$suffix" \
+        "cancelled edit must not send" > "$OUT/message-actions-edit-type.json"
+    see_main "$OUT/message-actions-edit-draft.json"
+    press "$OUT/message-actions-edit-draft.json" \
+        "ChatView.Message.CancelEdit.$suffix" \
+        "$OUT/message-actions-edit-cancel-press.json" \
+        || die "Cancel editing is not pressable"
+    wait_identifier "$user_edit" "$OUT/message-actions-edit-cancelled.json"
+    grep -q 'cancelled edit must not send' "$OUT/fake-events.jsonl" 2>/dev/null \
+        && die "cancelling a message edit sent the draft"
+
+    local requests_before requests_after
+    requests_before="$(grep -c '"event": "chat_request"' "$OUT/fake-events.jsonl")"
+    see_main "$OUT/message-actions-before-retry.json"
+    press "$OUT/message-actions-before-retry.json" "$assistant_retry" \
+        "$OUT/message-actions-retry-press.json" \
+        || die "Retry response is not pressable"
+    for _ in {1..80}; do
+        requests_after="$(grep -c '"event": "chat_request"' "$OUT/fake-events.jsonl")"
+        [[ "$requests_after" -gt "$requests_before" ]] && break
+        sleep 0.1
+    done
+    [[ "$requests_after" -gt "$requests_before" ]] \
+        || die "Retry response did not send a replacement request"
+    wait_send_idle "$OUT/message-actions-retried.json"
+
+    see_main "$OUT/message-actions-before-save-edit.json"
+    user_edit="$(jq -r '.data.ui_elements[]? | (.identifier // "")
+        | select(startswith("ChatView.Message.Edit."))' \
+        "$OUT/message-actions-before-save-edit.json" | head -1)"
+    [[ -n "$user_edit" ]] || die "retried turn exposes no Edit message action"
+    suffix="${user_edit##*.}"
+    press "$OUT/message-actions-before-save-edit.json" "$user_edit" \
+        "$OUT/message-actions-save-edit-open-press.json" || true
+    wait_identifier "ChatView.Message.EditField.$suffix" \
+        "$OUT/message-actions-save-editor.json"
+    "$AX_DRIVER" set-value "$APP_PID" "ChatView.Message.EditField.$suffix" \
+        "saved edited message prompt" > "$OUT/message-actions-save-edit-type.json"
+    see_main "$OUT/message-actions-save-edit-draft.json"
+    press "$OUT/message-actions-save-edit-draft.json" \
+        "ChatView.Message.SaveEdit.$suffix" \
+        "$OUT/message-actions-save-edit-press.json" \
+        || die "Save edited message is not pressable"
+    for _ in {1..80}; do
+        if jq -e 'select(.event == "chat_request")
+                  | select(.user_texts | index("saved edited message prompt"))' \
+            "$OUT/fake-events.jsonl" >/dev/null 2>&1; then break; fi
+        sleep 0.1
+    done
+    jq -e 'select(.event == "chat_request")
+           | select(.user_texts | index("saved edited message prompt"))' \
+        "$OUT/fake-events.jsonl" >/dev/null \
+        || die "Save edited message did not resend the edited turn"
+    wait_send_idle "$OUT/message-actions-saved-edit-settled.json"
+
+    # A finished answer no longer emits document-frame changes. This is the
+    # exact state where Jump to latest used to set the pinned flag but leave
+    # the transcript physically scrolled up. Drive a long, fully settled
+    # answer, move away from its tail, then require the same last-message
+    # action to return after pressing the button.
+    send_prompt "shape:long finished answer for jump-to-bottom" message-actions-long
+    wait_send_idle "$OUT/message-actions-long-settled.json"
+    local bottom_scroll_value
+    bottom_scroll_value="$(jq -r '[.data.ui_elements[]?
+        | select(.role == "AXScrollBar" and (.value | type) == "number")
+        | .value] | max // empty' "$OUT/message-actions-long-settled.json")"
+    [[ -n "$bottom_scroll_value" ]] \
+        || die "long settled transcript exposes no measurable scroll position"
+    "$AX_DRIVER" set-scroll-value "$APP_PID" 0 \
+        > "$OUT/message-actions-scroll-up.json" \
+        || die "could not move the settled transcript away from its tail"
+    local jump_visible=0
+    for _ in {1..60}; do
+        see_main "$OUT/message-actions-scrolled.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Transcript.JumpToBottom")' \
+            "$OUT/message-actions-scrolled.json" >/dev/null; then
+            jump_visible=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$jump_visible" == 1 ]] \
+        || die "scrolling up a settled transcript never exposed Jump to latest"
+    local scrolled_value
+    scrolled_value="$(jq -r '[.data.ui_elements[]?
+        | select(.role == "AXScrollBar" and (.value | type) == "number")
+        | .value] | min // empty' "$OUT/message-actions-scrolled.json")"
+    [[ -n "$scrolled_value" ]] \
+        || die "scrolled transcript exposes no measurable scroll position"
+    awk -v before="$bottom_scroll_value" -v after="$scrolled_value" \
+        'BEGIN { exit !(after < before - 0.02) }' \
+        || die "scroll fixture did not move away from the settled transcript tail"
+    press "$OUT/message-actions-scrolled.json" Transcript.JumpToBottom \
+        "$OUT/message-actions-jump-press.json" \
+        || die "Jump to latest is not pressable on a settled transcript"
+    local jumped=0
+    for _ in {1..60}; do
+        see_main "$OUT/message-actions-jumped.json"
+        local jumped_value
+        jumped_value="$(jq -r '[.data.ui_elements[]?
+            | select(.role == "AXScrollBar" and (.value | type) == "number")
+            | .value] | max // empty' "$OUT/message-actions-jumped.json")"
+        if [[ -n "$jumped_value" ]] \
+            && awk -v before="$scrolled_value" -v after="$jumped_value" \
+                'BEGIN { exit !(after > before + 0.02) }' \
+            && ! jq -e '.data.ui_elements[]?
+                        | select(.identifier == "Transcript.JumpToBottom")' \
+                "$OUT/message-actions-jumped.json" >/dev/null; then
+            jumped=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$jumped" == 1 ]] \
+        || die "Jump to latest hid itself without returning the settled transcript to its tail"
+    jq -n '{success: true,
+            assertion: "a finished transcript scrolls back to its final answer"}' \
+        > "$OUT/message-actions-jump-assertion.json"
+    log "  message actions and finished-answer Jump to latest all produced effects"
     cleanup_persona
 }
 
 flow_math_rendering() {
-    # Artifact-level coverage for #1504/#1576. The fake emits display math;
+    # Artifact-level coverage for #1504/#1576/#2107. The fake emits display
+    # and inline math plus commands absent from vanilla SwiftMath;
     # MathView exposes `Math:` only after SwiftMath parsed and hosted it, while
     # the safe fallback exposes `Unrenderable math:`. This therefore catches
     # both a missing font bundle and a parser/resource regression in the real
@@ -1368,11 +2091,58 @@ flow_math_rendering() {
     start_model
     send_prompt "shape:math show me the Gaussian integral" math
     wait_send_idle "$OUT/math-settled.json"
-    assert_tree_text "$OUT/math-settled.json" "Math: \\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}"
+    # TextKit 2's custom block stack does not expose SwiftMath's private
+    # NSViewRepresentable label through the flattened AX walk. Keep the
+    # artifact gate on what it can prove reliably: the formula is segmented
+    # out of prose (neither raw $$ source nor fallback is printed), while the
+    # surrounding blocks survive on both sides. Unit coverage pins the exact
+    # MathBlock latex payload and MathView still owns parse/resource fallback.
+    assert_tree_text "$OUT/math-settled.json" "The Gaussian integral is"
+    assert_tree_text "$OUT/math-settled.json" 'and inline it reads $e^{i\\pi} + 1 = 0$.'
+    assert_tree_text "$OUT/math-settled.json" "A bridged congruence is"
+    assert_tree_text "$OUT/math-settled.json" "A bridged alignment is"
+    if jq -e '(.data.ui_elements | tostring) | contains("$$\\\\int_")' \
+        "$OUT/math-settled.json" >/dev/null; then
+        die "display math reached the transcript as literal source"
+    fi
     if jq -e '(.data.ui_elements | tostring) | contains("Unrenderable math:")' \
         "$OUT/math-settled.json" >/dev/null; then
         die "SwiftMath took the literal-source fallback in the assembled app"
     fi
+
+    # #2056: keep code and table chrome visible through a live appearance
+    # transition. Three short turns fit the hosted runner's 1024x681 window;
+    # unlike chat-depth's five-turn fixture, none of these AX nodes virtualize.
+    send_prompt "shape:code show me fibonacci in python" "markdown-code"
+    wait_send_idle "$OUT/code-settled.json"
+    send_prompt "shape:table compare those two models for me" "markdown-table"
+    wait_send_idle "$OUT/table-settled.json"
+    transcript_only "$OUT/table-settled.json" "$OUT/light-transcript.json"
+    assert_markdown_code_and_table "$OUT/light-transcript.json" "$OUT/light"
+
+    open_settings
+    see_settings "$OUT/settings.json"
+    press "$OUT/settings.json" Settings.Category.appearance "$OUT/appearance-open.json" \
+        || die "Appearance category is not pressable during markdown theme coverage"
+    see_settings "$OUT/appearance.json"
+    press "$OUT/appearance.json" Settings.Appearance.Theme.dark "$OUT/dark-press.json" \
+        || die "Dark appearance is not pressable during markdown theme coverage"
+    see_settings "$OUT/dark.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.dark")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/dark.json" >/dev/null || die "Dark appearance did not become selected"
+    transcript_only "$OUT/dark.json" "$OUT/dark-transcript.json"
+    assert_markdown_code_and_table "$OUT/dark-transcript.json" "$OUT/dark"
+
+    press "$OUT/dark.json" Settings.Appearance.Theme.light "$OUT/light-press.json" \
+        || die "Light appearance is not pressable after the dark markdown check"
+    see_settings "$OUT/light.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.light")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/light.json" >/dev/null || die "Light appearance did not become selected"
+    log "  live Light → Dark → Light kept math, code blocks, and tables rendered"
     cleanup_persona
 }
 
@@ -1489,6 +2259,57 @@ flow_slow_stream_stop() {
         > "$OUT/stop-assertion.json"
     wait_send_idle "$OUT/slow-settled.json"
     baseline slow-stream-stop.stopped "$OUT/slow-settled.json"
+
+    # Release dogfood found a second Stop edge: cancelling before the first
+    # content token left an unanswered user prompt in wire history. The next
+    # request then answered that cancelled prompt instead of the new one.
+    # Exercise that zero-content lane and prove the immediately-following turn
+    # is routed from its own prompt.
+    send_prompt "cancel this before content" zero-content-stop
+    for _ in {1..40}; do
+        see_main "$OUT/zero-content-streaming.json"
+        if [[ "$(element_field "$OUT/zero-content-streaming.json" ChatView.SendOrStopButton description)" == "Stop generating" ]]; then break; fi
+        sleep 0.05
+    done
+    [[ "$(element_field "$OUT/zero-content-streaming.json" ChatView.SendOrStopButton description)" == "Stop generating" ]] \
+        || die "zero-content request never transitioned to Stop generating"
+    press "$OUT/zero-content-streaming.json" ChatView.SendOrStopButton "$OUT/zero-content-stop.json"
+    wait_send_idle "$OUT/zero-content-stopped.json"
+    send_prompt "shape:list answer the new request" after-stop
+    wait_send_idle "$OUT/after-stop-settled.json"
+    assert_tree_text "$OUT/after-stop-settled.json" "Three things, in order:"
+    jq -n '{success: true, assertion: "a send immediately after zero-content Stop answers the new prompt"}' \
+        > "$OUT/after-stop-assertion.json"
+
+    # A forming fenced block used to appear first as a stray backtick text
+    # row, then swap into a code card with a partial language, and finally
+    # shrink when the closing fence arrived. Sample the assembled app while
+    # the fake sidecar streams its deliberately split code fixture: no raw
+    # marker may become an accessibility row at any intermediate revision.
+    send_prompt "shape:code stream a code block" streaming-fence
+    local fence_samples=0
+    for sample in {1..120}; do
+        see_main "$OUT/streaming-fence-$sample.json"
+        if jq -e '.data.ui_elements[]?
+                  | ((.value // "") | tostring)
+                  | select((gsub("[[:space:]]"; "")) == "`"
+                           or (gsub("[[:space:]]"; "")) == "``")' \
+            "$OUT/streaming-fence-$sample.json" >/dev/null; then
+            die "a forming code fence flickered into the streaming AX tree"
+        fi
+        fence_samples=$((fence_samples + 1))
+        [[ "$(element_field "$OUT/streaming-fence-$sample.json" ChatView.SendOrStopButton description)" == "Send message" ]] \
+            && break
+        sleep 0.01
+    done
+    wait_send_idle "$OUT/streaming-fence-settled.json"
+    assert_code_block_is_its_own_view \
+        "$OUT/streaming-fence-settled.json" \
+        "Here is the function you asked for" \
+        "def fib(n):"
+    jq -n --argjson samples "$fence_samples" \
+        '{success: true, assertion: "forming fences never became text rows", samples: $samples}' \
+        > "$OUT/streaming-fence-assertion.json"
     cleanup_persona
 }
 
@@ -1554,17 +2375,6 @@ flow_low_memory_choice() {
     jq -e '.data.ui_elements[]? | select(.identifier == "Quickstart.Footer.Primary")' \
         "$OUT/low-memory-selected.json" >/dev/null \
         || die "selecting the low-memory choice left no Download & start action"
-    local sheet_region
-    sheet_region="$(jq -r '.data.ui_elements[] | select(.role == "AXSheet") | [.bounds.x, .bounds.y, .bounds.width, .bounds.height] | map(round) | @csv' "$OUT/low-memory-selected.json" | head -1)"
-    [[ -n "$sheet_region" ]] || die "Quickstart sheet bounds are absent from AX"
-    pb app switch --to "PID:$APP_PID" --verify --json > "$OUT/focus-before-image.json"
-    # Capture the containing window instead of relying on Peekaboo's newer
-    # area/region flags. The AX assertion above still proves that the sheet is
-    # present, while a window capture works with both v3.0 beta and current
-    # Peekaboo releases used across our dogfood Macs.
-    pb image --window-id "$MAIN_WINDOW_ID" --path "$OUT/low-memory-selected.png" --json \
-        > "$OUT/low-memory-selected-image.json"
-
     jq -n '{success: true, assertion: "onboarding exposes and selects an honestly labelled sub-1B low-memory fallback"}' \
         > "$OUT/low-memory-assertion.json"
     cleanup_persona
@@ -1621,25 +2431,53 @@ flow_update_state() {
     [[ -n "$expected" ]] || die "could not read CFBundleShortVersionString"
     [[ "$shown" == *"$expected"* ]] \
         || die "update panel ($state) says '$shown' but the app is $expected"
+    # PR #1907: the automatic-update preference is part of the shipped App
+    # panel, not just updater plumbing. Local golden builds intentionally omit
+    # SUPublicEDKey, so the control is visible but disabled; signed release
+    # builds enable the same control and default it on through Info.plist.
+    jq -e '.data.ui_elements[]? | select(
+        .identifier == "Settings.App.AutomaticUpdatesToggle"
+    )' "$OUT/update-app-panel.json" >/dev/null \
+        || die "Settings > App does not expose automatic background updates"
+    # One baseline PER STATE, for the same reason the wait loop above accepts
+    # both. The two panels are genuinely different trees — AheadOfManifest has
+    # no ``Settings.App.RecheckCTA`` and no re-check copy beside it — so a
+    # single baseline can only pin one of them, and the release window then
+    # fails the flow on a UI that is behaving correctly. Collapsing the region
+    # instead (the ``Footer.DesktopVersionPill`` treatment in ax-baseline.py)
+    # would hide a real regression in whichever panel is not being exercised.
+    baseline "update-state.app-panel.${state##*.}" "$OUT/update-app-panel.json"
     log "  update state names the running version ($expected, via ${state##*.})"
     cleanup_persona
+}
 
-    # Reproduce #636 directly: a restorable updater window can exist even
-    # when the fetched release equals the running build. It must render a
-    # coherent up-to-date state, never an update CTA plus a false missing-DMG
-    # diagnosis. The fixture makes this independent of the live channel.
-    start_persona update-window-current \
-        RAPID_GUI_UPDATE_CURRENT=1 RAPID_GUI_OPEN_UPDATE_WINDOW=1
-    wait_identifier UpdateInstall.UpToDate "$OUT/update-window-current.json"
-    local title
-    title="$(element_field "$OUT/update-window-current.json" UpdateInstall.Title value)"
-    [[ "$title" == "Rapid-MLX is up to date" ]] \
-        || die "current-release updater title is contradictory: '$title'"
-    ! jq -e '.data.ui_elements[]? | select(
-        ((.value // .label // "") | tostring | test("DMG not available|doesn.t ship a DMG"; "i"))
-    )' "$OUT/update-window-current.json" >/dev/null \
-        || die "current-release updater still reports a missing DMG"
-    log "  restored updater window renders one coherent up-to-date state"
+# A signed release can discover the new version through Rapid's lightweight
+# manifest while Sparkle is already fetching that same update in the
+# background. Sparkle rejects a second foreground check in this state. The UI
+# must expose the real busy state instead of leaving an enabled orange button
+# whose click is silently ignored.
+flow_update_busy() {
+    start_persona update-busy \
+        RAPID_GUI_GOLDEN_MODE=1 \
+        RAPID_GUI_UPDATE_BUSY_FIXTURE=1
+    dismiss_first_run
+    open_settings
+    see_main "$OUT/settings.json"
+    press "$OUT/settings.json" Settings.Category.app "$OUT/open-app.json"
+    wait_identifier Settings.App.UpdateBusy "$OUT/app-panel.json"
+
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.App.UpdateBusy"
+                    and (.description | contains("Update in progress")))' \
+        "$OUT/app-panel.json" >/dev/null \
+        || die "background Sparkle session has no visible progress feedback"
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Settings.App.UpdateCTA")' \
+             "$OUT/app-panel.json" >/dev/null; then
+        die "background Sparkle session still exposes the no-op update CTA"
+    fi
+    baseline "update-busy.app-panel" "$OUT/app-panel.json"
+    log "  background update replaces the no-op CTA with truthful progress"
     cleanup_persona
 }
 
@@ -1689,7 +2527,13 @@ flow_no_dead_controls() {
     see_main "$OUT/dead-before.json"
 
     local category
-    for category in modelManagement tools appearance privacy app; do
+    local settings_categories=(modelManagement instructions tools connectors performance appearance privacy app)
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Settings.Category.developer")' \
+        "$OUT/dead-before.json" >/dev/null; then
+        settings_categories+=(developer)
+    fi
+    for category in "${settings_categories[@]}"; do
         press "$OUT/dead-before.json" "Settings.Category.$category" \
             "$OUT/dead-open-$category.json" \
             || die "Settings category $category is not pressable"
@@ -1707,6 +2551,49 @@ flow_no_dead_controls() {
             || die "Settings > $category exposes no identified controls of its own"
         log "  $category: $count identified controls"
     done
+
+    # Presence is not behaviour. Exercise reversible controls and require the
+    # AX value/selection to round-trip after each press. This catches buttons
+    # that highlight under the pointer but never mutate their binding.
+    press "$OUT/dead-panel-app.json" Settings.Category.appearance "$OUT/dead-open-appearance-actions.json" \
+        || die "Appearance category is not pressable"
+    see_main "$OUT/dead-appearance-before.json"
+    press "$OUT/dead-appearance-before.json" Settings.Appearance.Theme.dark "$OUT/dead-appearance-dark-press.json" \
+        || die "Dark appearance option is not pressable"
+    see_main "$OUT/dead-appearance-dark.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.dark")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/dead-appearance-dark.json" >/dev/null \
+        || die "Dark appearance accepted AXPress but did not become selected"
+    press "$OUT/dead-appearance-dark.json" Settings.Appearance.Theme.light "$OUT/dead-appearance-light-press.json" \
+        || die "Light appearance option is not pressable"
+    see_main "$OUT/dead-appearance-light.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Appearance.Theme.light")
+           | select(.selected == true or .value == 1 or .value == "1")' \
+        "$OUT/dead-appearance-light.json" >/dev/null \
+        || die "Light appearance did not restore selection"
+
+    press "$OUT/dead-appearance-light.json" Settings.Category.privacy "$OUT/dead-open-privacy-actions.json" \
+        || die "Privacy category is not pressable"
+    see_main "$OUT/dead-privacy-before.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Settings.Privacy.Link.MTPLX")' \
+        "$OUT/dead-privacy-before.json" >/dev/null \
+        || die "MTPLX attribution link is missing from Settings → Privacy"
+    [[ "$(element_field "$OUT/dead-privacy-before.json" Settings.Privacy.Link.MTPLX enabled)" == "true" ]] \
+        || die "MTPLX attribution link is disabled"
+    local telemetry_before telemetry_after
+    telemetry_before="$(element_field "$OUT/dead-privacy-before.json" Settings.Privacy.TelemetryToggle value)"
+    press "$OUT/dead-privacy-before.json" Settings.Privacy.TelemetryToggle "$OUT/dead-privacy-toggle.json" \
+        || die "Telemetry toggle is not pressable"
+    see_main "$OUT/dead-privacy-after.json"
+    telemetry_after="$(element_field "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle value)"
+    [[ -n "$telemetry_before" && -n "$telemetry_after" && "$telemetry_before" != "$telemetry_after" ]] \
+        || die "Telemetry toggle accepted AXPress but its value did not change"
+    press "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle "$OUT/dead-privacy-restore.json" \
+        || die "Telemetry toggle could not be restored"
 
     local ax_contracts=(
         "dead-panel-tools.json|Settings.Tools.Toggle.web_search|Web search"
@@ -1726,20 +2613,196 @@ flow_no_dead_controls() {
             || die "$identifier has no readable VoiceOver label"
     done
     log "  Settings toggles expose readable VoiceOver labels"
+
+    # Dogfood every reversible Settings control, not merely its presence.
+    # Each toggle must change and then restore its persisted value. Segmented
+    # controls must publish the selection they accepted. Disclosure buttons
+    # must add and then remove their body. This keeps an AXPress that only
+    # produces a hover/highlight from masquerading as working UI.
+    see_main "$OUT/dead-actions-start.json"
+    press "$OUT/dead-actions-start.json" Settings.Category.modelManagement \
+        "$OUT/dead-actions-models-open.json"
+    round_trip_toggle Settings.Models.ShowAllModelsToggle dead-actions-show-all
+    round_trip_toggle Settings.Models.AutoStartOnLaunchToggle dead-actions-auto-start
+
+    see_main "$OUT/dead-actions-models-favorite-before.json"
+    local favorite_before favorite_after favorite_restored
+    favorite_before="$(element_field "$OUT/dead-actions-models-favorite-before.json" \
+        Settings.ModelManagement.Favorite.fake-alias description)"
+    press "$OUT/dead-actions-models-favorite-before.json" \
+        Settings.ModelManagement.Favorite.fake-alias \
+        "$OUT/dead-actions-models-favorite-press.json"
+    see_main "$OUT/dead-actions-models-favorite-after.json"
+    favorite_after="$(element_field "$OUT/dead-actions-models-favorite-after.json" \
+        Settings.ModelManagement.Favorite.fake-alias description)"
+    [[ -n "$favorite_after" && "$favorite_after" != "$favorite_before" ]] \
+        || die "favorite button accepted AXPress but did not change Pin/Unpin state"
+    press "$OUT/dead-actions-models-favorite-after.json" \
+        Settings.ModelManagement.Favorite.fake-alias \
+        "$OUT/dead-actions-models-favorite-restore-press.json"
+    see_main "$OUT/dead-actions-models-favorite-restored.json"
+    favorite_restored="$(element_field "$OUT/dead-actions-models-favorite-restored.json" \
+        Settings.ModelManagement.Favorite.fake-alias description)"
+    [[ "$favorite_restored" == "$favorite_before" ]] \
+        || die "favorite button did not restore its original Pin/Unpin state"
+
+    press "$OUT/dead-actions-models-favorite-restored.json" Settings.Category.tools \
+        "$OUT/dead-actions-tools-open.json"
+    local tool_name
+    for tool_name in web_search browse weather; do
+        round_trip_toggle "Settings.Tools.Toggle.$tool_name" "dead-actions-tool-$tool_name"
+        see_main "$OUT/dead-actions-details-$tool_name-before.json"
+        press "$OUT/dead-actions-details-$tool_name-before.json" \
+            "Settings.Tools.Details.$tool_name" \
+            "$OUT/dead-actions-details-$tool_name-press.json"
+        see_main "$OUT/dead-actions-details-$tool_name-open.json"
+        jq -e --arg identifier "Settings.Tools.DetailsBody.$tool_name" \
+            '.data.ui_elements[]? | select(.identifier == $identifier)' \
+            "$OUT/dead-actions-details-$tool_name-open.json" >/dev/null \
+            || die "Details for $tool_name pressed but revealed no body"
+        press "$OUT/dead-actions-details-$tool_name-open.json" \
+            "Settings.Tools.Details.$tool_name" \
+            "$OUT/dead-actions-details-$tool_name-close-press.json"
+        see_main "$OUT/dead-actions-details-$tool_name-closed.json"
+        jq -e --arg identifier "Settings.Tools.DetailsBody.$tool_name" \
+            '[.data.ui_elements[]? | select(.identifier == $identifier)] | length == 0' \
+            "$OUT/dead-actions-details-$tool_name-closed.json" >/dev/null \
+            || die "Details for $tool_name did not collapse"
+    done
+    round_trip_toggle Settings.Tools.Browse.AutoApproveToggle dead-actions-auto-approve
+    press_and_require_selected Settings.Tools.WebSearch.Backend.brave dead-actions-backend-brave
+    press_and_require_selected Settings.Tools.WebSearch.Backend.tavily dead-actions-backend-tavily
+    press_and_require_selected Settings.Tools.WebSearch.Backend.duckduckgo dead-actions-backend-restore
+
+    see_main "$OUT/dead-actions-tools-done.json"
+    press "$OUT/dead-actions-tools-done.json" Settings.Category.connectors \
+        "$OUT/dead-actions-connectors-open.json"
+    round_trip_toggle Settings.Connectors.MasterToggle dead-actions-connectors-master
+
+    see_main "$OUT/dead-actions-connectors-done.json"
+    press "$OUT/dead-actions-connectors-done.json" Settings.Category.performance \
+        "$OUT/dead-actions-performance-open.json"
+    press_and_require_selected Settings.Performance.Prefix.On dead-actions-prefix-on
+    press_and_require_selected Settings.Performance.Prefix.Off dead-actions-prefix-off
+    press_and_require_selected Settings.Performance.Prefix.Default dead-actions-prefix-default
+    see_main "$OUT/dead-actions-cache-before.json"
+    local cache_before cache_after
+    cache_before="$(element_field "$OUT/dead-actions-cache-before.json" \
+        Settings.Performance.CacheBudget value)"
+    "$AX_DRIVER" increment "$APP_PID" Settings.Performance.CacheBudget \
+        > "$OUT/dead-actions-cache-increment.json" \
+        || die "Cache budget slider rejected its native AXIncrement action"
+    see_main "$OUT/dead-actions-cache-after.json"
+    cache_after="$(element_field "$OUT/dead-actions-cache-after.json" \
+        Settings.Performance.CacheBudget value)"
+    [[ -n "$cache_after" && "$cache_after" != "$cache_before" ]] \
+        || die "Cache budget slider accepted AXIncrement but stayed at $cache_after"
+    "$AX_DRIVER" decrement "$APP_PID" Settings.Performance.CacheBudget \
+        > "$OUT/dead-actions-cache-decrement.json" \
+        || die "Cache budget slider rejected its native AXDecrement action"
+    see_main "$OUT/dead-actions-cache-restored.json"
+    [[ "$(element_field "$OUT/dead-actions-cache-restored.json" \
+            Settings.Performance.CacheBudget value)" == "$cache_before" ]] \
+        || die "Cache budget slider did not restore $cache_before"
+
+    see_main "$OUT/dead-actions-performance-done.json"
+    press "$OUT/dead-actions-performance-done.json" Settings.Category.app \
+        "$OUT/dead-actions-app-open.json"
+    round_trip_toggle Settings.App.HideDockOnCloseToggle dead-actions-hide-dock
+    see_main "$OUT/dead-actions-app-before-recheck.json"
+    # The App panel is a per-STATE tree (see the update-state flow above):
+    # ``AheadOfManifest`` — the build is newer than anything published — has NO
+    # ``Settings.App.RecheckCTA`` at all. That is precisely the state every
+    # version-bump PR builds into (app X.Y.Z+1, manifest X.Y.Z), so an
+    # unconditional press here failed 2 of 2 runs that reached this flow on the
+    # 0.12.15 bump while passing on every same-version PR. Mirror update-state:
+    # exercise the CTA when the panel renders it, and in AheadOfManifest assert
+    # the state marker instead — a dead control in UpToDate still dies, and a
+    # correctly-absent control no longer reads as one.
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Settings.App.RecheckCTA")' \
+        "$OUT/dead-actions-app-before-recheck.json" >/dev/null; then
+        press "$OUT/dead-actions-app-before-recheck.json" Settings.App.RecheckCTA \
+            "$OUT/dead-actions-app-recheck-press.json" \
+            || die "Check for updates is not pressable"
+        local update_feedback=0
+        for ((i=0; i<40; i++)); do
+            see_main "$OUT/dead-actions-app-checked.json"
+            if jq -e '(.data.ui_elements | tostring)
+                      | contains("Checking for updates") or contains("Up to date")' \
+                "$OUT/dead-actions-app-checked.json" >/dev/null; then
+                update_feedback=1
+                break
+            fi
+            sleep 0.25
+        done
+        [[ "$update_feedback" == 1 ]] \
+            || die "Check for updates produced no visible state"
+    else
+        jq -e '.data.ui_elements[]?
+               | select(.identifier == "Settings.App.AheadOfManifest")' \
+            "$OUT/dead-actions-app-before-recheck.json" >/dev/null \
+            || die "Settings > App shows neither Settings.App.RecheckCTA nor Settings.App.AheadOfManifest"
+    fi
+
+    # Developer exists only in debug builds. Its destructive reset is unit
+    # tested separately; here the GUI contract is that every scope toggle
+    # round-trips and the action opens a cancellable confirmation rather than
+    # erasing immediately.
+    see_main "$OUT/dead-actions-after-update.json"
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Settings.Category.developer")' \
+        "$OUT/dead-actions-after-update.json" >/dev/null; then
+        press "$OUT/dead-actions-after-update.json" Settings.Category.developer \
+            "$OUT/dead-actions-developer-open.json"
+        round_trip_toggle Settings.Developer.Scope.Preferences dead-actions-developer-preferences
+        round_trip_toggle Settings.Developer.Scope.Conversations dead-actions-developer-conversations
+        round_trip_toggle Settings.Developer.Scope.Telemetry dead-actions-developer-telemetry
+        see_main "$OUT/dead-actions-developer-before-confirm.json"
+        press "$OUT/dead-actions-developer-before-confirm.json" Settings.Developer.Reonboard \
+            "$OUT/dead-actions-developer-dialog-press.json" \
+            || die "Erase and restart is not pressable"
+        wait_identifier Settings.Developer.CancelReonboard \
+            "$OUT/dead-actions-developer-dialog.json"
+        local dialog_closed=0
+        for ((i=0; i<40; i++)); do
+            # SwiftUI can replace a confirmation-dialog AX element between a
+            # tree dump and AXPress. Re-resolve and retry the semantic action;
+            # the observable contract is that the dialog disappears.
+            "$AX_DRIVER" press "$APP_PID" Settings.Developer.CancelReonboard \
+                > "$OUT/dead-actions-developer-cancel.json" 2>/dev/null || true
+            sleep 0.1
+            see_main "$OUT/dead-actions-developer-cancelled.json"
+            if ! jq -e '.data.ui_elements[]?
+                        | select(.identifier == "Settings.Developer.CancelReonboard")' \
+                "$OUT/dead-actions-developer-cancelled.json" >/dev/null; then
+                dialog_closed=1; break
+            fi
+            sleep 0.25
+        done
+        [[ "$dialog_closed" == 1 ]] \
+            || die "re-onboarding confirmation stayed open after Cancel"
+    fi
+    log "  reversible Settings controls all changed state and restored"
     cleanup_persona
 }
 
 flow_browse_all_destination() {
-    # An advertised destination must actually be one, and must not cost the
-    # user what they already chose.
+    # An advertised destination must actually be one, must not cost the user
+    # what they already chose, and must not be a way out of setup.
     #
     # "Browse all models →" on Quickstart step 2 was implemented as one line
     # that set a dismiss flag (#1653). It was present, enabled, correctly
     # labelled and carried an AXIdentifier, so every structural check passed —
     # the wizard simply vanished, the user's pick was discarded, and they
     # landed on whatever the alphabetical fallback chose (a 7.6 GB download
-    # nobody asked for). None of that is visible in a tree dump. This flow
-    # presses the control and drives the whole round trip.
+    # nobody asked for). None of that is visible in a tree dump.
+    #
+    # The first fix sent the user to the Settings model catalogue: a second
+    # window, a staged tab, and a round trip back. Paper 05.2.J · S1
+    # supersedes it — the catalogue is now a micro-stage INSIDE Step 2. So the
+    # assertions below are the same three questions, asked of the new
+    # destination: did anything happen, did setup survive, did the pick.
     start_persona browse-all-destination
 
     # Only the consent sheet — the wizard has to stay up, it is the subject.
@@ -1801,117 +2864,74 @@ flow_browse_all_destination() {
     press "$OUT/ba-chosen.json" Quickstart.BrowseAll "$OUT/ba-press.json" \
         || die "Quickstart.BrowseAll is not pressable"
 
-    # 1. It opened the catalogue. `open_settings` drives the menu, so assert
-    #    the window the BUTTON opened rather than opening one ourselves.
-    local opened=0 probe=2
-    for ((i=0; i<40; i++)); do
-        probe=0; ax_window_present Settings "$OUT/ba-settings-window.json" || probe=$?
-        if [[ "$probe" == 0 ]]; then opened=1; break; fi
-        # probe == 2 is "we never got to look" — keep looking, and if the
-        # budget runs out still un-observed, blame the driver, not the button.
-        sleep 0.25
-    done
-    if [[ "$opened" != 1 ]]; then
-        if [[ "$probe" == 2 ]]; then
-            die "could not read the app's window list for 10s — the AX driver failed, so the button is untested"
+    # 1. It opened the catalogue, and it opened it HERE. Wait for one of the
+    #    catalogue's own surfaces rather than for the list specifically — a
+    #    persona with a fake engine may legitimately land on the empty-cache or
+    #    error body, and this flow is about the destination, not the contents.
+    local landed=0
+    for ((i=0; i<60; i++)); do
+        see_main "$OUT/ba-catalog.json"
+        if jq -e '[.data.ui_elements[]?
+                   | select((.identifier // "") | startswith("Quickstart.BrowseAll."))]
+                  | length > 0' "$OUT/ba-catalog.json" >/dev/null 2>&1; then
+            landed=1; break
         fi
-        die "Browse all models did not open anything — it is a dismiss button again (#1653)"
-    fi
-    # Only NOW ask peekaboo for the id, purely to target focus/click/menu at it.
-    # A poll rather than one read: AX publishes a new window before CGWindow
-    # hands out a targetable id, and a one-shot here fails the flow for a race
-    # that has nothing to do with the button under test.
-    SETTINGS_WINDOW_ID=""
-    for ((i=0; i<40; i++)); do
-        pb list windows --app "PID:$APP_PID" --json > "$OUT/ba-windows.json" 2>/dev/null || true
-        # `|| true` on the whole pipeline: a failed `pb` leaves empty or partial
-        # JSON, jq then exits non-zero, and under `set -euo pipefail` that would
-        # abort the very loop written to survive it.
-        SETTINGS_WINDOW_ID="$(jq -r '.data.windows[]? | select(.title == "Settings") | .window_id' \
-            "$OUT/ba-windows.json" 2>/dev/null | head -1 || true)"
-        if [[ -n "$SETTINGS_WINDOW_ID" ]]; then break; fi
         sleep 0.25
     done
-    [[ -n "$SETTINGS_WINDOW_ID" ]] || die "Settings is in the AX tree but peekaboo will not name its window"
+    [[ "$landed" == 1 ]] \
+        || die "Browse all models did not open the in-window catalogue — it is a dismiss button again (#1653)"
+    log "  landed on the in-window catalogue"
 
-    # 2. On the models tab, not merely "Settings somewhere". The wizard's own
-    #    copy promises the catalogue; landing on the user's last-used tab is a
-    #    different bug wearing the same green check.
-    wait_settings_stable "$OUT/ba-settings.json" Settings.Models.ShowAllModelsToggle
-    log "  landed on Model Management"
+    # 2. Setup is still on screen, at the same public step. The bug this
+    #    replaces dismissed the wizard; the fix it replaces opened a second
+    #    window. Neither may happen.
+    jq -e '.data.ui_elements[]? | select(.identifier == "Quickstart.Progress")' \
+        "$OUT/ba-catalog.json" >/dev/null \
+        || die "the setup rail is gone — browsing dismissed onboarding"
+    jq -e '[.data.ui_elements[]?
+            | select(.identifier == "Quickstart.Step2.Kicker")
+            | .value // .title // .label // ""]
+           | map(select(test("STEP 2 OF 4"; "i"))) | length > 0' \
+        "$OUT/ba-catalog.json" >/dev/null \
+        || die "the catalogue is not reporting Step 2 of 4 — a micro-stage became a step"
 
-    # 3. Settings is actually USABLE, not merely present. A window opened
-    #    behind a modal sheet still publishes its whole subtree to AX, and
-    #    AXUIElementPerformAction reaches it there too — so neither the tree
-    #    nor an AXPress can tell a usable window from a trapped one. Focus it,
-    #    click it the way a person would, and require the panel to change.
-    pb window focus --app "PID:$APP_PID" --window-id "$SETTINGS_WINDOW_ID" --json > "$OUT/ba-focus.json" \
-        || die "could not focus the Settings window the button opened"
-    # Coordinates re-read AFTER the focus, because focusing can raise or move
-    # the window and a stale point would click whatever now sits there.
-    see_settings "$OUT/ba-focused.json"
-    local cx cy
-    read -r cx cy < <(jq -r '.data.ui_elements[]
-                             | select(.identifier == "Settings.Category.privacy")
-                             | [(.bounds.x + .bounds.width / 2), (.bounds.y + .bounds.height / 2)]
-                             | @tsv' "$OUT/ba-focused.json")
-    [[ -n "$cx" && -n "$cy" ]] || die "Settings.Category.privacy has no bounds to click"
-    # ``--foreground`` is the whole point. Peekaboo's default is background
-    # delivery — a coordinate hit-test followed by an accessibility action,
-    # which reaches UI a person cannot, and is therefore exactly as blind to
-    # "trapped behind a modal sheet" as the AXPress this replaced.
-    # ``--window-id`` also pins the click to the Settings window rather than
-    # whatever else the app has on screen at that point.
-    pb_click_coords "$cx,$cy" \
-        --app "PID:$APP_PID" --window-id "$SETTINGS_WINDOW_ID" \
-        --json > "$OUT/ba-click.json" \
-        || die "the Settings window did not accept a real click — it is behind the wizard sheet"
-    # A real click that changed nothing is the same failure as no click at all,
-    # so require the panel's own control to appear, not merely that the press
-    # returned success.
-    wait_settings_stable "$OUT/ba-privacy.json" Settings.Privacy.TelemetryToggle
-    log "  Settings is focused and responds to a real click"
+    # 3. No second window. `ax_window_present` returns 1 for "read the list, not
+    #    there" and 2 for "could not look" — only an explicit 1 is evidence.
+    local probe=0
+    ax_window_present Settings "$OUT/ba-windows.json" || probe=$?
+    case "$probe" in
+        0) die "Browse all models opened a Settings window — Paper 05.2.J · S1 forbids it" ;;
+        2) die "could not read the app's window list, so 'no second window' is unverified" ;;
+    esac
+    log "  no Settings window, no second window"
 
-    # 4. Close it, the way the user would, and land back on the wizard with
-    #    the same pick. This is the half the bug actually broke.
-    #
-    press "$OUT/ba-privacy.json" Settings.BackToQuickstart "$OUT/ba-close.json" \
-        || die "could not activate Back to setup"
-
-    # The SwiftUI scene may retain an internal window object after dismissal,
-    # so ask AX whether a user-visible Settings window remains. Do not accept a
-    # failed dump as evidence that closing succeeded.
-    local closed=0
-    probe=2
-    for ((i=0; i<40; i++)); do
-        probe=0; ax_window_present Settings "$OUT/ba-windows-after.json" || probe=$?
-        # ONLY an explicit 1 — a dump we actually read that does not contain
-        # the window. Accepting 2 here would let one failed dump stand in for
-        # the close, which is exactly the mistake this helper exists to make
-        # impossible to write.
-        if [[ "$probe" == 1 ]]; then closed=1; break; fi
-        sleep 0.25
-    done
-    # Not a cosmetic check: with Settings still open, the app-wide AX dump
-    # below carries the wizard AND the Settings tree, so the round-trip
-    # assertion would pass without any round trip having happened.
-    if [[ "$closed" != 1 ]]; then
-        if [[ "$probe" == 2 ]]; then
-            die "could not read the app's window list for 10s — whether Settings closed is unknown, so the round trip below is untrustworthy"
-        fi
-        die "the Settings window did not close — the round trip below would be vacuous"
+    # 4. If this fixture's intentionally tiny fake catalogue contains the
+    #    shortlist pick, the matching row must expose the shared selection.
+    #    Usually it does not: the fake reports only fake-alias rows, while the
+    #    shortlist deliberately exercises the real recommended aliases. The
+    #    unconditional proof that selection survived is therefore after Back,
+    #    where the chosen row is guaranteed to exist.
+    if jq -e --arg id "$chosen" '.data.ui_elements[]? | select(.identifier == $id)' \
+        "$OUT/ba-catalog.json" >/dev/null; then
+        jq -e --arg id "$chosen" '.data.ui_elements[]? | select(.identifier == $id) | select(.selected == true)' \
+            "$OUT/ba-catalog.json" >/dev/null \
+            || die "the matching catalogue row lost the user's selection (#1653)"
     fi
 
+    # 5. Back, by the visible control, returns to the shortlist with the pick
+    #    intact. Escape is a shortcut for this same control, which is why the
+    #    control has to exist and has to work.
+    press "$OUT/ba-catalog.json" Quickstart.Footer.Back "$OUT/ba-back.json" \
+        || die "the catalogue's Back control is not pressable"
     wait_identifier Quickstart.BrowseAll "$OUT/ba-after.json"
-    jq -e '[.data.ui_elements[]? | select(.identifier == "Settings.BackToQuickstart")] | length == 0' \
-        "$OUT/ba-after.json" >/dev/null \
-        || die "Settings remained interactive after returning to setup"
-    pb image --mode screen --screen-index 0 --path "$OUT/ba-after.png" --json \
-        > "$OUT/ba-after-image.json"
+    jq -e '[.data.ui_elements[]?
+            | select((.identifier // "") | startswith("Quickstart.BrowseAll."))]
+           | length == 0' "$OUT/ba-after.json" >/dev/null \
+        || die "Back did not leave the catalogue"
     jq -e --arg id "$chosen" '.data.ui_elements[]? | select(.identifier == $id) | select(.selected == true)' \
         "$OUT/ba-after.json" >/dev/null \
-        || die "the wizard came back without the user's selection — browsing must not discard it (#1653)"
-    log "  back on the wizard, $chosen still selected"
+        || die "the shortlist came back without the user's selection — Back must not discard it"
+    log "  back on the shortlist, $chosen still selected"
     cleanup_persona
 }
 
@@ -1986,6 +3006,7 @@ flow_chat_depth() {
     log "  markdown rendered: table cells and list items are their own elements,"
     log "  no raw fences, pipe rows or list markers, code block nested and intact,"
     log "  and the CJK answer kept its emoji and its right-to-left run"
+
     baseline chat-depth.five-turns "$OUT/turn5-settled.json"
 
     # Restore has to bring back the WHOLE conversation. `chat-restore` only
@@ -2018,6 +3039,25 @@ flow_chat_depth() {
     log "  and every shape still rendered the way it was before the relaunch"
     baseline chat-depth.restored "$OUT/depth-restored-transcript.json"
     cleanup_persona
+}
+
+assert_markdown_code_and_table() {
+    local transcript="$1" scratch="$2"
+    local code_message="$scratch-code.json" table_message="$scratch-table.json"
+    assistant_message_only "$transcript" 2 "$code_message"
+    assert_code_block_is_its_own_view "$code_message" \
+        "Here is the function you asked for" "def fib(n)"
+    assert_tree_text "$code_message" "    return a"
+
+    assistant_message_only "$transcript" 3 "$table_message"
+    assert_rendered_as_separate_nodes "$table_message" "table cells" \
+        "qwen3.5-9b" "5.2 GB" "74 tok/s" "llama-3.1-8b" "4.5 GB" "68 tok/s"
+    jq -e '[.data.ui_elements[]?] as $e
+            | any($e[]; .role == "AXOutline" and .description == "Markdown table")
+              and ([ $e[] | select(.role == "AXRow") ] | length >= 2)
+              and ([ $e[] | select(.role == "AXCell") ] | length >= 6)' \
+        "$table_message" >/dev/null \
+        || die "markdown table lost its navigable row/cell structure"
 }
 
 flow_catalog_integrity() {
@@ -2097,6 +3137,93 @@ flow_catalog_integrity() {
     cleanup_persona
 }
 
+flow_chat_document_attachment() {
+    start_persona chat-document-attachment
+    dismiss_first_run
+    start_model
+
+    local fixture="$ROOT/Tests/GUIGoldenFlows/Fixtures/chat-document.txt"
+    see_main "$OUT/document-compose.json"
+    "$AX_DRIVER" paste-file "$APP_PID" rapid.chat.compose "$fixture" \
+        > "$OUT/document-paste.json"
+
+    wait_identifier ChatView.Attachment.Remove.chat-document.txt \
+        "$OUT/document-attached.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "ChatView.Attachment.Remove.chat-document.txt")' \
+        "$OUT/document-attached.json" >/dev/null \
+        || die "the pasted TXT file did not become a removable attachment chip"
+
+    # Paste the exact same path again through the real clipboard gesture. It
+    # must produce feedback without adding a second chip — otherwise the
+    # shared document budget is split across duplicate copies.
+    "$AX_DRIVER" paste-file "$APP_PID" rapid.chat.compose "$fixture" \
+        > "$OUT/document-duplicate-paste.json"
+    local duplicate_rejected=0
+    for _ in {1..40}; do
+        see_main "$OUT/document-duplicate-rejected.json"
+        if jq -e '([.data.ui_elements[]?
+                    | select(.identifier == "ChatView.Attachment.Remove.chat-document.txt")]
+                   | length) == 1
+                  and ((.data.ui_elements | tostring)
+                       | contains("That file is already attached."))' \
+            "$OUT/document-duplicate-rejected.json" >/dev/null; then
+            duplicate_rejected=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$duplicate_rejected" == 1 ]] \
+        || die "pasting the same document twice did not leave exactly one chip with duplicate feedback"
+
+    send_prompt "Which region is in this document?" document
+    for _ in {1..40}; do
+        if jq -e -s 'any(.[]; .event == "chat_request"
+                       and any(.user_texts[]?;
+                           contains("BEGIN RAPID ATTACHMENT")
+                           and contains("Revenue: 42")
+                           and contains("Region: APAC")))' \
+            "$OUT/fake-events.jsonl" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.25
+    done
+    jq -e -s 'any(.[]; .event == "chat_request"
+                   and any(.user_texts[]?;
+                       contains("BEGIN RAPID ATTACHMENT")
+                       and contains("Revenue: 42")
+                       and contains("Region: APAC")))' \
+        "$OUT/fake-events.jsonl" >/dev/null \
+        || die "the document chip sent no extracted local text to the model"
+
+    relaunch_persona
+    dismiss_first_run
+    wait_identifier Sidebar.NewChat "$OUT/document-restored-root.json"
+    local conversation_id
+    conversation_id="$(jq -r '.data.ui_elements[] | (.identifier // "")
+        | select(test("^Sidebar\\.Conversation\\.[0-9A-Fa-f-]{36}$"))' \
+        "$OUT/document-restored-root.json" | head -1)"
+    [[ -n "$conversation_id" ]] || die "document conversation did not persist"
+    press "$OUT/document-restored-root.json" "$conversation_id" \
+        "$OUT/document-open-restored.json"
+    local restored=0
+    for _ in {1..40}; do
+        see_main "$OUT/document-restored.json"
+        if jq -e '(.data.ui_elements | tostring) | contains("chat-document.txt")' \
+            "$OUT/document-restored.json" >/dev/null; then
+            restored=1
+            break
+        fi
+        sleep 0.25
+    done
+    [[ "$restored" == 1 ]] || die "the restored transcript lost the document chip"
+    assert_tree_text "$OUT/document-restored.json" "chat-document.txt"
+    if jq -e '(.data.ui_elements | tostring) | contains("Revenue: 42")' \
+        "$OUT/document-restored.json" >/dev/null; then
+        die "extracted document contents leaked into the visible transcript"
+    fi
+    cleanup_persona
+}
+
 # Wait until the fake has recorded an event matching a jq predicate.
 #
 # The event log is the independent witness. Every "did it work?" question in
@@ -2160,7 +3287,20 @@ flow_image_generation() {
     # No diffusion weights: the fake answers /v1/images/* with a real 1x1 PNG
     # whose bytes differ per render, after a scripted number of steps so the
     # in-flight card is observable rather than a frame between two polls.
-    start_persona image-generation FAKE_IMAGE_STEPS=8 FAKE_IMAGE_STEP_MS=300
+    # RAPID_GUI_GOLDEN_MODE=1 + RAPID_SIMULATED_IMPORT_PATH together activate
+    # the app's import test seam: when both are set, Images.Edit.Import imports
+    # exactly this file through the same post-pick path a real picker would (see
+    # ImagesView.chooseEditImage) instead of opening a native NSOpenPanel, whose
+    # file browser publishes no AX identifiers and cannot be driven by injected
+    # key events on an unattended CI runner. The golden-mode gate means a real
+    # user's launch — which never sets it — always gets the picker even if an
+    # unrelated process leaked an import path into the environment.
+    # AX baseline normalization itself takes several seconds on a busy mini;
+    # keep the synthetic decode tail long enough to observe after it.
+    start_persona image-generation FAKE_IMAGE_STEPS=8 FAKE_IMAGE_STEP_MS=300 \
+        FAKE_IMAGE_FINISH_MS=15000 \
+        RAPID_GUI_GOLDEN_MODE=1 \
+        RAPID_SIMULATED_IMPORT_PATH="$ROOT/Tests/RapidTests/__Snapshots__/cheetah-logo-96.png"
 
     dismiss_first_run
 
@@ -2192,10 +3332,42 @@ flow_image_generation() {
     done
     [[ "$resolved" == 1 ]] \
         || die "Images.ModelPicker never resolved to $FAKE_IMAGE_ALIAS — the tab has no model to render with"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Images.Aspect")' "$OUT/ig-empty.json" >/dev/null \
-        || die "Images.Aspect is missing — no way to choose an aspect ratio"
+    # The picker and readiness banner are fed by separate async state. A
+    # resolved picker does not guarantee that the banner has consumed the
+    # same catalog refresh yet; snapshotting here used to race and capture
+    # "No model chosen" on busy CI runners. Wait for the cached model's Start
+    # action so the baseline describes one coherent state.
+    wait_identifier Readiness.Action "$OUT/ig-empty.json"
+    jq -e '[.data.ui_elements[]? | select((.identifier // "")
+                                           | startswith("Images.Aspect."))]
+           | length == 3' "$OUT/ig-empty.json" >/dev/null \
+        || die "Images aspect options are not independently addressable"
     jq -e '.data.ui_elements[]? | select(.identifier == "Images.Resolution")' "$OUT/ig-empty.json" >/dev/null \
         || die "Images.Resolution is missing — no way to choose an output resolution"
+    baseline image-generation.empty "$OUT/ig-empty.json"
+
+    local starter_id starter_prompt
+    for starter_id in Images.Starter.0 Images.Starter.1 Images.Starter.2 Images.Starter.3; do
+        see_main "$OUT/ig-starter-before.json"
+        starter_prompt="$(element_field "$OUT/ig-starter-before.json" "$starter_id" description)"
+        [[ -n "$starter_prompt" ]] || die "$starter_id has no readable prompt"
+        press "$OUT/ig-starter-before.json" "$starter_id" \
+            "$OUT/ig-${starter_id##*.}-press.json" \
+            || die "$starter_id is not pressable"
+        see_main "$OUT/ig-starter-filled.json"
+        jq -e --arg prompt "$starter_prompt" \
+            '.data.ui_elements[]?
+             | select(.identifier == "rapid.images.compose" and .value == $prompt)' \
+            "$OUT/ig-starter-filled.json" >/dev/null \
+            || die "$starter_id did not fill the image prompt"
+        "$AX_DRIVER" set-value "$APP_PID" rapid.images.compose "" \
+            > "$OUT/ig-starter-clear.json"
+        wait_identifier "$starter_id" "$OUT/ig-starter-restored.json"
+    done
+    press_and_require_selected Images.Aspect.portrait ig-aspect-portrait
+    press_and_require_selected Images.Aspect.landscape ig-aspect-landscape
+    press_and_require_selected Images.Aspect.square ig-aspect-square
+    log "  all starter prompts and aspect buttons changed the composer state"
 
     # 3. Load the model. rapid-mlx serves one model per process, so opening the
     #    tab cannot silently inherit a ready server: the readiness gate holds
@@ -2244,6 +3416,23 @@ flow_image_generation() {
     done
     [[ "$inflight" == 1 ]] \
         || die "no in-flight progress card: Images.Cancel never appeared during a render"
+    baseline image-generation.inflight "$OUT/ig-inflight.json"
+
+    # Sampling completion is followed by VAE decode / encoding. That tail must
+    # be a named indeterminate phase, not a full 8/8 bar that appears stuck.
+    local finalizing=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/ig-finalizing.json"
+        if jq -e '.data.ui_elements[]?
+                  | select((.value // .label // "") == "Finalizing image…")' \
+               "$OUT/ig-finalizing.json" >/dev/null; then
+            finalizing=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$finalizing" == 1 ]] \
+        || die "the post-denoise tail never showed Finalizing image…"
+    baseline image-generation.finalizing "$OUT/ig-finalizing.json"
 
     wait_fake_event '.event == "image_request"' \
         "no image_request reached the sidecar — the prompt was never sent"
@@ -2327,11 +3516,10 @@ flow_image_generation() {
     # identifier `Images.Aspect` and all three are always present, so
     # "there is a 1:1 button" is true no matter which one is active — an
     # assertion that cannot fail. Only the selected flag distinguishes them.
-    jq -e '[.data.ui_elements[]? | select(.identifier == "Images.Aspect")
-            | select(.selected == true)
-            | (.description // .title // "")] == ["1:1"]' \
+    jq -e '[.data.ui_elements[]? | select(.identifier == "Images.Aspect.square")
+            | select(.selected == true)] | length == 1' \
         "$OUT/ig-result-2.json" >/dev/null \
-        || die "the selected aspect is not the square one the requests were sent with: $(jq -c '[.data.ui_elements[]? | select(.identifier == "Images.Aspect") | {d: (.description // .title), selected}]' "$OUT/ig-result-2.json")"
+        || die "the selected aspect is not the square one the requests were sent with"
 
     # Two thumbnails is not two renders — and the two ways that can go wrong
     # need two different witnesses.
@@ -2447,7 +3635,7 @@ flow_image_generation() {
         if jq -e '.success == true and .data.walk.complete == true
                   and ([.data.ui_elements[]? | .identifier // ""] as $ids
                        | ($ids | index("Images.Edit.Source")) == null
-                         and ($ids | index("Images.Aspect")) != null)' \
+                         and ($ids | index("Images.Aspect.square")) != null)' \
                "$OUT/ig-edit-exited.json" >/dev/null; then
             exited=1; break
         fi
@@ -2457,10 +3645,134 @@ flow_image_generation() {
         || die "exiting edit mode did not restore generation controls"
 
     baseline image-generation.generated "$OUT/ig-edit-exited.json"
+
+    # 7. Import from disk — the SECOND door into /v1/images/edits, and the one
+    #    the journey above never opens.
+    #
+    #    The generated-result edit walks in through Images.Result.Edit. This
+    #    section drives the other entry: Images.Edit.Import -> an edit keyed to
+    #    the imported file's own name. It exists because "import an image then
+    #    edit it" is a distinct user contract: nothing below can pass unless the
+    #    app really turns the picked file into an editable source (edit mode,
+    #    "Replace source image" affordance, the file name on the source bar, and
+    #    the fixture's bytes on the wire).
+    #
+    #    The app's own AX tree cannot reach a native NSOpenPanel — it publishes
+    #    no kAXIdentifierAttribute — and injected key events cannot drive its
+    #    file browser on an unattended CI runner (see the RAPID_SIMULATED_IMPORT
+    #    note in start_persona). So the harness has told the app, via that seam,
+    #    exactly which file Images.Edit.Import should pick. The press below goes
+    #    through the app-level post-pick path for real, and every user-visible
+    #    contract is still asserted here: edit mode, the replace-source
+    #    affordance, the file name, and the fixture's bytes on the wire. The old
+    #    filename is static; assert it landed.
+    local fixture="$ROOT/Tests/RapidTests/__Snapshots__/cheetah-logo-96.png"
+    [[ -f "$fixture" ]] || die "import fixture not found: $fixture"
+    local file_basename
+    file_basename="$(basename "$fixture" .png)"
+    # The seam path never opens a modal, so the press completes normally; keep
+    # the CannotComplete tolerance anyway (like a real pick, the composer can be
+    # momentarily busy) and let the edit-mode wait below be the judge: if the
+    # imported source never appears the import button is genuinely broken.
+    press "$OUT/ig-edit-exited.json" Images.Edit.Import "$OUT/ig-import-press.json" \
+        2>/dev/null || true
+
+    # Entering edit mode from an import must be observably different from the
+    # generated-result entry: the source is keyed to the FILE NAME, the import
+    # affordance flips to "Replace source image", and the edit source bar
+    # appears.
+    local imported=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/ig-import-entered.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Edit.Source")) != null)
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Edit.Import")) != null)
+                  and ([.data.ui_elements[]? | select(.identifier == "Images.Edit.Import")
+                        | (.help // .description // "")] | any(. == "Replace source image"))' \
+               "$OUT/ig-import-entered.json" >/dev/null; then
+            imported=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$imported" == 1 ]] \
+        || die "importing the fixture did not enter edit mode with a replace-source affordance"
+    assert_tree_text "$OUT/ig-import-entered.json" "$file_basename" \
+        || die "the imported source does not carry the file name ($file_basename) on the edit source bar"
+
+    # 8. Edit the imported image — the rest of the contract after a real
+    #    import: type an instruction, generate, and the multipart edit request
+    #    must carry the fixture bytes.
+    local import_prompt="give the logo a blue background"
+    type_prompt "$import_prompt" ig-import-draft
+    press "$OUT/ig-import-draft.json" Images.Generate "$OUT/ig-import-submit.json" \
+        || die "Images.Generate is not pressable after importing an image"
+    wait_fake_event '.event == "image_request" and .operation == "edit" and .has_image == true' \
+        "no multipart edit request carrying an image reached the sidecar after import"
+    wait_fake_event '.event == "image_response" and .cancelled == false and .index == 4' \
+        "the imported edit never completed"
+    local import_done=0
+    for ((i=0; i<200; i++)); do
+        see_main "$OUT/ig-import-result.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Gallery.Thumb.4")) != null)
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Edit.Source")) != null)
+                  and (([.data.ui_elements[]? | .identifier // ""] | index("Images.Cancel")) == null)' \
+               "$OUT/ig-import-result.json" >/dev/null; then
+            import_done=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$import_done" == 1 ]] \
+        || die "the imported edit did not land as a new thumbnail and remain the edit source"
+    jq -s -e --arg alias "$FAKE_IMAGE_ALIAS" --arg prompt "$import_prompt" \
+        '[.[] | select(.event == "image_request" and .operation == "edit" and .prompt == $prompt)
+              | {model, n, operation, has_image}] ==
+         [{model:$alias, n:1, operation:"edit", has_image:true}]' "$OUT/fake-events.jsonl" >/dev/null \
+        || die "the imported edit request did not carry the exact prompt, model, and the fixture image: $(jq -s -c '[.[] | select(.event == "image_request" and .operation == "edit")]' "$OUT/fake-events.jsonl")"
+    # The uploaded image must be the picked fixture. has_image only proves a
+    # multipart part named "image" existed; a regression that submits the
+    # previously generated image — or any other arbitrary PNG — would still
+    # pass it. But the fixture cannot be compared by raw bytes: the app's
+    # EditImageImporter decodes and re-encodes every import, so ancillary
+    # chunks (iCCP, eXIf ...) and the IDAT stream can legitimately differ
+    # across macOS encoder versions. Compare the DECODED RGBA pixel hash
+    # instead, which is the user contract that matters. The fake's
+    # png-rgba-sha subcommand runs the exact same decoder the request fake
+    # uses, so expectation and upload can never drift.
+    local expected_sha
+    expected_sha="$("$ROOT/scripts/fake-rapid-mlx.sh" png-rgba-sha "$fixture")"
+    [[ -n "$expected_sha" ]] \
+        || die "could not compute the fixture's pixel hash: $fixture"
+    jq -s -e --arg sha "$expected_sha" --arg prompt "$import_prompt" \
+        '[.[] | select(.event == "image_request" and .operation == "edit" and .prompt == $prompt)
+              | .image_rgba_sha256] == [$sha]' \
+        "$OUT/fake-events.jsonl" >/dev/null \
+        || die "the uploaded image pixels do not match the fixture ($fixture, rgba sha256 $expected_sha)"
+
+    # Exit restores generation controls — the same exit contract as the
+    # generated-result journey, now after an import.
+    press "$OUT/ig-import-result.json" Images.Edit.Exit "$OUT/ig-import-exit.json" \
+        || die "Images.Edit.Exit is not pressable after an imported edit"
+    local import_exited=0
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/ig-import-exited.json"
+        if jq -e '.success == true and .data.walk.complete == true
+                  and ([.data.ui_elements[]? | .identifier // ""] as $ids
+                       | ($ids | index("Images.Edit.Source")) == null
+                         and ($ids | index("Images.Aspect.square")) != null)' \
+               "$OUT/ig-import-exited.json" >/dev/null; then
+            import_exited=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$import_exited" == 1 ]] \
+        || die "exiting edit mode after an import did not restore generation controls"
+
     log "  image-generation OK"
 }
 flow_resident_load_rejected() {
-    start_persona resident-load-rejected FAKE_REJECT_IMAGE_LOAD=1
+    start_persona resident-load-rejected FAKE_REJECT_IMAGE_LOAD=1 \
+        FAKE_RESIDENT_LOAD_DELAY_MS=1500
 
     dismiss_first_run
 
@@ -2517,7 +3829,7 @@ flow_resident_load_rejected() {
     done
     [[ "$resolved" == 1 ]] \
         || die "Images.ModelPicker never resolved to $FAKE_IMAGE_ALIAS - the Images tab has no model to load"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Images.Aspect")' "$OUT/rlr-ig-empty.json" >/dev/null \
+    jq -e '.data.ui_elements[]? | select(.identifier == "Images.Aspect.square")' "$OUT/rlr-ig-empty.json" >/dev/null \
         || die "Images.Aspect is missing - the picker did not finish resolving"
 
     # 3. The readiness action routes through ensureServing and hits the
@@ -2530,6 +3842,19 @@ flow_resident_load_rejected() {
     # 4. The wire must show the load was ATTEMPTED in-process and REJECTED.
     wait_fake_event '.event == "model_load"' \
         "the Images action never issued an in-process /v1/models/load"
+
+    # The request is deliberately held open: the tap must immediately replace
+    # the CTA with a working state. Before this regression fix HF was already
+    # writing the checkpoint while the UI still said "isn't downloaded yet"
+    # and kept showing a pressable Download & start button.
+    see_main "$OUT/rlr-in-flight.json"
+    jq -e '[.data.ui_elements[]? | .value? | strings] | any(contains("Downloading or loading the image model"))' \
+        "$OUT/rlr-in-flight.json" >/dev/null \
+        || die "resident image download started without visible working feedback"
+    if jq -e '.data.ui_elements[]? | select(.identifier == "Readiness.Action")' \
+        "$OUT/rlr-in-flight.json" >/dev/null; then
+        die "Download & start remained pressable while its resident load was in flight"
+    fi
     wait_fake_event '.event == "model_load_rejected"' \
         "the fake did not reject the in-process image load (FAKE_REJECT_IMAGE_LOAD not applied)"
 
@@ -2566,21 +3891,623 @@ flow_launch_integrations() {
 
     # The engine-owned registry currently resolves to fourteen distinct
     # products after the overlapping Claude Code and Continue entries are
-    # merged. Pin representatives at both ends as well as the exact count so a
-    # new YAML profile cannot silently disappear from the desktop again.
+    # merged. Count the actual per-row action, not a container: putting the id
+    # on the row propagates it to the Copy button in SwiftUI and makes the
+    # button look addressable while preventing it from having its own stable
+    # identity.
     for _ in {1..40}; do
         see_main "$OUT/launch.json"
-        count="$(jq '[.data.ui_elements[]? | (.identifier // "") | select(startswith("Launch.Integration."))] | unique | length' "$OUT/launch.json")"
+        count="$(jq '[.data.ui_elements[]? | (.identifier // "") | select(startswith("Launch.Integration.Copy."))] | unique | length' "$OUT/launch.json")"
         [[ "$count" == 14 ]] && break
         sleep 0.25
     done
     [[ "$count" == 14 ]] || die "Launch rendered $count integrations; engine registry exposes 14 (#1715)"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.cline")' "$OUT/launch.json" >/dev/null \
+    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.Copy.cline")' "$OUT/launch.json" >/dev/null \
         || die "Launch omitted config-writing target Cline"
-    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.smolagents")' "$OUT/launch.json" >/dev/null \
+    jq -e '.data.ui_elements[]? | select(.identifier == "Launch.Integration.Copy.smolagents")' "$OUT/launch.json" >/dev/null \
         || die "Launch omitted adapter profile smolagents"
+    # The two one-session launch commands are the useful fast path, not an
+    # implementation-detail registry order. Keep them first and in the product
+    # order promised by the Launch page.
+    local first_two
+    first_two="$(jq -r '[.data.ui_elements[]?
+                         | select((.identifier // "")
+                                  | startswith("Launch.Integration.Copy."))
+                         | .identifier]
+                        | .[0:2]
+                        | join(",")' "$OUT/launch.json")"
+    [[ "$first_two" == "Launch.Integration.Copy.claude-code,Launch.Integration.Copy.codex" ]] \
+        || die "Launch did not lead with Claude Code then Codex (got: $first_two)"
+    # The card itself is not the action. Every visible row must publish a
+    # distinct Copy button so AX/keyboard users can invoke the same command a
+    # pointer user can, and every one is disabled honestly until a live model
+    # has minted a usable endpoint/key.
+    local copy_count enabled_copy_count
+    copy_count="$(jq '[.data.ui_elements[]?
+                       | (.identifier // "")
+                       | select(startswith("Launch.Integration.Copy."))]
+                      | unique | length' "$OUT/launch.json")"
+    [[ "$copy_count" == 14 ]] \
+        || die "Launch rendered $copy_count addressable Copy buttons for 14 integrations"
+    enabled_copy_count="$(jq '[.data.ui_elements[]?
+                               | select(((.identifier // "") | startswith("Launch.Integration.Copy."))
+                                        and .enabled == true)] | length' "$OUT/launch.json")"
+    [[ "$enabled_copy_count" == 0 ]] \
+        || die "Launch enabled $enabled_copy_count copy commands before a model was ready"
     baseline launch-integrations.complete "$OUT/launch.json"
+
+    press "$OUT/launch.json" Sidebar.NewChat "$OUT/launch-chat.json" \
+        || die "Sidebar.NewChat is not pressable from Launch"
+    start_model
+    see_main "$OUT/launch-model-ready.json"
+    press "$OUT/launch-model-ready.json" Sidebar.Launch "$OUT/launch-ready-open.json"
+    local i ready_copies=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/launch-ready.json"
+        ready_copies="$(jq '[.data.ui_elements[]?
+                              | select(((.identifier // "")
+                                        | startswith("Launch.Integration.Copy."))
+                                       and .enabled == true)]
+                             | length' "$OUT/launch-ready.json")"
+        [[ "$ready_copies" == 14 ]] && break
+        sleep 0.1
+    done
+    [[ "$ready_copies" == 14 ]] \
+        || die "Launch enabled $ready_copies of 14 copy commands after the chat model was ready"
+    local integration_id copied_command
+    while IFS= read -r integration_id; do
+        pbcopy < /dev/null
+        see_main "$OUT/launch-copy-before.json"
+        press "$OUT/launch-copy-before.json" "$integration_id" \
+            "$OUT/launch-copy-${integration_id##*.}.json" \
+            || die "$integration_id is not pressable"
+        copied_command="$(pbpaste)"
+        [[ -n "$copied_command" ]] \
+            || die "$integration_id pressed but copied no command"
+    done < <(jq -r '[.data.ui_elements[]?
+                      | select(((.identifier // "")
+                                | startswith("Launch.Integration.Copy."))
+                               and .enabled == true)
+                      | .identifier] | unique[]' "$OUT/launch-ready.json")
+    log "  all 14 integration buttons copied a non-empty ready command"
     log "  launch-integrations OK"
+    cleanup_persona
+}
+
+flow_audio_readiness() {
+    log "flow: audio-readiness"
+    # Keep `pull` alive long enough to prove Audio owns a real download job.
+    # The audio server reports /healthz before its lazy engine has weights, so
+    # a UI-only Ready assertion would miss the regression this flow guards.
+    start_persona audio-readiness \
+        FAKE_DOWNLOAD_OVERRUN=1 \
+        FAKE_PARTIAL_AUDIO_CACHE=1 \
+        FAKE_AUDIO_PULL_STATE="$OUT_ROOT/audio-readiness/pulled-audio.txt" \
+        RAPID_GUI_GOLDEN_MODE=1 \
+        RAPID_SIMULATED_AUDIO_PATH="$ROOT/../../examples/assistant_bank_en.wav" \
+        RAPID_SIMULATED_SPEECH_SAVE_PATH="$OUT_ROOT/audio-readiness/saved-speech.wav" \
+        RAPID_SIMULATED_TRANSCRIPTION_SAVE_PATH="$OUT_ROOT/audio-readiness/saved-transcription.txt"
+    dismiss_first_run
+    see_main "$OUT/chat.json"
+    press "$OUT/chat.json" Sidebar.Audio "$OUT/dictation.json" \
+        || die "Sidebar.Audio is not pressable"
+
+    # Dictation is the Audio landing surface, but its global hotkey requires
+    # real Microphone + Accessibility grants that an unattended runner must not
+    # invent. Cover the reachable configuration UI and its privacy default,
+    # then switch to the existing Speech workbench for its end-to-end actions.
+    local i dictation_ready=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/dictation.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Dictation.Model")' "$OUT/dictation.json" >/dev/null \
+           && jq -e '.data.ui_elements[]?
+                     | select(.identifier == "Dictation.Enable")' "$OUT/dictation.json" >/dev/null; then
+            dictation_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$dictation_ready" == 1 ]] \
+        || die "Audio did not open on a rendered Dictation pane"
+    wait_identifier Dictation.ArchiveAudio "$OUT/dictation.json"
+    [[ "$(element_field "$OUT/dictation.json" Dictation.ArchiveAudio value)" != "1" ]] \
+        || die "Dictation retained raw microphone recordings without opt-in"
+    # Do not snapshot this pane: Accessibility/Microphone grants and app-name
+    # vocabulary suggestions legitimately differ per host. The semantic checks
+    # above are the stable Golden contract.
+    # Opening a tab is not a request to spend memory. #2053 removed automatic
+    # loading everywhere else; the default Audio pane is the easiest place for
+    # it to creep back in, because dictation *does* load a model — just later,
+    # when the user actually presses the hotkey.
+    if [[ -s "$OUT/fake-events.jsonl" ]] \
+       && jq -e -s 'any(.[]; .event == "server_started")' "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Opening Audio started a model before any user action"
+    fi
+
+    press "$OUT/dictation.json" Audio.Mode.Speech "$OUT/speech-tab-press.json" \
+        || die "Audio Speech segment is not pressable from Dictation"
+
+    local speech_ready=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/speech.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Audio.Speech.ModelPicker")' "$OUT/speech.json" >/dev/null \
+           && jq -e '.data.ui_elements[]?
+                     | select(.identifier == "Readiness.Action"
+                              and (.description // .value // .label // "") == "Download")' \
+                    "$OUT/speech.json" >/dev/null; then
+            speech_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_ready" == 1 ]] \
+        || die "Speech did not expose download-only readiness"
+    baseline audio-readiness.speech "$OUT/speech.json"
+
+    press "$OUT/speech.json" Readiness.Action "$OUT/speech-download-start.json" \
+        || die "Speech Download is not pressable"
+    wait_fake_event \
+        '.event == "command" and .subcommand == "pull" and .alias == "fake-qwen3-tts"' \
+        "Speech Download did not invoke pull for fake-qwen3-tts"
+
+    # Sample several fresh AX trees inside the fake's five-second pull window.
+    # An early healthy audio sidecar must never turn that window into Ready.
+    local speech_downloading=0
+    for ((i=0; i<8; i++)); do
+        see_main "$OUT/speech-downloading.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(((.description // .value // .label // "") | tostring)
+                           | startswith("Downloading fake-qwen3-tts"))' \
+                 "$OUT/speech-downloading.json" >/dev/null; then
+            speech_downloading=1
+        fi
+        if jq -e '(.data.ui_elements | tostring)
+                  | contains("Ready — fake-qwen3-tts")' \
+                 "$OUT/speech-downloading.json" >/dev/null; then
+            die "Speech reported Ready while fake-qwen3-tts was still downloading"
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_downloading" == 1 ]] \
+        || die "Speech never exposed Downloading after Download"
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-qwen3-tts")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Speech started fake-qwen3-tts before its pull completed and cache was verified"
+    fi
+
+    local speech_start_ready=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/speech-downloaded.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Readiness.Action"
+                           and (.description // .value // .label // "") == "Start")' \
+                 "$OUT/speech-downloaded.json" >/dev/null; then
+            speech_start_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_start_ready" == 1 ]] \
+        || die "Speech did not become Start-ready after its download completed"
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-qwen3-tts")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Speech loaded automatically after a download-only action"
+    fi
+    press "$OUT/speech-downloaded.json" Readiness.Action "$OUT/speech-start.json" \
+        || die "Speech Start is not pressable after download"
+    wait_fake_event \
+        '.event == "server_started" and .alias == "fake-qwen3-tts"' \
+        "Speech did not start after the explicit Start action"
+    local speech_loaded=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/speech-loaded.json"
+        if ! jq -e '.data.ui_elements[]?
+                    | select(.identifier == "Readiness.Action")' \
+                   "$OUT/speech-loaded.json" >/dev/null; then
+            speech_loaded=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_loaded" == 1 ]] \
+        || die "Speech stayed behind Start after its model became ready"
+
+    local speech_controls_ready=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/speech-controls-before.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Audio.Speech.LoadVoices"
+                           and .enabled == true)' \
+            "$OUT/speech-controls-before.json" >/dev/null; then
+            speech_controls_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_controls_ready" == 1 ]] \
+        || die "Speech became ready but Load Voices stayed disabled"
+    press "$OUT/speech-controls-before.json" Audio.Speech.LoadVoices \
+        "$OUT/speech-load-voices-press.json" \
+        || die "Load Voices is not pressable"
+    wait_fake_event '.event == "audio_voices"' \
+        "Load Voices never reached the audio server"
+    local voices_loaded=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/speech-voices-loaded.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Audio.Speech.VoicePicker"
+                           and .value == "Golden")' \
+            "$OUT/speech-voices-loaded.json" >/dev/null; then
+            voices_loaded=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$voices_loaded" == 1 ]] \
+        || die "Load Voices produced no selected voice"
+    press "$OUT/speech-voices-loaded.json" Audio.Speech.VoicePicker \
+        "$OUT/speech-voice-picker-press.json" \
+        || die "Voice picker is not pressable"
+    wait_identifier Audio.Speech.VoiceOption.Harbor "$OUT/speech-voice-options.json"
+    press "$OUT/speech-voice-options.json" Audio.Speech.VoiceOption.Harbor \
+        "$OUT/speech-voice-harbor-press.json" \
+        || die "Harbor voice option is not pressable"
+    see_main "$OUT/speech-voice-harbor.json"
+    jq -e '.data.ui_elements[]?
+           | select(.identifier == "Audio.Speech.VoicePicker" and .value == "Harbor")' \
+        "$OUT/speech-voice-harbor.json" >/dev/null \
+        || die "voice picker did not select Harbor"
+
+    local speed_before speed_after
+    speed_before="$(element_field "$OUT/speech-voice-harbor.json" Audio.Speech.Speed value)"
+    "$AX_DRIVER" increment "$APP_PID" Audio.Speech.Speed \
+        > "$OUT/speech-speed-increment.json" \
+        || die "speech speed rejected AXIncrement"
+    see_main "$OUT/speech-speed-after.json"
+    speed_after="$(element_field "$OUT/speech-speed-after.json" Audio.Speech.Speed value)"
+    [[ -n "$speed_after" && "$speed_after" != "$speed_before" ]] \
+        || die "speech speed accepted AXIncrement but did not change"
+    "$AX_DRIVER" set-value "$APP_PID" Audio.Speech.Text "golden speech controls" \
+        > "$OUT/speech-text-type.json"
+    see_main "$OUT/speech-generate-ready.json"
+    press "$OUT/speech-generate-ready.json" Audio.Speech.Generate \
+        "$OUT/speech-generate-press.json" \
+        || die "Generate Speech is not pressable"
+    wait_fake_event '.event == "audio_speech"
+                     and .voice == "Harbor"
+                     and .text == "golden speech controls"' \
+        "Generate Speech did not send the selected voice and text"
+    wait_identifier Audio.Speech.Play "$OUT/speech-result.json"
+    local speech_saved=0
+    for ((i=0; i<40; i++)); do
+        # Re-resolve the dynamic result button for every AXPress. A real
+        # semantic action is required here; CGEvent coordinate clicks are not
+        # trustworthy on unattended runners and can report success while TCC
+        # discards the event.
+        "$AX_DRIVER" press "$APP_PID" Audio.Speech.Save \
+            > "$OUT/speech-save-press.json" 2>/dev/null || true
+        if [[ -s "$OUT_ROOT/audio-readiness/saved-speech.wav" ]]; then
+            speech_saved=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_saved" == 1 ]] \
+        || die "Save speech did not write the generated WAV"
+    see_main "$OUT/speech-before-play.json"
+    local playback_started=0
+    for ((i=0; i<40; i++)); do
+        "$AX_DRIVER" press "$APP_PID" Audio.Speech.Play \
+            > "$OUT/speech-play-press.json" 2>/dev/null || true
+        sleep 0.05
+        see_main "$OUT/speech-playing.json"
+        if [[ "$(element_field "$OUT/speech-playing.json" Audio.Speech.Play description)" == "Stop playback" ]]; then
+            playback_started=1; break
+        fi
+        sleep 0.1
+    done
+    [[ "$playback_started" == 1 ]] \
+        || die "Play speech did not enter playback state"
+    "$AX_DRIVER" decrement "$APP_PID" Audio.Speech.Speed \
+        > "$OUT/speech-speed-decrement.json" \
+        || die "speech speed rejected AXDecrement"
+    see_main "$OUT/speech-speed-restored.json"
+    [[ "$(element_field "$OUT/speech-speed-restored.json" Audio.Speech.Speed value)" == "$speed_before" ]] \
+        || die "speech speed did not restore its original value"
+    log "  voices, voice selection, speed, and Generate Speech produced effects"
+
+    # Residency is polled independently from Audio readiness. The sidecar can
+    # be ready several frames before the sidebar's first residency snapshot;
+    # switching tabs immediately made the transcription baseline alternate
+    # between "no resident" and the correctly resident TTS model depending on
+    # poll timing. Wait for the user-visible state that must follow readiness
+    # before recording the next settled screen.
+    local speech_resident=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/speech-resident.json"
+        if jq -e '.data.ui_elements as $elements
+                  | any(range(1; $elements | length);
+                        $elements[.].identifier == "Sidebar.Residency"
+                        and $elements[.].value == "fake-qwen3-tts"
+                        and $elements[. - 1].identifier == "Sidebar.Residency"
+                        and $elements[. - 1].description == "Lock")' \
+                 "$OUT/speech-resident.json" >/dev/null; then
+            speech_resident=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$speech_resident" == 1 ]] \
+        || die "ready fake-qwen3-tts never appeared as the locked resident model"
+
+    # A media resident is process-wide state, not the Chat model selection.
+    # Launch commands must neither advertise the TTS alias to coding agents
+    # nor remain copyable while their selected chat model is not serving.
+    press "$OUT/speech-resident.json" Sidebar.Launch "$OUT/launch-from-audio.json" \
+        || die "Sidebar.Launch is not pressable from an Audio residency"
+    local launch_copy_count=0
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/launch-from-audio.json"
+        launch_copy_count="$(jq '[.data.ui_elements[]?
+                                  | (.identifier // "")
+                                  | select(startswith("Launch.Integration.Copy."))]
+                                 | unique | length' "$OUT/launch-from-audio.json")"
+        [[ "$launch_copy_count" == 14 ]] && break
+        sleep 0.25
+    done
+    [[ "$launch_copy_count" == 14 ]] \
+        || die "Launch did not finish loading integrations from Audio"
+    if jq -e '[.data.ui_elements[]?
+               | select(((.identifier // "") | startswith("Launch.Integration.Copy."))
+                        and .enabled == true)] | length > 0' \
+            "$OUT/launch-from-audio.json" >/dev/null; then
+        die "Launch enabled agent commands while an Audio model was serving"
+    fi
+    if jq -e '[.data.ui_elements[]? | .value? | strings]
+              | any(contains("fake-qwen3-tts")
+                    and (contains("--model")
+                         or contains(" -m ")
+                         or contains("ANTHROPIC_MODEL")
+                         or contains("HERMES_INFERENCE_MODEL")))' \
+            "$OUT/launch-from-audio.json" >/dev/null; then
+        die "Launch leaked the resident Audio alias into an agent command"
+    fi
+    press "$OUT/launch-from-audio.json" Sidebar.Audio "$OUT/audio-after-launch.json" \
+        || die "Sidebar.Audio is not pressable after checking Launch"
+    wait_identifier Audio.Mode.Dictation "$OUT/audio-after-launch.json" \
+        || die "Audio did not settle after returning from Launch"
+
+    # Back to the default mode. Speech to Text deliberately owns no readiness
+    # banner: dictation loads its model as part of the act of dictating, which
+    # is exactly the on-demand path #2053 asks for, so there is no Download /
+    # Start step for it to expose. What must hold is that the pane is fully
+    # addressable after a round trip through another mode and another tab —
+    # model, hotkey and the enable switch all present — and that merely opening
+    # it never loads anything.
+    press "$OUT/audio-after-launch.json" Audio.Mode.Dictation "$OUT/dictation-return-press.json" \
+        || die "Audio Dictation segment is not pressable"
+    local dictation_controls=0
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/dictation-return.json"
+        if jq -e '[.data.ui_elements[]?
+                   | .identifier // ""
+                   | select(. == "Dictation.Model"
+                            or . == "Dictation.Hotkey"
+                            or . == "Dictation.Enable")]
+                  | unique | length == 3' "$OUT/dictation-return.json" >/dev/null; then
+            dictation_controls=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$dictation_controls" == 1 ]] \
+        || die "Dictation did not expose its model, hotkey and enable controls"
+    if jq -e '.data.ui_elements[]? | select(.identifier == "Readiness.Action")' \
+            "$OUT/dictation-return.json" >/dev/null; then
+        die "Dictation exposed a Download/Start banner it does not own"
+    fi
+    # No structural baseline for this pane: the Microphone and Accessibility
+    # rows render a grant button only while the permission is missing, so its
+    # tree legitimately differs between a fresh runner and a developer machine.
+    # A snapshot would encode the runner's TCC state as the contract.
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-whisper-small")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Opening Dictation loaded its model before the user dictated"
+    fi
+
+    # Dictation is additive: the existing file-transcription workbench must
+    # remain reachable and preserve the same explicit Download → Start lifecycle.
+    press "$OUT/dictation-return.json" Audio.Mode.Transcription "$OUT/transcription.json" \
+        || die "Audio Transcription segment is not pressable"
+    local transcription_ready=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/transcription.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Audio.Transcription.ModelPicker")' \
+                 "$OUT/transcription.json" >/dev/null \
+           && jq -e '.data.ui_elements[]?
+                     | select(.identifier == "Readiness.Action"
+                              and (.description // .value // .label // "") == "Download")' \
+                    "$OUT/transcription.json" >/dev/null; then
+            transcription_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$transcription_ready" == 1 ]] \
+        || die "Transcription did not expose download-only readiness"
+    jq -e '.data.ui_elements[]?
+           | select(.role == "AXStaticText"
+                    and ((.value // "") | contains("AIFF")))' \
+        "$OUT/transcription.json" >/dev/null \
+        || die "Transcription picker copy does not advertise its supported AIFF input"
+    baseline audio-readiness.transcription "$OUT/transcription.json"
+
+    press "$OUT/transcription.json" Readiness.Action "$OUT/transcription-download.json" \
+        || die "Transcription Download is not pressable"
+    wait_fake_event \
+        '.event == "command" and .subcommand == "pull" and .alias == "fake-whisper-small"' \
+        "Transcription Download did not invoke pull"
+    local transcription_start_ready=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/transcription-downloaded.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "Readiness.Action"
+                           and (.description // .value // .label // "") == "Start")' \
+                 "$OUT/transcription-downloaded.json" >/dev/null; then
+            transcription_start_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$transcription_start_ready" == 1 ]] \
+        || die "Transcription did not become Start-ready after download"
+    if jq -e -s 'any(.[]; .event == "server_started" and .alias == "fake-whisper-small")' \
+        "$OUT/fake-events.jsonl" >/dev/null; then
+        die "Transcription loaded automatically after Download"
+    fi
+    press "$OUT/transcription-downloaded.json" Readiness.Action \
+        "$OUT/transcription-start.json" \
+        || die "Transcription Start is not pressable"
+    wait_fake_event \
+        '.event == "server_started" and .alias == "fake-whisper-small"' \
+        "Transcription did not start explicitly"
+
+    # The fake emits server_started as soon as the process accepts the alias,
+    # but the app deliberately keeps sending disabled until its health poll
+    # observes that alias as ready. On a hosted runner, pressing Choose File
+    # in that interval selects the fixture correctly while Transcribe remains
+    # disabled, making the later assertion blame the picker for a readiness
+    # race. Wait on the user-visible readiness SSOT before exercising it.
+    local transcription_serving_ready=0
+    for ((i=0; i<120; i++)); do
+        see_main "$OUT/transcription-serving.json"
+        if jq -e '.data.ui_elements[]?
+                  | select(.role == "AXGroup"
+                           and ((.description // "")
+                                == "Ready — fake-whisper-small"))' \
+                 "$OUT/transcription-serving.json" >/dev/null; then
+            transcription_serving_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$transcription_serving_ready" == 1 ]] \
+        || die "Transcription server started but never became UI-ready"
+
+    local file_selected=0
+    for ((i=0; i<20; i++)); do
+        see_main "$OUT/transcription-controls.json"
+        "$AX_DRIVER" press "$APP_PID" Audio.Transcription.FilePicker \
+            > "$OUT/transcription-file-press.json" 2>/dev/null || true
+        sleep 0.25
+        see_main "$OUT/transcription-file-selected.json"
+        if jq -e 'any(.data.ui_elements[]?;
+                      .identifier == "Audio.Transcription.Run" and .enabled == true)' \
+                "$OUT/transcription-file-selected.json" >/dev/null; then
+            file_selected=1; break
+        fi
+    done
+    [[ "$file_selected" == 1 ]] \
+        || die "Choose File never enabled Transcribe"
+    press "$OUT/transcription-file-selected.json" Audio.Transcription.Run \
+        "$OUT/transcription-run.json" \
+        || die "Transcribe is not pressable after selecting a file"
+    wait_fake_event '.event == "audio_transcription"' \
+        "Transcribe did not send the selected audio file"
+    wait_identifier Audio.Transcription.Result "$OUT/transcription-result.json"
+    assert_tree_text "$OUT/transcription-result.json" "Golden transcription result."
+    press "$OUT/transcription-result.json" Audio.Transcription.Copy \
+        "$OUT/transcription-copy.json" \
+        || die "Copy transcription is not pressable"
+    [[ "$(pbpaste)" == "Golden transcription result." ]] \
+        || die "Copy transcription did not update the pasteboard"
+    press "$OUT/transcription-result.json" Audio.Transcription.Save \
+        "$OUT/transcription-save.json" \
+        || die "Save transcription is not pressable"
+    [[ "$(cat "$OUT/saved-transcription.txt")" == "Golden transcription result." ]] \
+        || die "Save transcription did not write the visible result"
+
+    jq -n '{success: true,
+            assertion: "Dictation is privacy-safe and inert on open; Speech and file Transcription remain functional with explicit Download and Start"}' \
+        > "$OUT/audio-readiness-actions.json"
+    log "  audio-readiness OK"
+    cleanup_persona
+}
+
+# Dictation is its own product journey, not merely the landing state of Audio.
+# Keep this separate from audio-readiness so a regression in its controls is
+# named directly in CI. Microphone and Accessibility grants are intentionally
+# not faked: their TCC state belongs to the host. The stable contract is that
+# every setup control is reachable, raw recordings remain opt-in, local
+# vocabulary edits work, mode round-trips preserve the pane, and opening it
+# alone never downloads or starts a model.
+flow_dictation() {
+    log "flow: dictation"
+    start_persona dictation \
+        RAPID_GUI_GOLDEN_MODE=1
+    dismiss_first_run
+    see_main "$OUT/chat.json"
+    press "$OUT/chat.json" Sidebar.Audio "$OUT/dictation-open.json" \
+        || die "Sidebar.Audio is not pressable"
+
+    local i controls_ready=0
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/dictation.json"
+        if jq -e '[.data.ui_elements[]?
+                   | .identifier // ""
+                   | select(. == "Dictation.Model"
+                            or . == "Dictation.Hotkey"
+                            or . == "Dictation.Enable"
+                            or . == "Dictation.NewTerm"
+                            or . == "Dictation.AddTerm"
+                            or . == "Dictation.ArchiveAudio")]
+                  | unique | length == 6' "$OUT/dictation.json" >/dev/null; then
+            controls_ready=1; break
+        fi
+        sleep 0.25
+    done
+    [[ "$controls_ready" == 1 ]] \
+        || die "Dictation did not expose its complete setup surface"
+    [[ "$(element_field "$OUT/dictation.json" Dictation.Model value)" == "fake-whisper-small" ]] \
+        || die "Dictation did not select the available transcription model"
+    [[ "$(element_field "$OUT/dictation.json" Dictation.Hotkey value)" == "Right ⌘" ]] \
+        || die "Dictation did not expose the safe right-hand default hotkey"
+    [[ "$(element_field "$OUT/dictation.json" Dictation.ArchiveAudio value)" != "1" ]] \
+        || die "Dictation retained raw microphone recordings without opt-in"
+
+    press "$OUT/dictation.json" Dictation.ArchiveAudio "$OUT/archive-on-press.json" \
+        || die "Keep recordings is not pressable"
+    see_main "$OUT/archive-on.json"
+    [[ "$(element_field "$OUT/archive-on.json" Dictation.ArchiveAudio value)" == "1" ]] \
+        || die "Keep recordings accepted a press but did not turn on"
+    press "$OUT/archive-on.json" Dictation.ArchiveAudio "$OUT/archive-off-press.json" \
+        || die "Keep recordings is not pressable after enabling"
+    see_main "$OUT/archive-off.json"
+    [[ "$(element_field "$OUT/archive-off.json" Dictation.ArchiveAudio value)" != "1" ]] \
+        || die "Keep recordings did not return to its privacy-safe default"
+
+    "$AX_DRIVER" set-value "$APP_PID" Dictation.NewTerm "GoldenTerm2049" \
+        > "$OUT/vocabulary-type.json" \
+        || die "Dictation vocabulary field rejected input"
+    see_main "$OUT/vocabulary-ready.json"
+    press "$OUT/vocabulary-ready.json" Dictation.AddTerm "$OUT/vocabulary-add.json" \
+        || die "Dictation Add term is not pressable after input"
+    wait_identifier Dictation.RemoveTerm.GoldenTerm2049 "$OUT/vocabulary-added.json" \
+        || die "Dictation Add term produced no removable vocabulary chip"
+    press "$OUT/vocabulary-added.json" Dictation.RemoveTerm.GoldenTerm2049 \
+        "$OUT/vocabulary-remove.json" \
+        || die "Dictation vocabulary remove is not pressable"
+    see_main "$OUT/vocabulary-removed.json"
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "Dictation.RemoveTerm.GoldenTerm2049")' \
+             "$OUT/vocabulary-removed.json" >/dev/null; then
+        die "Dictation vocabulary term remained after Remove"
+    fi
+
+    press "$OUT/vocabulary-removed.json" Audio.Mode.Speech "$OUT/speech.json" \
+        || die "Speech mode is not pressable from Dictation"
+    wait_identifier Audio.Speech.ModelPicker "$OUT/speech-ready.json"
+    press "$OUT/speech-ready.json" Audio.Mode.Dictation "$OUT/dictation-return.json" \
+        || die "Dictation mode is not pressable after visiting Speech"
+    wait_identifier Dictation.Enable "$OUT/dictation-restored.json"
+    if jq -e -s 'any(.[]; .event == "server_started")' "$OUT/fake-events.jsonl" \
+        >/dev/null 2>&1; then
+        die "Opening and configuring Dictation started a model before dictation"
+    fi
+
+    log "  setup controls, privacy toggle, vocabulary, and mode round-trip produced effects"
+    log "  dictation OK"
     cleanup_persona
 }
 
@@ -2594,9 +4521,12 @@ require_tools
 case "$FLOW" in
     fresh-install) flow_fresh_install ;;
     cached-quickstart) flow_cached_quickstart ;;
+    cached-curated-tradeup) flow_cached_curated_tradeup ;;
     download-progress) flow_download_progress ;;
     settings-persistence) flow_settings_persistence ;;
+    settings-mtp) flow_settings_mtp ;;
     chat-restore) flow_chat_restore ;;
+    message-actions) flow_message_actions ;;
     restored-tools) flow_restored_tools ;;
     tool-loop-budget) flow_tool_loop_budget ;;
     chat-depth) flow_chat_depth ;;
@@ -2605,19 +4535,26 @@ case "$FLOW" in
     model-crash-recovery) flow_model_crash_recovery ;;
     low-memory-choice) flow_low_memory_choice ;;
     update-state) flow_update_state ;;
+    update-busy) flow_update_busy ;;
     window-close-prompt) flow_window_close_prompt ;;
     no-dead-controls) flow_no_dead_controls ;;
     catalog-integrity) flow_catalog_integrity ;;
     browse-all-destination) flow_browse_all_destination ;;
+    chat-document-attachment) flow_chat_document_attachment ;;
     image-generation) flow_image_generation ;;
+    dictation) flow_dictation ;;
+    audio-readiness) flow_audio_readiness ;;
     resident-load-rejected) flow_resident_load_rejected ;;
     launch-integrations) flow_launch_integrations ;;
     all)
         flow_fresh_install
         flow_cached_quickstart
+        flow_cached_curated_tradeup
         flow_download_progress
         flow_settings_persistence
+        flow_settings_mtp
         flow_chat_restore
+        flow_message_actions
         flow_restored_tools
         flow_tool_loop_budget
         flow_chat_depth
@@ -2626,11 +4563,15 @@ case "$FLOW" in
         flow_model_crash_recovery
         flow_low_memory_choice
         flow_update_state
+        flow_update_busy
         flow_window_close_prompt
         flow_no_dead_controls
         flow_catalog_integrity
         flow_browse_all_destination
+        flow_chat_document_attachment
         flow_image_generation
+        flow_dictation
+        flow_audio_readiness
         flow_resident_load_rejected
         flow_launch_integrations
         ;;

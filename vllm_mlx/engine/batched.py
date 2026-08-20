@@ -699,65 +699,6 @@ except ImportError:
     GuidedGenerator = None
 
 
-def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
-    """
-    Extract images and videos from OpenAI-format messages.
-
-    Returns:
-        Tuple of (has_media, images_list, videos_list)
-    """
-    images = []
-    videos = []
-
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-
-        for item in content:
-            # Handle Pydantic models
-            if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
-            elif hasattr(item, "dict"):
-                item = {k: v for k, v in item.dict().items() if v is not None}
-
-            if not isinstance(item, dict):
-                continue
-
-            item_type = item.get("type", "")
-
-            if item_type == "image_url":
-                img_url = item.get("image_url", {})
-                if isinstance(img_url, str):
-                    images.append(img_url)
-                elif isinstance(img_url, dict):
-                    url = img_url.get("url", "")
-                    if url:
-                        images.append(url)
-
-            elif item_type == "image":
-                img = item.get("image") or item.get("url", "")
-                if img:
-                    images.append(img)
-
-            elif item_type == "video_url":
-                vid_url = item.get("video_url", {})
-                if isinstance(vid_url, str):
-                    videos.append(vid_url)
-                elif isinstance(vid_url, dict):
-                    url = vid_url.get("url", "")
-                    if url:
-                        videos.append(url)
-
-            elif item_type == "video":
-                vid = item.get("video") or item.get("url", "")
-                if vid:
-                    videos.append(vid)
-
-    has_media = bool(images or videos)
-    return has_media, images, videos
-
-
 class MLLMModelWrapper:
     """
     Wrapper for MLLM models to make them compatible with BatchGenerator.
@@ -901,6 +842,9 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._model_load_executor = None  # mlx-step worker (#170)
         self._mllm_instance = None  # MLXMultimodalLM instance
+        # The MLLM lane has no text EngineCore/model_config to query. Set this
+        # from the loaded language backbone's concrete cache probe instead.
+        self._mllm_is_hybrid: bool | None = None
         self._loaded = False
         self._engine_started = False  # Track if engine loop is running
         self._start_time: float | None = None
@@ -1183,6 +1127,18 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        vision_min_pixels = getattr(self._scheduler_config, "vision_min_pixels", 0)
+        vision_max_pixels = getattr(self._scheduler_config, "vision_max_pixels", 0)
+        if vision_min_pixels or vision_max_pixels:
+            from ..mllm_batch_generator import _supports_dynamic_vision_bounds
+
+            if not _supports_dynamic_vision_bounds(self._processor):
+                raise RuntimeError(
+                    "--vision-min-pixels/--vision-max-pixels require a "
+                    "dynamic-resolution image processor (for example, "
+                    "Qwen2.5-VL or Qwen3-VL)"
+                )
+
         # Probe the language-backbone cache before the port reports ready.
         # ArraysCache has the merge/filter/extract primitives needed for a
         # correctness-first serialized lane (#1796), but concurrent hybrid
@@ -1193,6 +1149,7 @@ class BatchedEngine(BaseEngine):
             _probe_mllm_cache_type, language_model
         ).result()
         arrays_cache_compat = cache_type == "ArraysCache"
+        self._mllm_is_hybrid = arrays_cache_compat
         if cache_type is not None and not arrays_cache_compat:
             raise RuntimeError(
                 f"Model '{self._model_name}' uses a hybrid/linear-attention "
@@ -1258,7 +1215,6 @@ class BatchedEngine(BaseEngine):
         max_concurrent_requests = getattr(
             self._scheduler_config, "max_concurrent_requests", 256
         )
-
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -1268,6 +1224,8 @@ class BatchedEngine(BaseEngine):
             vision_cache_size=100,
             max_concurrent_requests=max_concurrent_requests,
             allow_arrays_cache=arrays_cache_compat,
+            vision_min_pixels=vision_min_pixels,
+            vision_max_pixels=vision_max_pixels,
         )
 
         # Create and start MLLM scheduler — pass the model-owning executor so
@@ -1283,7 +1241,9 @@ class BatchedEngine(BaseEngine):
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
-            f"completion_batch={completion_batch_size}"
+            f"completion_batch={completion_batch_size}, vision_min_pixels="
+            f"{vision_min_pixels or 'model-default'}, vision_max_pixels="
+            f"{vision_max_pixels or 'model-default'}"
         )
 
     async def _start_llm(self) -> None:
@@ -1294,7 +1254,9 @@ class BatchedEngine(BaseEngine):
         from ..scheduler import SchedulerConfig
         from ..utils.tokenizer import load_model_with_fallback
 
-        # Build tokenizer config
+        # The shared loader applies RAPID_MLX_TRUST_REMOTE_CODE=0 across every
+        # text-model entry point. Keep the engine's explicit request here so
+        # the default serve behavior remains unchanged.
         tokenizer_config = {"trust_remote_code": self._trust_remote_code}
 
         # Qwen3 fix
@@ -2325,6 +2287,8 @@ class BatchedEngine(BaseEngine):
         Returns False on any access error so a malformed engine state
         never *enables* the new path — fails closed.
         """
+        if self._is_mllm and self._mllm_is_hybrid is not None:
+            return self._mllm_is_hybrid
         try:
             return bool(self._engine.engine.model_config.is_hybrid)
         except (AttributeError, TypeError):
@@ -2610,26 +2574,101 @@ class BatchedEngine(BaseEngine):
         openai-harmony's ``StreamableParser`` (issue #513). Falls back to
         the legacy custom state machine for non-harmony models and for
         harmony tokenizers whose IDs don't match the official encoding.
+
+        Detection (``from_tokenizer_for_streaming`` →
+        ``tokenizer.get_vocab()``) rebuilds the tokenizer's full vocab dict
+        — ~60-85ms for a 262k-token Gemma vocab — and was previously paid on
+        EVERY streaming request. The tokenizer and the harmony escape-hatch
+        flags are fixed for the engine's lifetime, so the *detection result*
+        (format + marker ``TokenMap``) is invariant; only the returned
+        router's state machine is per-request. Memoize the detected
+        ``(kind, TokenMap)`` once and rebuild a fresh, cheap router per
+        request. This removes the entire ~84ms MLLM first-token overhead (the
+        whole rapid-vs-mlx-vlm vision TTFT gap) and shaves the same
+        per-request cost off every gemma-4 / gpt-oss streaming completion. The
+        per-request router object is constructed exactly as before — this only
+        skips re-scanning the vocab.
         """
+        # Read the tokenizer first — the property can raise mid-lifecycle
+        # ("not loaded" during a startup/teardown race). Treat that as the
+        # legacy no-router path for THIS request without caching anything, so a
+        # later (loaded) request still detects normally.
         try:
             tokenizer = self.tokenizer
-            if tokenizer is None:
-                return None
-            router = OutputRouter.from_tokenizer_for_streaming(
-                tokenizer,
-                force_harmony_streaming=self._force_openai_harmony_streaming,
-                no_harmony_streaming=self._no_openai_harmony_streaming,
-            )
-            if router is None:
-                return None
-            if router.map.format_tag not in _OUTPUT_ROUTER_ALLOWLIST:
-                return None
-            return router
-        # Unsupported tokenizers are expected to fall through to the legacy
-        # parser path; construction failures indicate the same non-router path.
         except Exception as e:
-            logger.debug("OutputRouter unavailable for this request: %s", e)
+            logger.debug("OutputRouter unavailable (tokenizer error): %s", e)
             return None
+
+        # Cache keyed on the tokenizer *object identity* so a model/tokenizer
+        # hot-swap (a different ``self.tokenizer``) transparently re-detects
+        # instead of serving a stale format map.
+        cached = getattr(self, "_output_router_template", None)
+        if cached is not None and cached[0] is tokenizer:
+            template = cached[1]
+        else:
+            try:
+                template = self._detect_output_router_template(tokenizer)
+            except Exception as e:
+                # A TRANSIENT detection failure (e.g. ``get_vocab()`` raising
+                # during lazy init) must NOT be cached: caching the negative
+                # result would permanently disable the router for this
+                # tokenizer, silently leaking channel tokens into every later
+                # response. Fall back to no-router for this request only and
+                # retry detection next time — matching the pre-cache behavior
+                # where every request re-ran detection. A *legitimate* "no
+                # supported format" result returns ``None`` (not a raise) and
+                # IS cached below.
+                logger.debug("OutputRouter detection failed (will retry): %s", e)
+                return None
+            self._output_router_template = (tokenizer, template)
+
+        if template is None:
+            return None
+        kind, token_map = template
+        try:
+            if kind == "harmony":
+                from ..output_router_harmony import HarmonyStreamingRouter
+
+                return HarmonyStreamingRouter(token_map, tokenizer)
+            return OutputRouter(token_map, tokenizer)
+        except Exception as e:
+            logger.debug("OutputRouter rebuild failed for this request: %s", e)
+            return None
+
+    def _detect_output_router_template(
+        self,
+        tokenizer: Any,
+    ) -> tuple[str, Any] | None:
+        """One-time router-format detection (see ``_create_output_router``).
+
+        Runs the full ``from_tokenizer_for_streaming`` scan once and captures
+        the router *kind* (``"harmony"`` vs the legacy ``"legacy"`` state
+        machine) plus its marker ``TokenMap``, so subsequent requests rebuild
+        a router without re-reading the vocabulary. Returns ``None`` for a
+        *legitimate* negative — no tokenizer, no supported format, or a format
+        outside the allowlist — which the caller caches. Deliberately does NOT
+        swallow exceptions: a transient failure (e.g. ``get_vocab()`` during
+        lazy init) must propagate so the caller can retry instead of caching a
+        permanently-broken no-router result.
+        """
+        if tokenizer is None:
+            return None
+        router = OutputRouter.from_tokenizer_for_streaming(
+            tokenizer,
+            force_harmony_streaming=self._force_openai_harmony_streaming,
+            no_harmony_streaming=self._no_openai_harmony_streaming,
+        )
+        if router is None:
+            return None
+        if router.map.format_tag not in _OUTPUT_ROUTER_ALLOWLIST:
+            return None
+        # ``from_tokenizer_for_streaming`` returns either the legacy
+        # ``OutputRouter`` state machine or a ``HarmonyStreamingRouter``;
+        # remember which so the per-request rebuild picks the same class.
+        from ..output_router_harmony import HarmonyStreamingRouter
+
+        kind = "harmony" if isinstance(router, HarmonyStreamingRouter) else "legacy"
+        return (kind, router.map)
 
     def _make_routed_output(
         self,
@@ -3023,6 +3062,12 @@ class BatchedEngine(BaseEngine):
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    def clear_prefix_cache(self, *, reset_stats: bool = True) -> bool:
+        """Clear reusable text prefix KV state while keeping weights loaded."""
+        if self._engine:
+            return self._engine.clear_prefix_cache(reset_stats=reset_stats)
+        return False
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort an active or queued batched request by request ID.

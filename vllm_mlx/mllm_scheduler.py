@@ -77,6 +77,10 @@ class MLLMSchedulerConfig:
     # carrying the text-LLM default (2048) gets bumped to 8192, while
     # any explicit operator-set value is honored as-is (#682, codex r2).
     prefill_step_size: int = 8192
+    # Optional image-resolution bounds forwarded to dynamic-resolution
+    # processors (Qwen2.5/3-VL). Zero leaves model defaults unchanged.
+    vision_min_pixels: int = 0
+    vision_max_pixels: int = 0
     # Enable vision embedding cache
     enable_vision_cache: bool = True
     # Maximum cache entries
@@ -96,6 +100,14 @@ class MLLMSchedulerConfig:
     allow_arrays_cache: bool = False
 
     def __post_init__(self) -> None:
+        if self.vision_min_pixels < 0 or self.vision_max_pixels < 0:
+            raise ValueError("vision pixel bounds must be non-negative")
+        if (
+            self.vision_min_pixels
+            and self.vision_max_pixels
+            and self.vision_min_pixels > self.vision_max_pixels
+        ):
+            raise ValueError("vision_min_pixels must not exceed vision_max_pixels")
         if self.allow_arrays_cache and (
             self.max_num_seqs != 1
             or self.prefill_batch_size != 1
@@ -332,6 +344,19 @@ class MLLMScheduler:
         self._processing_task: asyncio.Task | None = None
         self._step_executor = None  # ThreadPoolExecutor, created in _process_loop
 
+        # Event-driven wake for the idle scheduler loop. When there are no
+        # requests to process, ``_process_loop`` waits on this Event instead of
+        # polling with a fixed 10ms sleep, so a freshly-arrived request is
+        # picked up in microseconds rather than after up to a full poll tick.
+        # ``add_request`` sets it right after appending to ``self.waiting``;
+        # both run on the server event-loop thread, so the set/wait pair is
+        # single-loop and race-free. A bounded ``wait_for`` timeout in the loop
+        # is retained purely as a belt-and-suspenders liveness floor — a missed
+        # wake can never wedge the loop for longer than one tick. Created here
+        # (not bound to a loop until first awaited, per asyncio semantics) so it
+        # exists before ``start()``.
+        self._new_request_event = asyncio.Event()
+
         # Memory management: periodic mx.clear_cache() to free Metal buffer pool
         self._step_count = 0
         self._clear_cache_interval = 32
@@ -452,6 +477,8 @@ class MLLMScheduler:
                 completion_batch_size=self.config.completion_batch_size,
                 allow_arrays_cache=self.config.allow_arrays_cache,
                 prefill_step_size=self.config.prefill_step_size,
+                vision_min_pixels=self.config.vision_min_pixels,
+                vision_max_pixels=self.config.vision_max_pixels,
             )
 
     # ========== Sync API (step-based) ==========
@@ -560,6 +587,15 @@ class MLLMScheduler:
             self._disconnect_abort_ids.discard(request_id)
             self.requests[request_id] = request
         self.waiting.append(request)
+        # Wake the idle scheduler loop immediately (see ``_new_request_event``)
+        # instead of letting it sleep out its poll tick. Safe from here: both
+        # this append and the loop's wait run on the event-loop thread.
+        # ``getattr`` keeps ``add_request`` callable on the minimally
+        # constructed schedulers unit tests build via ``__new__`` (which set
+        # only ``config`` and skip ``__init__``); the live loop always has it.
+        new_request_event = getattr(self, "_new_request_event", None)
+        if new_request_event is not None:
+            new_request_event.set()
 
         logger.debug(
             f"Added MLLM request {request_id}: "
@@ -1161,6 +1197,11 @@ class MLLMScheduler:
                 # Arbitrary RuntimeError/ValueError text may include caller
                 # data or local paths that happen to match the old markers.
                 is_client_error = isinstance(e, ClientRequestError)
+                public_error = (
+                    err_msg
+                    if is_client_error
+                    else "MLLM inference failed due to an internal engine error"
+                )
                 # Create error outputs (queue delivery deferred to caller).
                 for request_id in error_ids:
                     output.outputs.append(
@@ -1168,8 +1209,11 @@ class MLLMScheduler:
                             request_id=request_id,
                             output_text="",
                             finished=True,
-                            error=err_msg if is_client_error else None,
+                            error=public_error,
                             error_kind=("invalid_request" if is_client_error else None),
+                            # Preserve the established terminal reason for
+                            # internal aborts; the non-None error is what
+                            # prevents routes from serializing fake success.
                             finish_reason="error" if is_client_error else "length",
                         )
                     )
@@ -1564,8 +1608,20 @@ class MLLMScheduler:
                         # Yield to other tasks
                         await asyncio.sleep(0)
                     else:
-                        # No work, wait a bit
-                        await asyncio.sleep(0.01)
+                        # Idle: block until ``add_request`` signals new work
+                        # rather than polling on a fixed sleep. This removes
+                        # the up-to-10ms first-token latency a cold request
+                        # used to pay while the loop slept out its poll tick.
+                        # The ``wait_for`` timeout is a liveness floor only — a
+                        # missed wake can never wedge the loop beyond it — and
+                        # ``clear()`` re-arms the Event for the next idle spell.
+                        try:
+                            await asyncio.wait_for(
+                                self._new_request_event.wait(), timeout=0.05
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                        self._new_request_event.clear()
 
                 except asyncio.CancelledError:
                     break

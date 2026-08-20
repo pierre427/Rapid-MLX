@@ -4,6 +4,28 @@ import Testing
 
 @Suite("Download/catalog hardening")
 struct DownloadCatalogHardeningTests {
+    @Test("Speculative presets are parsed from the alias profile table")
+    func speculativePresetParsing() {
+        let output = """
+          Alias                  Size       Tools            Reasoning    Spec-Decode Suffix Tier DFlash DDTree Preset
+          qwen3.8-27b-4bit       15.2 GiB   hermes           qwen3        ✓ MTP       n/a         —       —       MTP@rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX@3
+          llama3-3b-4bit         1.8 GiB    llama3_json      —            ✓           unknown     —       —       Suffix
+          qwen3.6-27b-4bit       15.1 GiB   hermes           qwen3        ✗ hybrid    n/a         —       —       —
+        """
+        let capabilities = ModelCatalog.parseSpeculativeCapabilities(output)
+        #expect(capabilities["qwen3.8-27b-4bit"]?.method == .mtp)
+        #expect(capabilities["qwen3.8-27b-4bit"]?.model == "rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX")
+        #expect(capabilities["qwen3.8-27b-4bit"]?.tokens == 3)
+        #expect(capabilities["llama3-3b-4bit"]?.method == .suffix)
+        #expect(capabilities["qwen3.6-27b-4bit"] == nil)
+
+        let legacyOutput = """
+          Alias                  Tools            Reasoning
+          model-ending-suffix    hermes           Suffix
+        """
+        #expect(ModelCatalog.parseSpeculativeCapabilities(legacyOutput).isEmpty)
+    }
+
     @MainActor
     @Test("DownloadManager rejects option-shaped aliases before spawning rapid-mlx")
     func downloadManagerRejectsOptionAlias() {
@@ -217,6 +239,48 @@ struct DownloadCatalogHardeningTests {
 
         #expect(available.map { $0.0 } == ["lfm2.5-1b-4bit"])
         #expect(!available.contains(where: { $0.0 == "Size" }))
+    }
+
+    @Test("empty-cache notice never parses as a phantom \"No\" model (#1918)")
+    func emptyCacheNoticeIsNotAModel() {
+        // `rapid-mlx ls` prints this in place of a "Cached models" table when
+        // the disk is cold. Its single-space prose used to tokenize (parseCached
+        // splits on any whitespace) into a selectable phantom — alias "No",
+        // repo "models", size "cached yet." — that dead-ended model start.
+        let notice = """
+
+              No models cached yet. Run 'rapid-mlx pull <alias>' or 'rapid-mlx chat <alias>' to download one.
+
+            """
+        #expect(ModelCatalog.parseCached(notice).isEmpty)
+        #expect(ModelCatalog.parseAvailable(notice).isEmpty)
+    }
+
+    @Test("a genuine alias literally named \"No\" is not blacklisted (#1918)")
+    func genuineNoAliasIsNotBlacklisted() {
+        // The fix matches the full "No models cached yet" notice, never the
+        // bare word "No", so a real model whose alias happens to be "No"
+        // (row = "No" + 2+ spaces + repo) must still reach the catalog.
+        let cached = ModelCatalog.parseCached(
+            """
+              Cached models (1 on disk)
+              ────────────────────────────────────────
+              Alias                 HuggingFace repo                         Size
+              No                    mlx-community/No-Model-4bit               2 GB
+            """
+        )
+        #expect(cached.map { $0.0 } == ["No"])
+        #expect(cached.first?.1 == "mlx-community/No-Model-4bit")
+
+        let available = ModelCatalog.parseAvailable(
+            """
+              Available models (1 aliases)
+              ────────────────────────────────────────
+              Alias                 Family
+              No                    experimental
+            """
+        )
+        #expect(available.map { $0.0 } == ["No"])
     }
 
     @Test("ModelInfoCatalog sanitizes repo ids before UI link construction")

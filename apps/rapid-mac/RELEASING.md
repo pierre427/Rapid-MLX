@@ -13,14 +13,34 @@ they are tied to your Apple Developer account.
 > `rapid-mlx` engine is the repository ROOT. The sidecar bundled into the app
 > is pip-installed from that engine at the repo root (no git submodule). App
 > release tags are prefixed **`rapid-mac-v`** so they never collide with the
-> engine's own `v*` tags. The CI workflow is at the repo root
-> `.github/workflows/rapid-mac-release.yml` — the copy under
-> `apps/rapid-mac/.github/` is inert (GitHub only runs workflows from the repo
-> root).
+> engine's own `v*` tags. The CI workflow lives at the repo root
+> `.github/workflows/rapid-mac-release.yml` (GitHub only runs workflows from
+> the repo root).
 
 ---
 
 ## Two lanes
+
+Two lanes, split by **who the build is for**. The frequent case (dogfood)
+runs on your Mac for $0; the rare, user-facing case (public) runs on GitHub CI,
+which owns signing secrets and the distribution layer (auto-update feeds).
+
+```
+Rapid-MLX Desktop release — who is this build for?
+│
+├─ "just me / a tester"  →  DOGFOOD · local  (most builds, $0 CI)
+│      scripts/release-local.sh
+│      → a signed, testable .app/DMG on your Mac; no tag, no GitHub Release
+│
+└─ "all users"           →  PUBLIC · GitHub CI  (a few / month)
+       push a rapid-mac-v* tag
+       → rapid-mac-release.yml: build → sign → notarise → GitHub Release,
+         plus the Sparkle appcast / latest.json auto-update feeds
+```
+
+A bare `v*` tag is the **engine's** release scheme, not the app's; the desktop
+lane is gated on the `rapid-mac-v*` prefix so the two never collide in this
+monorepo.
 
 | | Dogfood (local) | Public (CI) |
 |---|---|---|
@@ -84,7 +104,7 @@ Add these under **Settings → Secrets and variables → Actions**. The workflow
 `.github/workflows/rapid-mac-release.yml` references every one of them by name
 only.
 
-### Required secrets (6)
+### Required Apple secrets (6)
 
 | Secret name | Value (from Part A) |
 |---|---|
@@ -95,6 +115,24 @@ only.
 | `AC_API_ISSUER_ID` | App Store Connect issuer id (A2) |
 | `AC_API_KEY_P8_BASE64` | base64 of `AuthKey_<KEYID>.p8` (A2) |
 
+### Required Sparkle signing key
+
+Generate this once on a trusted Mac after `swift package resolve`:
+
+```bash
+cd apps/rapid-mac
+.build/artifacts/sparkle/Sparkle/bin/generate_keys --account rapid-mlx
+.build/artifacts/sparkle/Sparkle/bin/generate_keys --account rapid-mlx \
+  -x ~/Desktop/rapid-mlx-sparkle-private-key
+```
+
+The first command prints the public key. Add it as the Actions **variable**
+`SPARKLE_PUBLIC_ED_KEY`. Add the exact contents of the exported file as the
+Actions **secret** `SPARKLE_ED_PRIVATE_KEY`, then move the exported file into
+the team's protected credential store and remove the Desktop copy. Losing this
+private key breaks the automatic-update chain for every installed version;
+rotating it requires a signed transition release.
+
 ### Required for tagged releases — updater fallback publishing
 
 | Name | Kind | Value |
@@ -104,11 +142,14 @@ only.
 | `CLOUDFLARE_ZONE_ID` | secret | zone id owning `dl.rapidmlx.com`, used for single-file cache purge |
 | `RAPID_MAC_DIST_R2_BUCKET` | **variable** | `rapid-desktop-dist` |
 | `RAPID_MAC_DIST_CDN_BASE` | **variable** | `https://dl.rapidmlx.com` |
+| `SPARKLE_ED_PRIVATE_KEY` | secret | exported Sparkle Ed25519 private key |
+| `SPARKLE_PUBLIC_ED_KEY` | **variable** | matching `SUPublicEDKey` value |
 
 The release jobs fail a tagged release if these are absent. They upload the
-content-addressed DMG first, then queue every tag's monotonic `latest.json`
-publication, so the static updater fallback cannot advertise a missing artifact
-or roll back when releases overlap. The two bucket/CDN names are
+content-addressed DMG and Sparkle ZIP first, then queue every tag's monotonic
+`latest.json` + `appcast.xml` publication, so neither updater can advertise a
+missing artifact or roll back when releases overlap. The bucket/CDN and public
+key values are
 **config, not credentials**, so they go in *Variables*, not *Secrets*.
 
 ### Dropped
@@ -174,19 +215,23 @@ No tag, no GitHub Release, no CI. Costs $0.
 ### D2. Public CI release (tag-triggered)
 
 ```bash
-# 1. Bump apps/rapid-mac/Resources/Info.plist CFBundleShortVersionString
-#    and add a "## [X.Y.Z]" section to apps/rapid-mac/CHANGELOG.md, on main.
+# 1. Bump apps/rapid-mac/Resources/Info.plist:
+#      CFBundleShortVersionString = X.Y.Z
+#      CFBundleVersion = a strictly increasing positive integer
+#    Then add a "## [X.Y.Z]" section to apps/rapid-mac/CHANGELOG.md, on main.
 # 2. Cut it (guarded — preflights CHANGELOG/plist/tag, then pushes the tag):
 cd apps/rapid-mac
 scripts/release-local.sh --publish rapid-mac-v0.11.0
 ```
 
 `--publish` does **not** build locally. It preflights (stable
-`rapid-mac-vX.Y.Z` tag, CHANGELOG entry present, tag == plist version, local
+`rapid-mac-vX.Y.Z` tag, CHANGELOG entry present, tag == plist version, monotonic
+`CFBundleVersion`, local
 `main` == the release remote's `main`, tag is new and strictly newer than the latest
 rapid-mac release, and the root workflow triggers on the tag) then pushes the
 tag. `.github/workflows/rapid-mac-release.yml` then builds → signs →
-notarises → size-gates → attaches `rapid-mlx-desktop.dmg` to the GitHub
+notarises → generates an EdDSA-signed Sparkle ZIP/appcast → size-gates →
+publishes both updater feeds → attaches `rapid-mlx-desktop.dmg` to the GitHub
 Release. The script auto-detects the remote whose URL is
 `raullenchai/Rapid-MLX`; set `RAPID_RELEASE_REMOTE=<name>` to select it
 explicitly. (You can equally `git push <release-remote> rapid-mac-v0.11.0` by hand;
@@ -211,9 +256,10 @@ gh run watch $(gh run list --workflow=rapid-mac-release.yml --limit=1 --json dat
 | Build / sign / notarise / staple / DMG | | ✅ scripts + CI |
 | Attach DMG to the GitHub Release | | ✅ CI |
 
-The app is distributed **only** as a direct `.dmg` download from GitHub
-Releases — there is no Homebrew cask. The `rapid-mlx` name is reserved for the
-engine (`pip install rapid-mlx` and `brew install rapid-mlx`, the latter
+First installation is distributed as a direct `.dmg` download from GitHub
+Releases; subsequent signed releases are also published as Sparkle ZIPs for
+automatic update. There is no Homebrew cask. The `rapid-mlx` name is reserved
+for the engine (`pip install rapid-mlx` and `brew install rapid-mlx`, the latter
 already in homebrew-core); the desktop app never claims it.
 
 ## Open TODO(owner) items

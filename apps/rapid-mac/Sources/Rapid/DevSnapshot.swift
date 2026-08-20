@@ -70,7 +70,7 @@ enum DevSnapshot {
             catalog: snapshotMCPCatalog,
             approval: snapshotMCPApproval
         )
-        let snapshotInstaller = Installer()
+        let snapshotSparkleUpdater = SparkleUpdateController(infoDictionary: [:])
         let snapshotWebSearch = WebSearchConfig()
         let snapshotPerfDefaults = UserDefaults(suiteName: "rapid.dev-snapshot.perf")!
         snapshotPerfDefaults.removePersistentDomain(forName: "rapid.dev-snapshot.perf")
@@ -90,6 +90,11 @@ enum DevSnapshot {
                     .environment(appearance)
                     .environment(settingsRouter)
                     .environment(installTracker)
+                    // ``FailedReplaceBanner`` (rendered by ContentView when a
+                    // Finder Replace silently failed) hands off to Sparkle, so
+                    // the controller has to be in this chain too — SwiftUI
+                    // traps on a missing observable the first time it renders.
+                    .environment(snapshotSparkleUpdater)
                     .environment(quickstart)
                     .environment(dockPromptStore)
                     .environment(browseApproval)
@@ -99,6 +104,28 @@ enum DevSnapshot {
                     .environment(snapshotMCPApproval)
                     .frame(width: width, height: height)
             )
+        }
+
+        // LIVE mode must run before the static matrix. The matrix below
+        // renders ~200 full-size views and temporarily raises process memory;
+        // running live last can trip ServerManager's real pre-load safety
+        // gate even for a 0.6B model, leaving state=.idle and silently skipping
+        // the only end-to-end sidecar check. Use a separate non-persisting
+        // chat model so the real turn cannot leak into the static fixtures.
+        if let liveAlias = ProcessInfo.processInfo.environment["RAPID_DEV_SERVE_ALIAS"],
+           !liveAlias.isEmpty {
+            let liveChat = ChatViewModel(
+                sampling: sampling,
+                customInstructions: chat.customInstructions,
+                server: server,
+                persistsConversations: false
+            )
+            await runLiveChat(
+                alias: liveAlias, server: server, chat: liveChat,
+                downloads: downloads, quickstart: quickstart, dir: dir
+            )
+            await server.stop()
+            server.dismissTerminalState()
         }
 
         // The Images tab, rendered standalone — ``ContentView`` owns its
@@ -193,7 +220,11 @@ enum DevSnapshot {
         // Scenario 1: the app as launched (idle / first-run, depending on
         // whether HF_HUB_CACHE points at a populated cache).
         render(contentView(width: 900, height: 640), to: "\(dir)/content-idle.png")
-        render(contentView(width: 640, height: 560), to: "\(dir)/content-min.png")
+        render(contentView(width: 720, height: 560), to: "\(dir)/content-min.png")
+        // Narrow window: the status footer sheds its readouts through
+        // ViewThatFits rather than squeezing them to ellipses, and the version
+        // pill must stay on one line. Only a width this small exercises it.
+        render(contentView(width: 380, height: 560), to: "\(dir)/content-narrow.png")
         // Images tab (empty state — no results, catalog not yet resolved).
         render(imagesView(width: 700, height: 640), to: "\(dir)/images-empty.png")
         // Narrow composer: the canvas controls wrap to the two-row
@@ -234,26 +265,42 @@ enum DevSnapshot {
         // matrix the Phase-1 review runs on. Chat and Launch are the two
         // surfaces this phase repaints, so both are captured at the
         // 900x640 review size in both appearances, plus one shot each at
-        // the 640x560 window floor to prove the layout survives it.
+        // the 720x560 window floor to prove the layout survives it.
         let reviewSize = CGSize(width: 900, height: 640)
-        let floorSize = CGSize(width: 640, height: 560)
+        let floorSize = CGSize(width: 720, height: 560)
 
         renderHosted(contentView(width: 900, height: 640), size: reviewSize,
                      appearance: .aqua, to: "\(dir)/chat-900x640-light.png")
         renderHosted(contentView(width: 900, height: 640), size: reviewSize,
                      appearance: .darkAqua, to: "\(dir)/chat-900x640-dark.png")
-        renderHosted(contentView(width: 640, height: 560), size: floorSize,
-                     appearance: .aqua, to: "\(dir)/chat-640x560-light.png")
-        renderHosted(contentView(width: 640, height: 560), size: floorSize,
-                     appearance: .darkAqua, to: "\(dir)/chat-640x560-dark.png")
+        renderHosted(contentView(width: 720, height: 560), size: floorSize,
+                     appearance: .aqua, to: "\(dir)/chat-720x560-light.png")
+        renderHosted(contentView(width: 720, height: 560), size: floorSize,
+                     appearance: .darkAqua, to: "\(dir)/chat-720x560-dark.png")
         renderHosted(launchView(width: 900, height: 640), size: reviewSize,
                      appearance: .aqua, to: "\(dir)/launch-900x640-light.png")
         renderHosted(launchView(width: 900, height: 640), size: reviewSize,
                      appearance: .darkAqua, to: "\(dir)/launch-900x640-dark.png")
-        renderHosted(launchView(width: 640, height: 560), size: floorSize,
-                     appearance: .aqua, to: "\(dir)/launch-640x560-light.png")
-        renderHosted(launchView(width: 640, height: 560), size: floorSize,
-                     appearance: .darkAqua, to: "\(dir)/launch-640x560-dark.png")
+        renderHosted(launchView(width: 720, height: 560), size: floorSize,
+                     appearance: .aqua, to: "\(dir)/launch-720x560-light.png")
+        renderHosted(launchView(width: 720, height: 560), size: floorSize,
+                     appearance: .darkAqua, to: "\(dir)/launch-720x560-dark.png")
+
+        // Scenario 1c (Paper 05.2): the Step 2 model-selection review matrix.
+        //
+        // Every micro-stage and every state its footer can be in, at the three
+        // documented widths, in both appearances. Rendered from the REAL
+        // ``QuickstartView`` against a synthetic catalogue rather than a live
+        // engine, so the states that need a failed or still-loading catalogue
+        // are reachable at all — and so nothing here touches a server, a
+        // download, or the user's model cache.
+        captureStep2Matrix(
+            quickstart: quickstart,
+            downloads: downloads,
+            server: server,
+            settingsRouter: settingsRouter,
+            dir: dir
+        )
 
         // The readiness matrix: every ``ModelReadiness`` case rendered as
         // the user sees it, with the three copy channels that must agree
@@ -337,6 +384,172 @@ enum DevSnapshot {
                      appearance: .aqua, to: "\(dir)/sidebar-light.png")
         renderHosted(sidebarOnly(), size: sidebarSize,
                      appearance: .darkAqua, to: "\(dir)/sidebar-dark.png")
+
+        // MARK: UI-2 Slice 1 — the core-workspace review matrix
+        //
+        // The captures above review Chat and Launch at 900x640 and at the
+        // 720x560 window floor, which were the sizes the v1.0 pass was
+        // signed off at. Slice 1 is reviewed at three DIFFERENT widths —
+        // 1440, 1000 and 720 — because that is where the lifecycle band
+        // changes shape, and a 900pt capture would silently review only
+        // its middle step.
+        //
+        // Chat and Images are captured at every width in both
+        // appearances. The band is captured separately at all three
+        // widths: a live ``ContentView`` can only show whichever state
+        // the harness is actually in, and staging a real multi-gigabyte
+        // download is not something a capture run can do.
+        let ui2Widths: [CGFloat] = [1440, 1000, 720]
+        let ui2Appearances: [(NSAppearance.Name, String)] = [(.aqua, "light"), (.darkAqua, "dark")]
+
+        for windowWidth in ui2Widths {
+            // 900 tall at every width: the point of the sweep is the
+            // horizontal behaviour, and holding height fixed makes the
+            // three images directly comparable.
+            let size = CGSize(width: windowWidth, height: 900)
+            for (appearance, mode) in ui2Appearances {
+                renderHosted(
+                    contentView(width: windowWidth, height: 900), size: size,
+                    appearance: appearance,
+                    to: "\(dir)/ui2-chat-\(Int(windowWidth))-\(mode).png"
+                )
+                renderHosted(
+                    imagesView(width: windowWidth, height: 900), size: size,
+                    appearance: appearance,
+                    to: "\(dir)/ui2-images-result-\(Int(windowWidth))-\(mode).png"
+                )
+            }
+        }
+
+        // Images again with the stage cleared, because the capture above
+        // inherits the edit-mode seeding from Scenario 1 and therefore
+        // only ever shows a RESULT. The empty stage is the surface this
+        // slice actually changed — it is where the mascot was replaced by
+        // the aspect preview — so it needs its own sweep.
+        //
+        // Safe to mutate here: every other Images capture has already
+        // been taken by this point in the run.
+        imageGen.cancelEdit()
+        imageGen.prompt = ""
+        // ``activeImage`` is derived from ``results``, so clearing the
+        // list is what empties the stage.
+        imageGen.results = []
+        for windowWidth in ui2Widths {
+            let size = CGSize(width: windowWidth, height: 900)
+            for (appearance, mode) in ui2Appearances {
+                renderHosted(
+                    imagesView(width: windowWidth, height: 900), size: size,
+                    appearance: appearance,
+                    to: "\(dir)/ui2-images-empty-\(Int(windowWidth))-\(mode).png"
+                )
+            }
+        }
+        // The aspect preview tracks the live selection, so sweep the
+        // three aspects too — a square-only capture would not show that
+        // the frame actually changes shape.
+        for aspect in ImageGenViewModel.Aspect.allCases {
+            imageGen.aspect = aspect
+            renderHosted(
+                imagesView(width: 1000, height: 900),
+                size: CGSize(width: 1000, height: 900),
+                appearance: .aqua,
+                to: "\(dir)/ui2-images-aspect-\(aspect.rawValue).png"
+            )
+        }
+        imageGen.aspect = .square
+
+        // The band, driven directly by the two states that open it, at
+        // each of its three heights. Rendered over a stub transcript so
+        // the graphite-against-canvas separation is reviewable rather
+        // than the band floating on nothing.
+        func bandProof(_ readiness: ModelReadiness, width: CGFloat) -> AnyView {
+            AnyView(
+                VStack(spacing: 0) {
+                    LifecycleBand(readiness: readiness, width: width)
+                    Spacer(minLength: 0)
+                }
+                .frame(width: width, height: LifecycleBand.height(for: width) + 80)
+                .background(RapidTheme.surfaceCanvas)
+                .tint(RapidTheme.brandAmber)
+            )
+        }
+        let bandStates: [(String, ModelReadiness)] = [
+            ("downloading", .downloading(
+                alias: "qwen3.5-9b-4bit",
+                detail: "1.2 GB of 5.0 GB · 8.4 MB/s · 7 min left",
+                fraction: 0.24
+            )),
+            // No fraction: the indeterminate case, which must render an
+            // honest bare track rather than a bar pinned at zero.
+            ("starting", .starting(
+                alias: "bonsai-1.7b-2bit",
+                detail: "Loading the model into memory…"
+            )),
+        ]
+        let ui2DetailWidths: [(window: CGFloat, detail: CGFloat)] = [
+            (1440, RapidTheme.Layout.Breakpoint.wide),
+            (1000, RapidTheme.Layout.Breakpoint.mid),
+            (720, RapidTheme.Layout.Breakpoint.floor),
+        ]
+        for (label, state) in bandStates {
+            for widths in ui2DetailWidths {
+                let size = CGSize(
+                    width: widths.detail,
+                    height: LifecycleBand.height(for: widths.detail) + 80
+                )
+                for (appearance, mode) in ui2Appearances {
+                    renderHosted(
+                        bandProof(state, width: widths.detail), size: size,
+                        appearance: appearance,
+                        to: "\(dir)/ui2-band-\(label)-\(Int(widths.window))-\(mode).png"
+                    )
+                }
+            }
+        }
+
+        // NOTE ON REDUCE MOTION. There is deliberately no capture for it
+        // here, and the reason is a real constraint rather than an
+        // oversight: `\.accessibilityReduceMotion` is a READ-ONLY
+        // environment key on macOS — it mirrors the system setting, and
+        // SwiftUI offers no writable keypath — so a harness cannot stage
+        // the reduced rendering the way it stages an appearance or a
+        // width. Injecting it would need a seam through every call site,
+        // which is a refactor this visual slice has no business making.
+        //
+        // The contract is held instead by ``RapidMotion.shouldPulse`` and
+        // by the source guard asserting both perpetual loops in the
+        // Images HUD route through it. Whether the reduced frame LOOKS
+        // right stays a manual check against the system setting.
+
+        // The rail with a MID-LIST row selected, which the capture above
+        // cannot show: it selects ``.launch``, the last row, so it proves
+        // the bar renders but not that the bar leaves its neighbours
+        // alone. Selecting Images puts a marked row between two unmarked
+        // ones, which is where a leading bar that took layout width —
+        // rather than overlaying it — would visibly step the labels in
+        // and out.
+        //
+        // ``.chat`` is deliberately NOT used here: it marks no nav row at
+        // all (it highlights a conversation row, and this fixture seeds
+        // no history), so it would capture an empty rail and look like
+        // the selection had regressed.
+        func sidebarSelectionProof() -> AnyView {
+            AnyView(
+                SidebarView(
+                    selection: .constant(.images),
+                    chat: chat,
+                    onNewChat: {},
+                    onSelectConversation: { _ in }
+                )
+                .frame(width: SidebarView.columnIdealWidth, height: 640)
+                .background(RapidTheme.surfaceSidebar)
+                .tint(RapidTheme.brandAmber)
+            )
+        }
+        renderHosted(sidebarSelectionProof(), size: sidebarSize,
+                     appearance: .aqua, to: "\(dir)/ui2-sidebar-selected-light.png")
+        renderHosted(sidebarSelectionProof(), size: sidebarSize,
+                     appearance: .darkAqua, to: "\(dir)/ui2-sidebar-selected-dark.png")
 
         // Settings → Model Management. The panel seeds its catalog
         // synchronously from ``ModelCatalogCache``'s mirror, so warm the
@@ -423,9 +636,13 @@ enum DevSnapshot {
                     .environment(appearance)
                     .environment(settingsRouter)
                     .environment(server)
+                    // The capture loop walks Category.allCases, which in a
+                    // debug build includes Developer — and that panel reads
+                    // the coordinator.
+                    .environment(quickstart)
                     .environment(downloads)
                     .environment(updater)
-                    .environment(snapshotInstaller)
+                    .environment(snapshotSparkleUpdater)
                     .environment(dockPromptStore)
                     .environment(snapshotWebSearch)
                     .environment(browseApproval)
@@ -650,19 +867,6 @@ enum DevSnapshot {
 
         log("wrote PNGs to \(dir)")
 
-        // LIVE mode: when RAPID_DEV_SERVE_ALIAS is set, actually start the
-        // sidecar (resolved by ServerLocator — the bundled engine unless
-        // RAPID_BIN overrides it), send one chat turn, and snapshot the
-        // REAL streamed output — the runtime path static renders can't
-        // reach. Then the normal terminate exercises clean teardown.
-        if let liveAlias = ProcessInfo.processInfo.environment["RAPID_DEV_SERVE_ALIAS"],
-           !liveAlias.isEmpty {
-            await runLiveChat(
-                alias: liveAlias, server: server, chat: chat,
-                downloads: downloads, quickstart: quickstart, dir: dir
-            )
-        }
-
         // One-shot: quit so the dogfood harness gets a clean exit.
         NSApp.terminate(nil)
     }
@@ -773,6 +977,274 @@ enum DevSnapshot {
     /// means the split view has never actually been under visual
     /// regression review.
     ///
+    // MARK: - Step 2 model selection (Paper 05.2)
+
+    /// A synthetic chat catalogue big enough to scroll, with a realistic mix of
+    /// cached and uncached rows.
+    ///
+    /// Synthetic on purpose. The states this matrix exists to prove — catalogue
+    /// error, still-loading, no results, empty cache — are precisely the ones a
+    /// healthy live engine will not produce on demand, and the alternative
+    /// (breaking a real engine to photograph the wreckage) touches things this
+    /// harness must not touch.
+    @MainActor
+    private static func step2Catalog() -> [ModelEntry] {
+        let cached: [(String, String)] = [
+            ("gemma3-1b-qat-4bit", "1.1 GiB"),
+            ("qwen3.5-4b-4bit", "2.4 GiB"),
+        ]
+        let uncached = [
+            "lfm2.5-1b-4bit", "lfm2.5-2.6b-4bit", "qwen3-0.6b-4bit",
+            "qwen3.5-9b-4bit", "qwen3.5-14b-4bit", "qwen3.5-32b-4bit",
+            "llama3.3-8b-4bit", "llama3.3-70b-4bit", "mistral-7b-4bit",
+            "mixtral-8x7b-4bit", "phi4-14b-4bit", "gemma3-4b-4bit",
+            "gemma3-12b-4bit", "gemma3-27b-4bit", "deepseek-r1-7b-4bit",
+            "ling-3.0-tiny-fp8", "smollm3-3b-4bit", "olmo2-13b-4bit",
+        ]
+        return cached.map {
+            ModelEntry(alias: $0.0, hfRepo: "mlx-community/\($0.0)",
+                       sizeOnDisk: $0.1, cached: true, kind: .chat)
+        } + uncached.map {
+            ModelEntry(alias: $0, hfRepo: "mlx-community/\($0)",
+                       sizeOnDisk: nil, cached: false, kind: .chat)
+        }
+        // An image row, to prove approved default D4 filters it out of a
+        // catalogue whose job is the first CHAT model.
+        + [ModelEntry(alias: "flux2-klein-4b", hfRepo: "mlx-community/flux2",
+                      sizeOnDisk: "4.3 GiB", cached: true, kind: .image)]
+    }
+
+    /// Render every Step 2 state at every documented width, in both
+    /// appearances.
+    @MainActor
+    private static func captureStep2Matrix(
+        quickstart: QuickstartCoordinator,
+        downloads: DownloadManager,
+        server: ServerManager,
+        settingsRouter: SettingsRouter,
+        dir: String
+    ) {
+        let catalog = step2Catalog()
+
+        func step2(
+            width: CGFloat,
+            height: CGFloat,
+            catalog: [ModelEntry],
+            loaded: Bool
+        ) -> AnyView {
+            AnyView(
+                QuickstartView(
+                    coordinator: quickstart,
+                    downloads: downloads,
+                    server: server,
+                    cachedModels: catalog,
+                    catalogLoaded: loaded,
+                    onSkip: {},
+                    onSeedWelcome: { true },
+                    onCompleted: {},
+                    // A fixed probe so the Review screen's free-space row is
+                    // deterministic across runs rather than reporting whatever
+                    // this machine happens to have free.
+                    freeBytesProbe: { 96_000_000_000 }
+                )
+                .environment(settingsRouter)
+                .frame(width: width, height: height)
+            )
+        }
+
+        /// The three documented review widths.
+        let sizes: [(label: String, size: CGSize)] = [
+            ("1440x900", CGSize(width: 1440, height: 900)),
+            ("1000x700", CGSize(width: 1000, height: 700)),
+            ("720x560", CGSize(width: 720, height: 560)),
+        ]
+        let appearances: [(String, NSAppearance.Name)] = [
+            ("light", .aqua), ("dark", .darkAqua),
+        ]
+
+        /// Drive the coordinator into one state, then photograph it everywhere.
+        func capture(_ name: String, catalog: [ModelEntry], loaded: Bool,
+                     _ arrange: () -> Void) {
+            for (sizeLabel, size) in sizes {
+                arrange()
+                for (schemeLabel, appearance) in appearances {
+                    renderHosted(
+                        step2(width: size.width, height: size.height,
+                              catalog: catalog, loaded: loaded),
+                        size: size,
+                        appearance: appearance,
+                        to: "\(dir)/step2-\(name)-\(sizeLabel)-\(schemeLabel).png"
+                    )
+                }
+            }
+        }
+
+        let starter = QuickstartCoordinator.defaultChoice
+        let cachedChoice = QuickstartView.choice(
+            forCatalogEntry: catalog.first { $0.alias == "gemma3-1b-qat-4bit" }!
+        )
+        let uncachedChoice = QuickstartView.choice(
+            forCatalogEntry: catalog.first { $0.alias == "qwen3.5-9b-4bit" }!
+        )
+
+        // 2b — recommendation loading. The catalogue has not landed, so the
+        // shortlist cannot say what is cached and the footer is disabled.
+        capture("finding-fit", catalog: [], loaded: false) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.resolveRecommendationLoading(catalogLoaded: false)
+        }
+
+        // 2c — the recommended shortlist, with two models already on this Mac.
+        capture("shortlist", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.resolveRecommendationLoading(catalogLoaded: true)
+            quickstart.select(starter)
+        }
+
+        // 2c — a cached model selected: the primary reads Start existing model.
+        capture("shortlist-cached-selection", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.resolveRecommendationLoading(catalogLoaded: true)
+            quickstart.select(cachedChoice)
+        }
+
+        // 2d-i — the catalogue, still loading.
+        capture("browse-loading", catalog: [], loaded: false) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+        }
+
+        // 2d — the catalogue, populated, with an uncached pick selected.
+        capture("browse-uncached-selection", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.select(uncachedChoice)
+        }
+
+        // 2d — the catalogue with a cached pick selected.
+        capture("browse-cached-selection", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.select(cachedChoice)
+        }
+
+        // 2d — the pick is searched away. The alias is retained; the primary is
+        // disabled and still shows the neutral verb. This is the "no valid
+        // visible selection" state and the disabled-CTA state at once.
+        capture("browse-no-selection-visible", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.select(uncachedChoice)
+            quickstart.catalogQuery = "gemma"
+        }
+
+        // 2d — a search that matches nothing.
+        capture("browse-no-results", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.catalogQuery = "zzzz-no-such-model"
+        }
+
+        // 2d — the catalogue subprocess failed (ModelCatalog's `[]` sentinel).
+        capture("browse-catalog-error", catalog: [], loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+        }
+
+        // 2d — an empty cache under the Cached filter. Note this is a healthy
+        // catalogue with nothing downloaded, NOT the phantom "No" row: that
+        // parser bug is fixed upstream (#1920) and is deliberately not worked
+        // around here.
+        let emptyCache = catalog
+            .filter { $0.kind == .chat }
+            .map {
+                ModelEntry(alias: $0.alias, hfRepo: $0.hfRepo, sizeOnDisk: nil,
+                           cached: false, kind: .chat)
+            }
+        capture("browse-empty-cache", catalog: emptyCache, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.catalogFilter = .cached
+        }
+
+        // 2e — Review download for an uncached model, opened from the
+        // catalogue. Primary reads Download & start; Back names the catalogue.
+        capture("review-uncached", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.select(uncachedChoice)
+            quickstart.beginReviewDownload(origin: .catalogue)
+        }
+
+        // 2e — Review for a model already on disk. Primary reads Start existing
+        // model, and no download size is quoted as a cost.
+        capture("review-cached", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.select(cachedChoice)
+            quickstart.beginReviewDownload(origin: .shortlist)
+        }
+
+        // Back restoration — the state the user lands in after Review → Back
+        // from the catalogue: catalogue re-shown, query/filter/sort intact,
+        // pick still selected.
+        capture("back-restores-catalogue", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.catalogQuery = "qwen"
+            quickstart.catalogSort = .nameAscending
+            quickstart.select(uncachedChoice)
+            quickstart.rememberCatalogAnchor(uncachedChoice.alias)
+            quickstart.beginReviewDownload(origin: .catalogue)
+            quickstart.backFromReviewDownload()
+        }
+
+        // Back restoration onto the shortlist, where a catalogue pick has to
+        // come back as YOUR PICK (approved default D2) rather than vanishing.
+        //
+        // Deliberately mistral, not qwen3.5-9b: the 9B is one of the four
+        // native shortlist rows, so picking it in the catalogue and coming back
+        // correctly shows NO extra group — which proves the "the group
+        // disappears when the selection is native" half of D2, and nothing at
+        // all about the half this capture is for.
+        let offShortlistChoice = QuickstartView.choice(
+            forCatalogEntry: catalog.first { $0.alias == "mistral-7b-4bit" }!
+        )
+        capture("back-restores-shortlist-your-pick", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.select(offShortlistChoice)
+            quickstart.backToRecommendedModels()
+        }
+
+        // The other half of D2, so both are on the canvas: a native shortlist
+        // row picked in the catalogue comes back selected in place, with no
+        // YOUR PICK group added.
+        capture("back-restores-shortlist-native", catalog: catalog, loaded: true) {
+            quickstart._testingReset()
+            quickstart.advanceToChooseModel()
+            quickstart.beginBrowsingCatalog()
+            quickstart.select(uncachedChoice)
+            quickstart.backToRecommendedModels()
+        }
+
+        // Leave the coordinator as the rest of the harness found it.
+        quickstart._testingReset()
+    }
+
     /// Hosting the view in a real (offscreen, borderless) ``NSWindow``
     /// and calling ``cacheDisplay`` drives genuine AppKit layout, which
     /// the split view needs. The window also gives us:
@@ -923,7 +1395,9 @@ private struct SettingsControlProofSheet: View {
                         .accessibilityIdentifier("DevSnapshot.Specimen.DestructiveCompact")
                     QuietIconButton(symbol: "trash", label: "Delete",
                                     tint: RapidTheme.statusError) {}
+                        .accessibilityIdentifier("DevSnapshot.Specimen.Icon.Delete")
                     QuietIconButton(symbol: "arrow.down.circle", label: "Download") {}
+                        .accessibilityIdentifier("DevSnapshot.Specimen.Icon.Download")
                 }
                 HStack(spacing: RapidTheme.Space.sm) {
                     Button("Disabled primary") {}.buttonStyle(.rapidPrimary).disabled(true)

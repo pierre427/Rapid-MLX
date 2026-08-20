@@ -9,7 +9,7 @@ surface matters.
 
 **Do not file a public GitHub issue for security reports.**
 
-Email **security@machinefi.com** with:
+Email **security@rapidmlx.com** with:
 
 - A description of the vulnerability
 - Steps to reproduce (a minimal Swift / shell snippet is ideal)
@@ -38,10 +38,11 @@ In scope:
 - How Rapid-MLX Desktop spawns, sandboxes, and communicates with the
   `rapid-mlx` subprocess (`ServerLocator`, `ServerManager`, the
   loopback HTTP client) — independent of which `rapid-mlx` binary is
-  resolved at launch. The bundled-sidecar slot itself will ship once
-  Phase 5 (CI release integration) lands; until then the resolved
-  binary comes from `$PATH` / Homebrew / pipx, and PRIVACY.md
-  documents the slot order users can audit.
+  resolved at launch. Full-bundle builds embed the engine inside the
+  app; slim builds download and provision it into the runtime-override
+  slot via the bootstrapper on first launch. A `rapid-mlx` on `$PATH`
+  is intentionally never consulted. PRIVACY.md documents the exact
+  slot order users can audit.
 
 Out of scope:
 
@@ -52,8 +53,8 @@ Out of scope:
   fix belongs in the upstream project at
   [github.com/raullenchai/Rapid-MLX](https://github.com/raullenchai/Rapid-MLX).
 - Local privilege escalations that require root or full disk access
-- Vulnerabilities in third-party search providers (Brave, Tavily) the
-  user opts into for `web_search`
+- Vulnerabilities in third-party search providers (Keenable, Parallel,
+  Tavily, Brave, or the DuckDuckGo backstop) used by `web_search`
 
 ## Recognition
 

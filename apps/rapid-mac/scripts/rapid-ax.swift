@@ -1,7 +1,8 @@
 #!/usr/bin/env swift
 // Minimal native Accessibility driver for deterministic Rapid GUI journeys.
 // It deliberately exposes only semantic operations: dump, press, set-value,
-// and closing a named native window through its AXCloseButton.
+// paste-file, and closing a named native window through its AXCloseButton.
+import AppKit
 import ApplicationServices
 import Foundation
 
@@ -110,11 +111,25 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "trust" {
 
 guard CommandLine.arguments.count >= 3,
       let pid = pid_t(CommandLine.arguments[2]) else {
-    fail("usage: rapid-ax <dump|press|set-value|close-window|trust> <pid> [identifier-or-window-title] [value]")
+    fail("usage: rapid-ax <dump|press|set-scroll-value|increment|decrement|set-value|paste-file|set-window-size|close-window|trust> <pid> [identifier-or-window-title] [value]")
 }
 
 let command = CommandLine.arguments[1]
 let application = AXUIElementCreateApplication(pid)
+
+// A semantic action should model an actual user interacting with the app.
+// On unattended runners AXPress can return success for a background SwiftUI
+// window without dispatching the Button closure. Bring the target app forward
+// before reading its tree, then resolve the post-activation elements so the
+// action never holds a reference across the activation/layout transition.
+if command != "dump" {
+    guard let running = NSRunningApplication(processIdentifier: pid) else {
+        fail("target application is no longer running")
+    }
+    running.activate(options: [.activateAllWindows])
+    usleep(100_000)
+}
+
 var visited = Set<AXUIElement>()
 var records = [[String: Any]]()
 var match: AXUIElement?
@@ -175,9 +190,24 @@ func walk(_ element: AXUIElement, depth: Int) {
     guard visited.insert(element).inserted else { return }
 
     let identifier = string(element, kAXIdentifierAttribute as CFString)
+    let role = string(element, kAXRoleAttribute as CFString)
+    // Action commands only need one element. Building a complete 12k-node
+    // dump after finding it leaves SwiftUI several seconds to replace the
+    // backing accessibility object; AXPress then receives a stale reference
+    // and fails with invalidUIElement/cannotComplete. Stop at the match. Dump
+    // still walks the complete tree because negative assertions depend on it.
+    if command == "set-scroll-value", match == nil,
+       role == kAXScrollBarRole as String {
+        match = element
+        return
+    }
+    if command != "dump", match == nil, identifier == wanted {
+        match = element
+        return
+    }
     var record: [String: Any] = ["depth": depth]
     if let identifier { record["identifier"] = identifier }
-    if let role = string(element, kAXRoleAttribute as CFString) { record["role"] = role }
+    if let role { record["role"] = role }
     if let subrole = string(element, kAXSubroleAttribute as CFString), !subrole.isEmpty {
         record["subrole"] = subrole
     }
@@ -237,6 +267,7 @@ func walk(_ element: AXUIElement, depth: Int) {
     }
     for child in children {
         walk(child, depth: depth + 1)
+        if command != "dump", match != nil { break }
     }
 }
 
@@ -283,6 +314,51 @@ if command == "close-window" {
     exit(0)
 }
 
+if command == "set-window-size" {
+    guard let wanted else { fail("set-window-size requires a window title") }
+    guard CommandLine.arguments.count > 4 else {
+        fail("set-window-size requires WIDTHxHEIGHT")
+    }
+    let parts = CommandLine.arguments[4].split(separator: "x", maxSplits: 1)
+    guard parts.count == 2,
+          let width = Double(parts[0]),
+          let height = Double(parts[1]),
+          width > 0, height > 0 else {
+        fail("set-window-size requires positive WIDTHxHEIGHT")
+    }
+    guard let window = windowElements.first(where: {
+        string($0, kAXTitleAttribute as CFString) == wanted
+    }) else {
+        fail("window not found: \(wanted)")
+    }
+    var requested = CGSize(width: width, height: height)
+    guard let value = AXValueCreate(.cgSize, &requested) else {
+        fail("could not encode requested window size")
+    }
+    let result = AXUIElementSetAttributeValue(
+        window, kAXSizeAttribute as CFString, value
+    )
+    guard result == .success else {
+        fail("setting window size failed: \(result.rawValue)")
+    }
+    usleep(300_000)
+    guard let actual = size(window, kAXSizeAttribute as CFString) else {
+        fail("window size could not be read after resize")
+    }
+    let payload: [String: Any] = [
+        "success": true,
+        "window": wanted,
+        "requested": ["width": width, "height": height],
+        "actual": ["width": actual.width, "height": actual.height],
+    ]
+    let data = try! JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]
+    )
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    exit(0)
+}
+
 if command == "dump" {
     let payload: [String: Any] = [
         "success": true,
@@ -313,6 +389,23 @@ switch command {
 case "press":
     let result = AXUIElementPerformAction(target, kAXPressAction as CFString)
     guard result == .success else { fail("AXPress \(identifier) failed: \(result.rawValue)") }
+case "set-scroll-value":
+    guard CommandLine.arguments.count > 3,
+          let value = Double(CommandLine.arguments[3]),
+          (0.0...1.0).contains(value)
+    else { fail("set-scroll-value requires a normalized value from 0 through 1") }
+    let result = AXUIElementSetAttributeValue(
+        target, kAXValueAttribute as CFString, NSNumber(value: value))
+    guard result == .success else {
+        fail("setting the first visible scroll bar failed: \(result.rawValue)")
+    }
+    usleep(150_000)
+case "increment":
+    let result = AXUIElementPerformAction(target, kAXIncrementAction as CFString)
+    guard result == .success else { fail("AXIncrement \(identifier) failed: \(result.rawValue)") }
+case "decrement":
+    let result = AXUIElementPerformAction(target, kAXDecrementAction as CFString)
+    guard result == .success else { fail("AXDecrement \(identifier) failed: \(result.rawValue)") }
 case "set-value":
     guard CommandLine.arguments.count > 4 else { fail("set-value requires a value") }
     let value = CommandLine.arguments[4] as CFString
@@ -320,6 +413,39 @@ case "set-value":
     guard focusResult == .success else { fail("focus \(identifier) failed: \(focusResult.rawValue)") }
     let result = AXUIElementSetAttributeValue(target, kAXValueAttribute as CFString, value)
     guard result == .success else { fail("set value \(identifier) failed: \(result.rawValue)") }
+case "paste-file":
+    guard CommandLine.arguments.count > 4 else { fail("paste-file requires a path") }
+    let url = URL(fileURLWithPath: CommandLine.arguments[4])
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        fail("paste-file path does not exist: \(url.path)")
+    }
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    guard pasteboard.writeObjects([url as NSURL]) else {
+        fail("could not write file URL to the pasteboard")
+    }
+    guard let running = NSRunningApplication(processIdentifier: pid) else {
+        fail("target application is no longer running")
+    }
+    running.activate(options: [.activateAllWindows])
+    // Activating the app can replace its first responder. Make activation
+    // real first, then focus the compose field immediately before posting the
+    // shortcut so Command-V cannot land in this short-lived driver instead.
+    usleep(150_000)
+    let focusResult = AXUIElementSetAttributeValue(
+        target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    guard focusResult == .success else {
+        fail("focus \(identifier) failed: \(focusResult.rawValue)")
+    }
+    usleep(50_000)
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)
+    else { fail("could not create Command-V events") }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    usleep(150_000)
 default:
     fail("unknown command: \(command)")
 }

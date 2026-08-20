@@ -8,12 +8,21 @@ let package = Package(
     name: "Rapid",
     platforms: [.macOS(.v14)],
     dependencies: [
+        // Sparkle owns signed desktop updates: background checks/downloads,
+        // install-on-quit, authorization when /Applications is not writable,
+        // and atomic replacement. Keep the in-tree updater as a migration
+        // fallback for builds that do not carry a Sparkle public key.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.5"),
         // Block-level markdown rendering for assistant turns. Apple's
         // ``AttributedString(markdown:)`` only does inline formatting and
         // silently flattens headings, lists, fenced code, and tables.
         // ``MarkdownUI`` renders each block as a real SwiftUI view, à la
         // ChatGPT Desktop. Pinned to the maintenance-line 2.4 series.
         .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.0"),
+        // Parsing only (swift-cmark underneath, GFM tables + strikethrough).
+        // The TextKit 2 render layer needs a parsed block list, which
+        // MarkdownUI's string-only entry point cannot provide — see #1843.
+        .package(url: "https://github.com/swiftlang/swift-markdown", from: "0.6.0"),
         // Issue #131: LaTeX rendering for math/STEM model responses.
         // ``MarkdownUI`` ships no math engine, so ``$``/``\frac``/``\sqrt``
         // would render as visible tokens. ``SwiftMath`` is the macOS-
@@ -50,6 +59,8 @@ let package = Package(
             name: "Rapid",
             dependencies: [
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),
+                .product(name: "Markdown", package: "swift-markdown"),
+                .product(name: "Sparkle", package: "Sparkle"),
                 "SwiftMath",
                 "RapidCrashHandler"
             ],

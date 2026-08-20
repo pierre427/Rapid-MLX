@@ -72,6 +72,18 @@ jobs:
             bash "$t"
           done
 
+      # install.sh picks the interpreter and builds ~/.rapid-mlx, but it only
+      # runs end-to-end on Apple Silicon, so its arch-selection and venv-repair
+      # logic (see #1953) is covered offline against fake interpreters. Pure
+      # bash, no network/Python/real install — runs on the Linux CI leg.
+      - name: Installer offline tests
+        run: |
+          set -euo pipefail
+          for t in tests/install/test_*.sh; do
+            echo "── $t"
+            bash "$t"
+          done
+
       # Parser microbench — catches >10x regressions in tool-call
       # extraction. Pure Python (parsers don't import mlx); thresholds
       # are intentionally generous (3-5x measured M3 numbers) to
@@ -192,6 +204,7 @@ jobs:
             tests/test_validate_release_subject.py \
             tests/test_check_gha_pinning.py \
             tests/test_check_mlx_upstream_calls.py \
+            tests/test_no_out_of_band_routing.py \
             tests/test_microbench_parsers.py \
             tests/test_telemetry_emit.py \
             tests/test_telemetry_consent.py \
@@ -260,6 +273,7 @@ jobs:
             tests/test_forced_alignment_route_hardening.py \
             tests/test_muse_glimmer_model.py \
             tests/test_bailing_hybrid_model.py \
+            tests/test_mtp_spec_decode.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
