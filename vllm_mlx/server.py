@@ -1063,6 +1063,13 @@ class _SpecAlignedCORSMiddleware(CORSMiddleware):
             lk = k.lower()
             if lk == "access-control-allow-origin":
                 continue
+            # The upstream 400 body is longer than our constant ``"OK"``.
+            # Carrying its Content-Length into PlainTextResponse makes the
+            # wire response claim bytes that never arrive: curl exits 18 and
+            # strict HTTP clients raise IncompleteRead. Let PlainTextResponse
+            # calculate the length of the replacement body instead.
+            if lk == "content-length":
+                continue
             if lk == "vary":
                 continue  # canonicalized below
             headers[k] = v
@@ -1166,6 +1173,44 @@ def _parse_csv(value: str) -> list[str]:
     trailing comma or stray space doesn't accidentally register an empty
     origin (which CORSMiddleware would silently never match)."""
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def configure_trusted_hosts(cli_hosts: list[str] | None = None) -> list[str]:
+    """OPT-IN Host-header allowlist (DNS-rebinding / Host-header-spoofing
+    hardening) via Starlette's ``TrustedHostMiddleware``.
+
+    Resolution:
+      1. ``--trusted-hosts`` CLI flag (comma-separated) — takes precedence.
+      2. ``RAPID_MLX_TRUSTED_HOSTS`` env var (comma-separated).
+      3. Unset / empty → middleware is NOT registered. This is the default:
+         restricting the Host header would break ``rapid-mlx share`` (which
+         forwards the public-facing Host header into the local server) and
+         LAN access via machine hostname, so an operator opts in deliberately.
+
+    ``allowed_hosts`` (Starlette) values cross-match the request ``Host``
+    header against glob patterns; ``*`` and ``localhost``/``127.0.0.1`` are
+    typical. A request whose Host matches nothing is rejected with 400.
+    """
+    hosts: list[str] = []
+    if cli_hosts is not None:
+        # argparse's nargs="+" accepts both ``a b`` and values users commonly
+        # write as ``a,b``. Normalize each entry so CLI and env semantics match.
+        hosts = [host for entry in cli_hosts for host in _parse_csv(entry)]
+    else:
+        env_raw = os.environ.get("RAPID_MLX_TRUSTED_HOSTS")
+        if env_raw:
+            hosts = _parse_csv(env_raw)
+    if not hosts:
+        return []
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
+    logger.info(
+        "TrustedHostMiddleware enabled (allowed_hosts=%s): requests with a "
+        "non-matching Host header are rejected.",
+        hosts,
+    )
+    return hosts
 
 
 def configure_cors_from_env(
@@ -1810,14 +1855,16 @@ def load_model(
                 "(alias pins is_text_only=True but --mllm was also given)"
             )
 
-    # Hybrid/linear-attention VLM checkpoints (e.g. Qwen3.5/3.6 GatedDeltaNet
-    # with a vision tower) auto-route to the MLLM lane on their vision weights,
-    # but the MLLM continuous-batching engine cannot build a BatchKVCache over
-    # an ArraysCache backbone (GitHub #352). Left alone, the naive
-    # ``rapid-mlx serve <flagship>`` command boots into the MLLM lane and then
-    # raises a RuntimeError telling the user to "Drop --mllm" — a flag they
-    # never set. Auto-fall-back to the text-only mlx-lm lane HERE, at the
-    # routing layer, with one clear INFO line. The dense text lane serves the
+    # Hybrid/linear-attention VLM checkpoints (e.g. Qwen3.5/3.6/3.8 GatedDeltaNet
+    # with a vision tower) auto-route to the MLLM lane on their vision weights.
+    # Post-#1798 the MLLM engine CAN serve an ArraysCache backbone, but only in
+    # a serialized one-request-at-a-time lane (a BatchKVCache cannot be built
+    # over ArraysCache, so concurrent batching stays off — GitHub #352). Left
+    # alone, the naive ``rapid-mlx serve <flagship>`` command would boot the
+    # whole model into that B=1 lane, capping text throughput for every request.
+    # Auto-fall-back to the text-only mlx-lm lane HERE, at the routing layer,
+    # with one clear INFO line, so the common text path keeps full batching and
+    # --mllm opts into the serialized vision lane. The dense text lane serves the
     # GatedDeltaNet backbone coherently and keeps ``is_hybrid=False`` (avoiding
     # the metal::malloc throttle wedge the 4B/9B/27B dense variants hit under
     # the hybrid scheduler path — see model_auto_config r6-A R6-C1).
@@ -1827,11 +1874,13 @@ def load_model(
     # "auto-downgraded" and never falsely claim the user passed ``--no-mllm``
     # (codex #2 on #1178). The materialize-then-probe order is load-bearing:
     # ``_ensure_routing_config`` must run BEFORE ``resolve_serving_lane`` so a
-    # first-time uncached hybrid VLM has real config evidence and is not routed
-    # into the crashing MLLM engine (codex BLOCKING on #1178). Only fires in
+    # first-time uncached hybrid VLM has real config evidence and is routed on
+    # fact, not on a missing config (codex BLOCKING on #1178). Only fires in
     # auto mode: an explicit ``--mllm`` (force_mllm) is respected so the
-    # operator who insists on the multimodal path gets the engine's own #352
-    # error rather than a silent override. #352 dogfood P1-② (0.10.16).
+    # operator who wants vision gets the serialized MLLM lane (#1798) — for a
+    # hybrid backbone that serves vision at B=1; for an arch mlx-vlm cannot
+    # drive it still errors — rather than a silent override. #352 dogfood
+    # P1-② (0.10.16).
     #
     # The generative-media lanes are exempt. An ``image-gen`` / ``video-gen``
     # alias never reaches ``resolve_serving_lane``'s question at all — it
@@ -1856,14 +1905,16 @@ def load_model(
         )
         if _auto_text_fallback:
             logger.info(
-                "Model %r auto-downgraded to the text-only mlx-lm lane: it is "
-                "a multimodal checkpoint the MLLM continuous-batching engine "
-                "cannot serve — either a hybrid/linear-attention language "
-                "backbone (GitHub #352) or an architecture the installed "
-                "mlx-vlm does not support yet (e.g. muse_glimmer, served via "
-                "the vendored text backbone). The vision path is unavailable "
-                "for this checkpoint. Pass --mllm to force the multimodal "
-                "engine (it will error), or --no-mllm to silence this notice.",
+                "Model %r auto-downgraded to the text-only mlx-lm lane for "
+                "full batched throughput: it is a multimodal checkpoint whose "
+                "language backbone the MLLM continuous-batching engine cannot "
+                "batch — either hybrid/linear-attention (GatedDeltaNet: "
+                "Qwen3.5/3.6/3.8) or a vision architecture the installed "
+                "mlx-vlm cannot drive yet (e.g. muse_glimmer, served via the "
+                "vendored text backbone). Pass --mllm to serve vision: a "
+                "hybrid backbone runs a serialized one-request-at-a-time lane "
+                "(#1798); an unsupported arch errors instead. Pass --no-mllm "
+                "to silence this notice.",
                 model_name,
             )
 
@@ -2826,6 +2877,18 @@ Examples:
         help="Tokens to process per prefill chunk (default: 2048). "
         "Larger values may improve TTFT on Apple Silicon with sufficient memory.",
     )
+    parser.add_argument(
+        "--vision-min-pixels",
+        type=int,
+        default=0,
+        help="Minimum pixels for dynamic-resolution VLM inputs (0: model default).",
+    )
+    parser.add_argument(
+        "--vision-max-pixels",
+        type=int,
+        default=0,
+        help="Maximum pixels for dynamic-resolution VLM inputs (0: model default).",
+    )
     # Task #292: mirror the ``rapid-mlx serve`` ``--enable-audio`` flag
     # on the legacy ``python -m vllm_mlx.server`` entrypoint so the same
     # text-mode-with-audio escape hatch is available to operators who
@@ -3085,8 +3148,19 @@ Examples:
         args, model_name=args.model
     )
 
+    if args.vision_min_pixels < 0 or args.vision_max_pixels < 0:
+        parser.error("vision pixel bounds must be non-negative")
+    if (
+        args.vision_min_pixels
+        and args.vision_max_pixels
+        and args.vision_min_pixels > args.vision_max_pixels
+    ):
+        parser.error("--vision-min-pixels must not exceed --vision-max-pixels")
+
     scheduler_config = SchedulerConfig(
         prefill_step_size=args.prefill_step_size,
+        vision_min_pixels=args.vision_min_pixels,
+        vision_max_pixels=args.vision_max_pixels,
         pflash_config=server_pflash_config,
         **_server_turboquant_scheduler_kwargs(args),
     )

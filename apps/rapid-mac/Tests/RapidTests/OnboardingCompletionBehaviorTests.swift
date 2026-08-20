@@ -466,13 +466,18 @@ struct OnboardingCompletionBehaviorTests {
                 "the completion action must be addressable by the golden-flow harness")
         #expect(!body.contains(#".accessibilityIdentifier("Quickstart.Ready")"#),
                 "a container identifier would overwrite the child button's AX identifier")
-        #expect(body.contains(#"Text("Startchatting")"#),
+        #expect(body.contains(#"Button("Startchatting"){completeOnboarding()}"#),
                 "the Ready screen must offer the Start chatting action")
         // The confirmation must run the coordinator transaction, not a
         // local shortcut that bypasses seeding / persistence.
         #expect(body.contains("coordinator.confirmStartChatting(seedWelcome:onSeedWelcome)"))
-        // No fake work between the click and the app.
-        #expect(!body.contains("case.ready:centeredCard(progressStep:.start){ProgressView"),
+        // No fake work between the click and the app. Direction D renders
+        // Ready through the shared outcome block, which has no progress slot
+        // at all; pin the absence directly rather than through the retired
+        // centred-card call shape.
+        #expect(!body.contains("case.ready:OnboardingCenteredCanvas{ProgressView"),
+                "Ready must not render a spinner — the model is already up")
+        #expect(!body.contains("privatevarreadyCard:someView{ProgressView"),
                 "Ready must not render a spinner — the model is already up")
     }
 
@@ -530,9 +535,14 @@ struct OnboardingCompletionBehaviorTests {
         // Skip is still the one genuine dismiss control, and still does not
         // write the completion flag.
         #expect(body.contains(#".accessibilityIdentifier("Quickstart.Skip")"#))
-        // Browse all models still routes to the Settings catalogue.
+        // Browse all models still has a destination — now the in-window
+        // catalogue rather than the Settings window. Paper 05.2.J · S1
+        // supersedes the Settings round trip; the control and its identifier
+        // survive the change, which is the part this suite is guarding.
         #expect(body.contains(#".accessibilityIdentifier("Quickstart.BrowseAll")"#))
-        #expect(body.contains("settingsRouter.beginQuickstartCatalogRoundTrip()"))
+        #expect(body.contains("coordinator.beginBrowsingCatalog()"))
+        #expect(!body.contains("settingsRouter.beginQuickstartCatalogRoundTrip()"),
+                "onboarding must not hand the catalogue to a second window any more")
         // The low-disk warning is still non-blocking with both exits.
         #expect(body.contains(#".accessibilityIdentifier("Quickstart.LowDisk.Continue")"#))
         #expect(body.contains(#".accessibilityIdentifier("Quickstart.LowDisk.Cancel")"#))

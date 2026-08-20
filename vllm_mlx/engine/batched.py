@@ -699,65 +699,6 @@ except ImportError:
     GuidedGenerator = None
 
 
-def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
-    """
-    Extract images and videos from OpenAI-format messages.
-
-    Returns:
-        Tuple of (has_media, images_list, videos_list)
-    """
-    images = []
-    videos = []
-
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-
-        for item in content:
-            # Handle Pydantic models
-            if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
-            elif hasattr(item, "dict"):
-                item = {k: v for k, v in item.dict().items() if v is not None}
-
-            if not isinstance(item, dict):
-                continue
-
-            item_type = item.get("type", "")
-
-            if item_type == "image_url":
-                img_url = item.get("image_url", {})
-                if isinstance(img_url, str):
-                    images.append(img_url)
-                elif isinstance(img_url, dict):
-                    url = img_url.get("url", "")
-                    if url:
-                        images.append(url)
-
-            elif item_type == "image":
-                img = item.get("image") or item.get("url", "")
-                if img:
-                    images.append(img)
-
-            elif item_type == "video_url":
-                vid_url = item.get("video_url", {})
-                if isinstance(vid_url, str):
-                    videos.append(vid_url)
-                elif isinstance(vid_url, dict):
-                    url = vid_url.get("url", "")
-                    if url:
-                        videos.append(url)
-
-            elif item_type == "video":
-                vid = item.get("video") or item.get("url", "")
-                if vid:
-                    videos.append(vid)
-
-    has_media = bool(images or videos)
-    return has_media, images, videos
-
-
 class MLLMModelWrapper:
     """
     Wrapper for MLLM models to make them compatible with BatchGenerator.
@@ -901,6 +842,9 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._model_load_executor = None  # mlx-step worker (#170)
         self._mllm_instance = None  # MLXMultimodalLM instance
+        # The MLLM lane has no text EngineCore/model_config to query. Set this
+        # from the loaded language backbone's concrete cache probe instead.
+        self._mllm_is_hybrid: bool | None = None
         self._loaded = False
         self._engine_started = False  # Track if engine loop is running
         self._start_time: float | None = None
@@ -1183,6 +1127,18 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        vision_min_pixels = getattr(self._scheduler_config, "vision_min_pixels", 0)
+        vision_max_pixels = getattr(self._scheduler_config, "vision_max_pixels", 0)
+        if vision_min_pixels or vision_max_pixels:
+            from ..mllm_batch_generator import _supports_dynamic_vision_bounds
+
+            if not _supports_dynamic_vision_bounds(self._processor):
+                raise RuntimeError(
+                    "--vision-min-pixels/--vision-max-pixels require a "
+                    "dynamic-resolution image processor (for example, "
+                    "Qwen2.5-VL or Qwen3-VL)"
+                )
+
         # Probe the language-backbone cache before the port reports ready.
         # ArraysCache has the merge/filter/extract primitives needed for a
         # correctness-first serialized lane (#1796), but concurrent hybrid
@@ -1193,6 +1149,7 @@ class BatchedEngine(BaseEngine):
             _probe_mllm_cache_type, language_model
         ).result()
         arrays_cache_compat = cache_type == "ArraysCache"
+        self._mllm_is_hybrid = arrays_cache_compat
         if cache_type is not None and not arrays_cache_compat:
             raise RuntimeError(
                 f"Model '{self._model_name}' uses a hybrid/linear-attention "
@@ -1258,7 +1215,6 @@ class BatchedEngine(BaseEngine):
         max_concurrent_requests = getattr(
             self._scheduler_config, "max_concurrent_requests", 256
         )
-
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -1268,6 +1224,8 @@ class BatchedEngine(BaseEngine):
             vision_cache_size=100,
             max_concurrent_requests=max_concurrent_requests,
             allow_arrays_cache=arrays_cache_compat,
+            vision_min_pixels=vision_min_pixels,
+            vision_max_pixels=vision_max_pixels,
         )
 
         # Create and start MLLM scheduler — pass the model-owning executor so
@@ -1283,7 +1241,9 @@ class BatchedEngine(BaseEngine):
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
-            f"completion_batch={completion_batch_size}"
+            f"completion_batch={completion_batch_size}, vision_min_pixels="
+            f"{vision_min_pixels or 'model-default'}, vision_max_pixels="
+            f"{vision_max_pixels or 'model-default'}"
         )
 
     async def _start_llm(self) -> None:
@@ -1294,7 +1254,9 @@ class BatchedEngine(BaseEngine):
         from ..scheduler import SchedulerConfig
         from ..utils.tokenizer import load_model_with_fallback
 
-        # Build tokenizer config
+        # The shared loader applies RAPID_MLX_TRUST_REMOTE_CODE=0 across every
+        # text-model entry point. Keep the engine's explicit request here so
+        # the default serve behavior remains unchanged.
         tokenizer_config = {"trust_remote_code": self._trust_remote_code}
 
         # Qwen3 fix
@@ -2325,6 +2287,8 @@ class BatchedEngine(BaseEngine):
         Returns False on any access error so a malformed engine state
         never *enables* the new path — fails closed.
         """
+        if self._is_mllm and self._mllm_is_hybrid is not None:
+            return self._mllm_is_hybrid
         try:
             return bool(self._engine.engine.model_config.is_hybrid)
         except (AttributeError, TypeError):
@@ -3098,6 +3062,12 @@ class BatchedEngine(BaseEngine):
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    def clear_prefix_cache(self, *, reset_stats: bool = True) -> bool:
+        """Clear reusable text prefix KV state while keeping weights loaded."""
+        if self._engine:
+            return self._engine.clear_prefix_cache(reset_stats=reset_stats)
+        return False
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort an active or queued batched request by request ID.

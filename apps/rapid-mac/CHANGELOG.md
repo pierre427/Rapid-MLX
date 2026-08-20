@@ -11,7 +11,189 @@ GitHub auto-generated notes: a non-technical user reading "Tier 1
 translates each commit subject into something a release-day reader
 can actually understand.
 
+> **Note:** pre-0.9 entries link their issue/PR and compare/release URLs to
+> the app's archived `machinefi/rapid-desktop` repository, where that work
+> shipped before the app moved into this `raullenchai/Rapid-MLX` monorepo.
+
 ## [Unreleased]
+
+## [0.12.17] — 2026-08-19
+
+Dictation actually works now — 0.12.16's release build shipped without the
+microphone permission, so the "Allow…" button did nothing. Update, and macOS
+will ask for the microphone like it should.
+
+### Fixed
+
+- **Speech to Text can be enabled again.** The signed app now carries the
+  microphone entitlement macOS requires. 0.12.16's release build shipped
+  without it, so the permission prompt never appeared and dictation
+  dead-ended at setup — development builds were unaffected, which is why
+  it slipped through. The build pipeline now refuses to sign a release
+  that is missing it.
+
+## [0.12.16] — 2026-08-19
+
+Dictate into any app from a global hotkey, web search works out of the box,
+chat typesets math, and conversations can be filed into folders and
+exported.
+
+### Added
+
+- **Dictate into any app.** Tap right Option, speak, and the words land at
+  your cursor — in any app, even with Rapid's window closed. Transcription
+  runs through your local server, so audio never leaves the Mac.
+- **Math renders as math.** Chat typesets inline and block LaTeX the way
+  models actually write it, so equations show up as equations instead of
+  raw markup.
+- **Web search that just works.** Chat's web search defaults to Keenable's
+  keyless service — real query-relevant snippets with no account and no API
+  key, replacing the DuckDuckGo scrape that rate-limited after a few
+  searches. Want the best measured quality? Paste a free Parallel key in
+  Settings → Tools (it tops the Artificial Analysis Search Index; the free
+  tier covers about 1,000 searches a month). Brave's entry now says plainly
+  that its API requires a card on file and auto-bills overage.
+- **File conversations into folders, and export them.** Create a folder from
+  any conversation's row menu, rename it, and export conversations as
+  Markdown from the same place.
+
+### Changed
+
+- **Model recommendations follow the Artificial Analysis Intelligence
+  Index.** Every Mac from 32 GB up is offered Qwen3.8-27B — GPT-5.6-class
+  intelligence at ~40 tok/s with multi-token prediction on — replacing
+  larger models that score far lower on the same index. Smaller Macs keep
+  their best-in-class picks.
+- Getting a model is now two explicit steps — Download, then Start when
+  you're ready — and the launch memory modal is gone.
+- Setup fills the window instead of floating as a small card over a dimmed
+  chat, so every step is reachable on every display.
+- Opt-in telemetry now includes the chip family and a rounded memory tier —
+  never raw bytes — and the privacy policy spells that out.
+
+### Fixed
+
+- The main window can no longer shrink below a usable size.
+- "Jump to latest" works after an answer finishes.
+- The same file can no longer be attached twice.
+- Code blocks no longer flicker between plain and code styling while an
+  answer streams.
+- Markdown code blocks and tables are visible again in chat.
+- Voice notes in Apple formats (M4A, CAF, …) transcribe directly — the app
+  transcodes them for the server on the fly.
+
+## [0.12.15] — 2026-08-18
+
+Fixes a bug that could silently truncate files your coding agent writes, adds a
+Developer section to Settings, and brings MTP acceleration to the Qwen 3.8
+models that ship with it.
+
+### Fixed
+
+- **Coding agents no longer get truncated file writes.** When an agent asked a
+  Qwen 3.5 or 3.6 model to write a file, the file could be cut off at the first
+  line break — a 700-byte file arriving as 11 bytes — with no error shown
+  anywhere. Short values could come back subtly misspelled (`Tokyo` as `Toyo`).
+  This affected versions 0.12.5 through 0.12.14; if you ran a coding agent on
+  those, it is worth re-checking files it wrote.
+- Downloading a model no longer crawls when our mirror slows down. Each file
+  now watches its own speed and switches to Hugging Face if the transfer
+  collapses, instead of waiting it out — one 335 MB model took 8 minutes before.
+- Voice transcription no longer invents words when a clip is short or silent.
+  A brief silent recording now returns nothing instead of a made-up sentence.
+- Images and other visual input work correctly again on hybrid vision models,
+  which could previously answer from the wrong cached state.
+- Media-only models (image, audio, video) no longer appear as things you can
+  launch for chat.
+
+### Added
+
+- **Settings → Developer**, in development builds only: rehearse the first-run
+  experience without touching your real setup. You choose what gets erased —
+  conversations, settings, and the telemetry decision are each opt-in, and the
+  confirmation names every item before anything is removed.
+- **MTP acceleration for Qwen 3.8**, opt-in from Settings → Performance. It is
+  off by default because the speedup varies by machine. Models that ship an MTP
+  head now carry everything needed to run it, so turning it on just works; a
+  model without one refuses to start rather than quietly running unaccelerated.
+- DeepSeek Harness joins Claude Code, Codex, Hermes and Aider as a fully
+  supported coding agent — including in the gate that every release must pass.
+
+### Security
+
+- Model files downloaded from the internet are treated as untrusted by default:
+  code shipped inside a model repository no longer runs implicitly, downloaded
+  Python components are checksum-verified, and the audio checkpoint loader
+  refuses formats that can execute code unless you opt in.
+
+### Changed
+
+- The status footer drops readouts it cannot fit instead of squeezing six
+  indicators into the width of four.
+- Installing on Apple Silicon now insists on a matching Python and repairs a
+  half-built environment, instead of leaving an installation that never worked.
+
+## [0.12.14] — 2026-08-15
+
+Adds a Rapid-built version of Qwen3.8-27B, lets you give models your own names,
+and moves app updates fully onto the signed background updater.
+
+### Added
+
+- **Qwen3.8-27B, Rapid mixed-precision build** — a version of Qwen3.8-27B we
+  quantized ourselves, at 13 GB of weights instead of the standard build's
+  15 GB. It answered every coding task and 25 of 30 tool-calling scenarios in
+  our release testing. Plan for a 48 GB Mac or larger; on 32 GB it is a tight
+  fit. Maths is its weak spot — for arithmetic-heavy work Qwen 3.6 35B or
+  Gemma 4 26B remain the safer picks.
+- Qwen 3.8 models now show their real family name in the model list, and their
+  verified tool support shows as a capability instead of "unknown".
+- Give any model a name of your own from the command line —
+  `rapid-mlx alias set fast qwen3.5-4b-4bit`, then `rapid-mlx serve fast`.
+  Names can point at a built-in model or any Hugging Face repository.
+- DeepSeek Harness joins the list of coding agents Rapid can set up for you.
+
+### Changed
+
+- App updates now run entirely through the signed background updater. The old
+  in-app installer is gone, which removes the case where an update could
+  download but fail to install. Versions 0.12.12 and newer update themselves;
+  older versions are pointed at the download page once.
+
+### Fixed
+
+- The model information shown for hybrid models is now read live instead of
+  from a stale snapshot.
+- Closing a chat mid-answer no longer records a false error in the logs.
+
+## [0.12.13] — 2026-08-14
+
+Adds Qwen's newest 27B model and document attachments in chat, plus a round of
+Mac app reliability and polish fixes.
+
+### Added
+
+- **Qwen3.8-27B** — Qwen's latest 27B model is now one click/command away
+  (`rapid-mlx chat qwen3.8-27b-4bit`). It's a strong general-purpose and
+  tool-using model, and it can also describe images when you start it with the
+  vision option turned on.
+- Normal chats now accept PDF, CSV, and TXT attachments. Rapid extracts document
+  text locally, keeps it with the conversation for follow-up questions, and
+  clearly marks large partial extracts. Scanned PDFs without selectable text
+  report that OCR is required instead of sending an empty prompt.
+
+### Fixed
+
+- The model list no longer shows a phantom "No" model on a machine that has
+  nothing downloaded yet.
+- The Launch page's Codex and Hermes buttons, which did nothing when clicked,
+  now start the right thing.
+- Hovering a button no longer covers its label with a grey block.
+- Long answers no longer slow the app down as their links pile up.
+- The message-box placeholder text now stays out of the way while you type in
+  another language.
+- Audio models are downloaded and checked before the app tries to use them, so
+  they no longer fail at the moment you press play.
 
 ## [0.12.12] — 2026-08-13
 
@@ -2832,7 +3014,7 @@ Older versions: see the
 [GitHub Releases page](https://github.com/machinefi/rapid-desktop/releases)
 for auto-generated notes against earlier tags.
 
-[Unreleased]: https://github.com/machinefi/rapid-desktop/compare/v0.5.16...HEAD
+[Unreleased]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.12.16...HEAD
 [0.5.16]: https://github.com/machinefi/rapid-desktop/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/machinefi/rapid-desktop/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/machinefi/rapid-desktop/compare/v0.5.13...v0.5.14

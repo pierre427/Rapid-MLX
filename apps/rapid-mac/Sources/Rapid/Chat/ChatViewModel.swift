@@ -26,6 +26,11 @@ final class ChatViewModel {
     /// conversation gains a user turn.
     private(set) var conversations: [ChatConversation] = []
 
+    /// User-created folders for filing conversations. Loaded from their own
+    /// `folders.json` on init; see ``ConversationFolderStore`` for why the
+    /// list is not stored alongside the transcripts.
+    private(set) var folders: [ChatFolder] = []
+
     /// Identity of the conversation ``messages`` currently holds. A fresh
     /// UUID on launch (opens to an empty "Ask anything"); ``persistActive``
     /// upserts under this id once the user sends.
@@ -189,6 +194,16 @@ final class ChatViewModel {
         self.conversations = persistsConversations
             ? ConversationStore.load(from: conversationStoreURL)
             : []
+        self.folders = persistsConversations
+            ? ConversationFolderStore.load(from: Self.folderStoreURL(for: conversationStoreURL))
+            : []
+    }
+
+    /// The folder file that sits beside whichever conversation store is in
+    /// use, so an injected test store keeps its folders in the same temp
+    /// directory instead of touching the real one.
+    private static func folderStoreURL(for conversationStore: URL?) -> URL? {
+        ConversationFolderStore.companionURL(forConversationStore: conversationStore)
     }
 
     /// Toggle a tool from the UI. Persists to ``UserDefaults`` so the choice
@@ -345,6 +360,96 @@ final class ChatViewModel {
         ConversationStore.save(conversations, to: conversationStoreURL)
     }
 
+    // MARK: - Folders
+
+    /// Create a folder. Returns nil for a blank name rather than making an
+    /// unnamed row the user then can't tell apart from any other.
+    ///
+    @discardableResult
+    func createFolder(named rawName: String) -> ChatFolder? {
+        guard let name = ChatFolder.normalizedName(rawName) else { return nil }
+        guard !folderNameExists(name) else { return nil }
+        let folder = ChatFolder(name: name)
+        folders.append(folder)
+        saveFolders()
+        return folder
+    }
+
+    @discardableResult
+    func renameFolder(_ id: UUID, to rawName: String) -> Bool {
+        guard let name = ChatFolder.normalizedName(rawName) else { return false }
+        guard let index = folders.firstIndex(where: { $0.id == id }) else { return false }
+        guard folders[index].name != name else { return true }
+        guard !folderNameExists(name, excluding: id) else { return false }
+        folders[index].name = name
+        saveFolders()
+        return true
+    }
+
+    /// Delete a folder WITHOUT deleting the conversations filed in it.
+    ///
+    /// The transcripts are the valuable thing; the folder is just where the
+    /// user put them. Unfiling them returns the rows to the date buckets,
+    /// which is recoverable — deleting them would not be. Same restraint
+    /// ``setConversationArchived`` shows for the same reason.
+    ///
+    /// Clearing ``folderID`` eagerly (rather than leaning on the render-time
+    /// orphan fallback) is what keeps a later folder created with a recycled
+    /// id from silently adopting rows that were never filed into it.
+    func deleteFolder(_ id: UUID) {
+        guard folders.contains(where: { $0.id == id }) else { return }
+        folders.removeAll { $0.id == id }
+        var unfiled = false
+        for index in conversations.indices where conversations[index].folderID == id {
+            conversations[index].folderID = nil
+            unfiled = true
+        }
+        saveFolders()
+        if unfiled { saveConversations() }
+    }
+
+    /// File a conversation into a folder, or pass nil to unfile it.
+    ///
+    /// Filing is not conversation *activity*: ``updatedAt`` and the row's
+    /// position are left alone, matching rename / pin / archive and the
+    /// contract ``ConversationOrdering`` states.
+    ///
+    /// **Filing un-archives.** The sidebar shows archived rows only in the
+    /// Archived disclosure, ahead of any folder, so filing one without this
+    /// would record the folder and change nothing you can see — the row stays
+    /// where it was and the action reads as broken. Putting something in a
+    /// folder means wanting it in that folder; surfacing it is what makes the
+    /// gesture honest. Unfiling (`nil`) deliberately does NOT re-archive:
+    /// there is no earlier state to restore, and silently archiving a row the
+    /// user only wanted out of a folder would hide it entirely.
+    func moveConversation(_ id: UUID, toFolder folderID: UUID?) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        // An id for a folder that no longer exists would file the row into a
+        // section that never renders — i.e. it would look deleted.
+        if let folderID, !folders.contains(where: { $0.id == folderID }) { return }
+        let needsSurfacing = folderID != nil && conversations[index].isArchived
+        guard conversations[index].folderID != folderID || needsSurfacing else { return }
+        conversations[index].folderID = folderID
+        if needsSurfacing { conversations[index].isArchived = false }
+        saveConversations()
+    }
+
+    private func saveFolders() {
+        guard persistsConversations else { return }
+        ConversationFolderStore.save(
+            folders,
+            to: Self.folderStoreURL(for: conversationStoreURL)
+        )
+    }
+
+    func folderNameExists(_ name: String, excluding excludedID: UUID? = nil) -> Bool {
+        folders.contains {
+            $0.id != excludedID
+                && $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive])
+                    == .orderedSame
+        }
+    }
+
     /// Load a saved conversation into the transcript, archiving whatever is
     /// currently open first. Cancels any in-flight stream.
     func selectConversation(_ id: UUID) {
@@ -475,10 +580,11 @@ final class ChatViewModel {
     func send(
         _ text: String,
         alias: String,
-        imageAttachments: [ChatImageAttachment] = []
+        imageAttachments: [ChatImageAttachment] = [],
+        fileAttachments: [ChatFileAttachment] = []
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || !imageAttachments.isEmpty else { return }
+        guard !trimmed.isEmpty || !imageAttachments.isEmpty || !fileAttachments.isEmpty else { return }
         guard !isStreaming else { return }
 
         // Small local models are unreliable at the first step of tool use:
@@ -500,6 +606,7 @@ final class ChatViewModel {
             role: .user,
             content: trimmed,
             imageAttachments: imageAttachments,
+            fileAttachments: ChatFileAttachment.fittedForMessage(fileAttachments),
             status: .complete
         )
         _ = appendMessage(user)
@@ -1033,14 +1140,13 @@ final class ChatViewModel {
         // would slip past the budget because the trimming logic
         // saw a near-empty assistant turn. Fold the serialized
         // tool-call arguments into the per-row cost so the budget
-        // reflects the actual wire body. Attachments are already
-        // inlined into ``content`` by ``composeProseWithFileAttachments``
-        // at send-time, so the content-byte count already covers
-        // text attachments. Images use multimodal content parts and
+        // reflects the actual wire body. ``modelContent`` includes locally
+        // extracted document text while keeping it out of the visible chat
+        // bubble. Images use multimodal content parts and
         // are excluded here (token-count-per-image is model-specific
         // and not estimable from byte count alone).
         let perRowCost: (ChatMessage) -> Int = { msg in
-            let contentChars = msg.content.count
+            let contentChars = msg.modelContent.count
             let toolArgsChars = (msg.toolCalls ?? [])
                 .reduce(0) { $0 + $1.function.arguments.count }
             return max(1, (contentChars + toolArgsChars) / 4)
@@ -1217,11 +1323,19 @@ final class ChatViewModel {
     ) -> Bool {
         guard !isStreaming else { return false }
         guard let idx = messages.firstIndex(where: { $0.id == id && $0.role == .user }) else { return false }
-        let attachments = messages[idx].imageAttachments
+        let imageAttachments = messages[idx].imageAttachments
+        let fileAttachments = messages[idx].fileAttachments
         let trimmed = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
+        guard !trimmed.isEmpty || !imageAttachments.isEmpty || !fileAttachments.isEmpty else {
+            return false
+        }
         messages = Array(messages.prefix(idx))
-        send(trimmed, alias: alias, imageAttachments: attachments)
+        send(
+            trimmed,
+            alias: alias,
+            imageAttachments: imageAttachments,
+            fileAttachments: fileAttachments
+        )
         return true
     }
 
@@ -1236,7 +1350,8 @@ final class ChatViewModel {
         send(
             userMessage.content,
             alias: alias,
-            imageAttachments: userMessage.imageAttachments
+            imageAttachments: userMessage.imageAttachments,
+            fileAttachments: userMessage.fileAttachments
         )
     }
 
@@ -1256,7 +1371,8 @@ final class ChatViewModel {
 
         let userMessage = messages[userIndex]
         guard !userMessage.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || !userMessage.imageAttachments.isEmpty else {
+                || !userMessage.imageAttachments.isEmpty
+                || !userMessage.fileAttachments.isEmpty else {
             return false
         }
         // In place, on the SAME conversation id — see ``editUserMessage``
@@ -1265,7 +1381,8 @@ final class ChatViewModel {
         send(
             userMessage.content,
             alias: alias,
-            imageAttachments: userMessage.imageAttachments
+            imageAttachments: userMessage.imageAttachments,
+            fileAttachments: userMessage.fileAttachments
         )
         return true
     }

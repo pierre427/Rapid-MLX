@@ -61,6 +61,30 @@ struct AccessibilityIdentifierInventoryTests {
         }
     }
 
+    // MARK: - Settings → Developer (debug builds only)
+
+    /// The panel and its controls exist only in a debug build, and so does
+    /// this pin — asserting the file's contents from a release test run would
+    /// fail against source that is deliberately compiled out.
+    #if DEBUG
+    @Test("Settings → Developer names its panel and every control")
+    func settingsDeveloperPanelIdentifiers() throws {
+        try assertDeclared(
+            [
+                #""Settings.Developer.Panel""#,
+                #""Settings.Developer.Scope.Preferences""#,
+                #""Settings.Developer.Scope.Conversations""#,
+                #""Settings.Developer.Scope.Telemetry""#,
+                #""Settings.Developer.Reonboard""#,
+                #""Settings.Developer.ConfirmReonboard""#,
+                #""Settings.Developer.CancelReonboard""#,
+            ],
+            in: "Sources/Rapid/UI/SettingsDeveloperPanel.swift",
+            surface: "Settings → Developer"
+        )
+    }
+    #endif
+
     // MARK: - Settings → Tools
 
     @Test("Settings → Performance names its panel and every control")
@@ -443,14 +467,67 @@ struct AccessibilityIdentifierInventoryTests {
             in: "Sources/Rapid/UI/QuickstartView.swift",
             surface: "Onboarding"
         )
+        // The rail and the footer lane moved into the Direction D design
+        // system when the wizard's centred-card chrome was replaced. The
+        // identifiers did NOT move: golden flows address all three, and
+        // `Quickstart.Progress` in particular is matched with its exact
+        // spoken label on three screens.
         try assertDeclared(
             [
                 #""Quickstart.Progress""#,
                 #""Quickstart.Footer.Back""#,
                 #""Quickstart.Footer.Primary""#,
             ],
+            in: "Sources/Rapid/UI/OnboardingDirectionD.swift",
+            surface: "Onboarding shell"
+        )
+        try assertDeclared(
+            [
+                #""Quickstart.Choice.\(choice.alias)""#,
+                #""Quickstart.CatalogRow.\(alias)""#,
+            ],
             in: "Sources/Rapid/UI/OnboardingComponents.swift",
-            surface: "Onboarding components"
+            surface: "Onboarding model rows"
+        )
+        // Review download's read-only content. These reach the accessibility
+        // tree through a component parameter (``OnboardingFactRow`` and
+        // ``OnboardingInlineNote`` both forward `identifier` to
+        // `.accessibilityIdentifier`), so they are pinned in their declared
+        // form rather than by the modifier shape the helper above matches.
+        //
+        // `Quickstart.Review.Incompatible` is the one a harness needs in order
+        // to assert that a WON'T FIT row explains itself: without it the only
+        // evidence that the screen said anything is a screenshot.
+        let review = try strippedSource("Sources/Rapid/UI/QuickstartView.swift")
+        for identifier in [
+            "Quickstart.Review.Alias",
+            "Quickstart.Review.Size",
+            "Quickstart.Review.CachedStatus",
+            "Quickstart.Review.Memory",
+            "Quickstart.Review.UsableMemory",
+            "Quickstart.Review.FreeSpace",
+            "Quickstart.Review.Repo",
+            "Quickstart.Review.Incompatible",
+        ] {
+            #expect(
+                review.contains(#"identifier:"\#(identifier)""#),
+                """
+                Onboarding Review: QuickstartView.swift no longer declares \
+                identifier: "\(identifier)". Golden flows read Review's facts \
+                by AXIdentifier — removing one makes that fact unassertable.
+                """
+            )
+        }
+    }
+
+    // MARK: - Launch integrations
+
+    @Test("Launch integration copy buttons are individually addressable")
+    func launchIntegrationCopyIdentifiers() throws {
+        try assertDeclared(
+            [#""Launch.Integration.Copy.\(tool.id)""#],
+            in: "Sources/Rapid/UI/ConnectToolsView.swift",
+            surface: "Launch integration rows"
         )
     }
 

@@ -60,7 +60,7 @@ def fake_home(tmp_path, monkeypatch) -> Path:
 
     # claude_code: replace the two module constants.
     monkeypatch.setattr(claude_code, "_CLAUDE_STATE_DIR", tmp_path / ".claude")
-    monkeypatch.setattr(claude_code, "_CONFIG_DIR", tmp_path / ".config/claude")
+    monkeypatch.setattr(claude_code, "_CONFIG_DIR", tmp_path / ".claude")
 
     # continue_dev: replace the config dir.
     monkeypatch.setattr(continue_dev, "_CONFIG_DIR", tmp_path / ".continue")
@@ -191,7 +191,11 @@ class TestClaudeCode:
             json.dumps(
                 {
                     "permissions": {"allow": ["Bash(git:*)"]},
-                    "env": {"OTHER_VAR": "preserved", "ANTHROPIC_BASE_URL": "old"},
+                    "env": {
+                        "OTHER_VAR": "preserved",
+                        "ANTHROPIC_BASE_URL": "old",
+                        "ANTHROPIC_AUTH_TOKEN": "proxy-token",
+                    },
                 }
             )
         )
@@ -202,6 +206,7 @@ class TestClaudeCode:
         assert data["env"]["OTHER_VAR"] == "preserved"
         # Overwritten.
         assert data["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
+        assert data["env"]["ANTHROPIC_AUTH_TOKEN"] == ""
 
     def test_backup_created(self, fake_home):
         cfg = claude_code.current_config_path()
@@ -540,7 +545,8 @@ class TestLaunchCommand:
         assert excinfo.value.code == 0
         targets = json.loads(capsys.readouterr().out)
         ids = [target["id"] for target in targets]
-        assert len(ids) == len(set(ids)) == 14
+        assert len(ids) == len(set(ids)) == 15
+        assert "deepseek-harness" in ids
         assert ids[:4] == ["cline", "claude-code", "continue-dev", "cursor"]
         assert {target["kind"] for target in targets} == {
             "config_writer",
@@ -859,6 +865,19 @@ class TestLaunchCommand:
         err = capsys.readouterr().err
         assert "Skipping --start-server" in err
 
+    def test_continue_is_an_alias_for_continue_dev(self, fake_home, capsys):
+        """``launch continue`` must resolve exactly like ``launch
+        continue-dev`` (#2082): ``rapid-mlx agents`` calls the same
+        product ``continue``, so both slugs are accepted here. The
+        canonical registry id stays ``continue-dev``."""
+        (fake_home / ".continue").mkdir()
+        launch_cli.launch_command(_make_args(client="continue-dev", dry_run=True))
+        canonical_out = capsys.readouterr().out
+        launch_cli.launch_command(_make_args(client="continue", dry_run=True))
+        alias_out = capsys.readouterr().out
+        assert alias_out == canonical_out
+        assert "continue-dev: detected=True" in alias_out
+
     def test_uses_original_alias_when_resolved(self, fake_home, capsys):
         """When ``main()`` rewrites ``args.model`` from alias to HF id,
         the launch command should patch with the ORIGINAL alias so the
@@ -901,6 +920,21 @@ def test_launch_help_text_is_registered(tmp_path):
     # And accept `list` as a client name.
     args = parser.parse_args(["launch", "list"])
     assert args.client == "list"
+
+
+def test_launch_help_lists_canonical_name_with_alias_noted():
+    """The client help keeps ``continue-dev`` as the canonical name and
+    notes the ``continue`` alias (#2082)."""
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    from vllm_mlx.launch.cli import register
+
+    register(sub)
+    # argparse wraps help text at arbitrary columns; normalize whitespace
+    # before matching so the assertion doesn't depend on wrap width.
+    help_text = " ".join(sub.choices["launch"].format_help().split())
+    assert "continue-dev" in help_text
+    assert "Aliases: continue (for continue-dev)" in help_text
 
 
 @pytest.mark.parametrize("bad_port", ["0", "-1", "65536", "99999", "abc"])

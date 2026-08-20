@@ -35,12 +35,14 @@ exec /usr/bin/env python3 - "$@" <<'PYEOF'
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import struct
 import sys
 import threading
 import time
+import wave
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -74,6 +76,17 @@ except (OSError, ValueError):
 
 def _setting(name, default=None):
     return os.environ.get(name, FILE_CONFIG.get(name, default))
+
+
+def _pulled_audio_aliases():
+    state_path = _setting("FAKE_AUDIO_PULL_STATE")
+    if not state_path:
+        return set()
+    try:
+        with open(state_path) as stream:
+            return {line.strip() for line in stream if line.strip()}
+    except OSError:
+        return set()
 
 
 def _parse_args(argv):
@@ -152,6 +165,8 @@ RESPONSE_SHAPES = {
         "The Gaussian integral is\n\n",
         "$$\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}$$",
         "\n\nand inline it reads $e^{i\\pi} + 1 = 0$.",
+        "\n\nA bridged congruence is $$a^{p-1} \\equiv 1 \\mod p$$.",
+        "\n\nA bridged alignment is $$\\begin{align}x &= 1 \\\\ y &= \\boxed{2}\\end{align}$$.",
     ],
     "shape:list": [
         "Three things, in order:\n\n",
@@ -543,12 +558,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models/residency":
             self._json(200, self._residency_snapshot())
             return
-        if self.path == "/v1/images/progress":
+        if self.path.partition("?")[0] == "/v1/images/progress":
             # Polled every few hundred ms while a render is in flight. Answer
             # it even when nothing is running: the client treats a transport
             # failure and "idle" identically, so a 404 here would be
             # indistinguishable from the daemon being down.
             self._json(200, RENDERS.snapshot())
+            return
+        if self.path.partition("?")[0] == "/v1/audio/voices":
+            _event("audio_voices")
+            self._json(200, {"voices": ["Golden", "Harbor"]})
             return
         self._json(404, {"error": "not_found"})
 
@@ -614,6 +633,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
         target = body.get("model") if isinstance(body.get("model"), str) else ""
         _event("model_load", alias=target)
+        delay_ms = int(_setting("FAKE_RESIDENT_LOAD_DELAY_MS", "0") or "0")
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
         if _setting("FAKE_REJECT_IMAGE_LOAD") == "1" and target == FAKE_IMAGE_ALIAS:
             # The engine refuses to admit this model (missing Python extra).
             # Mirror the real server's rejection envelope so
@@ -694,6 +716,10 @@ class Handler(BaseHTTPRequestHandler):
             if RENDERS.advance():
                 cancelled = True
                 break
+        # Real image engines still perform VAE decode / PNG encoding after the
+        # last denoise step. Keep that tail observable for GUI phase coverage.
+        finish_ms = max(0, int(_setting("FAKE_IMAGE_FINISH_MS", 0)))
+        time.sleep(finish_ms / 1000)
         RENDERS.end()
         png = _one_pixel_png(((index * 70) % 256, (index * 130) % 256, (index * 190) % 256))
         encoded = base64.b64encode(png).decode("ascii")
@@ -727,6 +753,42 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/images/edits":
             self._images_generate(editing=True)
+            return
+        if self.path == "/v1/audio/speech":
+            length = int(self.headers.get("content-length", "0") or "0")
+            body = json.loads(self.rfile.read(length) or b"{}")
+            _event(
+                "audio_speech",
+                model=body.get("model"),
+                voice=body.get("voice"),
+                speed=body.get("speed"),
+                text=body.get("input"),
+            )
+            audio = io.BytesIO()
+            with wave.open(audio, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                # Long enough for the AX flow to observe Play -> Stop, while
+                # still tiny and silent for unattended GUI tests.
+                wav.writeframes(b"\x00\x00" * 32000)
+            payload = audio.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path == "/v1/audio/transcriptions":
+            length = int(self.headers.get("content-length", "0") or "0")
+            if length:
+                self.rfile.read(length)
+            _event("audio_transcription")
+            self._json(200, {
+                "text": "Golden transcription result.",
+                "language": "en",
+                "duration": 0.1,
+            })
             return
         if self.path != "/v1/chat/completions":
             self._json(404, {"error": "not_found"})
@@ -873,10 +935,22 @@ def _emit_catalog(subcommand, alias):
     """
     if subcommand == "models":
         print("Available models")
-        print("Alias                  Parser           Reasoning")
-        print("---------------------  ---------------  ---------")
+        print("Alias                  Parser           Reasoning        Preset")
+        print("---------------------  ---------------  ---------------  --------")
+        if _setting("FAKE_INCLUDE_STARTER") == "1":
+            # A production catalog always contains the onboarding starter.
+            # Most flows deliberately keep the compact single-chat-row
+            # fixture, but fresh-install must exercise the real default
+            # selection contract rather than falling back to fake-alias.
+            print("lfm2.5-1b-4bit        hermes           none")
+        if _setting("FAKE_CACHED_CURATED_TRADEUP") == "1":
+            for index in range(6):
+                print(f"a-cached-{index}             hermes           none")
+            print("qwen3.5-4b-4bit       hermes           qwen3")
         print("fake-alias             hermes           qwen3")
         print("fake-external-alias    hermes           qwen3")
+        if _setting("FAKE_SETTINGS_MTP") == "1":
+            print("qwen3.8-27b-4bit       hermes           qwen3           MTP@rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX@3")
         # A video-generation row, in the tagged section the real engine
         # emits (#1607). It has no tokenizer and cannot answer a chat
         # request, so the desktop must filter it out of every catalog
@@ -898,6 +972,12 @@ def _emit_catalog(subcommand, alias):
         print("Alias                  Size       Kind        HF id")
         print("---------------------  ---------  ----------  ------")
         print(f"{FAKE_IMAGE_ALIAS}       4.6 GiB    [image:both] {FAKE_IMAGE_REPO}")
+        print()
+        print("Audio models (2 aliases)")
+        print("Alias                  Size       Kind        Family      HF id")
+        print("---------------------  ---------  ----------  ----------  ------")
+        print("fake-qwen3-tts         1.1 GiB    [audio:tts] qwen3_tts   fake/qwen3-tts")
+        print("fake-whisper-small     461 MiB    [audio:stt] whisper     fake/whisper-small")
         return True
     if subcommand == "ls":
         if _setting("FAKE_EMPTY_CACHE_NOTICE") == "1":
@@ -905,11 +985,29 @@ def _emit_catalog(subcommand, alias):
         print("Cached models")
         print("Alias                  Repo                   Size")
         print("---------------------  ---------------------  ------")
-        print(f"fake-alias             {FAKE_REPO}        1.2 GB")
-        print("(external)             fake-external-alias     2.4 GB")
+        if _setting("FAKE_SETTINGS_MTP") != "1":
+            print(f"fake-alias             {FAKE_REPO}        1.2 GB")
+            print("(external)             fake-external-alias     2.4 GB")
+        if _setting("FAKE_CACHED_CURATED_TRADEUP") == "1":
+            for index in range(6):
+                print(f"a-cached-{index}             fake-org/a-cached-{index}        100 MB")
+            print("qwen3.5-4b-4bit       mlx-community/Qwen3.5-4B-MLX-4bit  2.9 GB")
+        if _setting("FAKE_SETTINGS_MTP") == "1":
+            print("qwen3.8-27b-4bit       rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX  15.2 GB")
         # Cached, so the Images tab resolves to it without a download path —
         # ``ImageGenViewModel.resolveAlias`` prefers a cached entry.
         print(f"{FAKE_IMAGE_ALIAS}       {FAKE_IMAGE_REPO}  4.6 GB")
+        pulled_audio = _pulled_audio_aliases()
+        if "fake-qwen3-tts" in pulled_audio:
+            print("fake-qwen3-tts         fake/qwen3-tts        1.1 GiB")
+        elif _setting("FAKE_PARTIAL_AUDIO_CACHE") == "1":
+            # A real interrupted multi-shard pull remains visible in `ls` for
+            # disk cleanup, but its status alias must never make Audio render
+            # Start. The audio-readiness flow clicks through this row and
+            # requires a resumptive `pull fake-qwen3-tts`.
+            print("(incomplete)           fake/qwen3-tts        633 MB")
+        if "fake-whisper-small" in pulled_audio:
+            print("fake-whisper-small     fake/whisper-small    461 MiB")
         return True
     if subcommand == "info":
         # Per-alias, not a constant: `ls`/`models` map fake-image-alias to its
@@ -920,6 +1018,9 @@ def _emit_catalog(subcommand, alias):
         repo = {
             FAKE_IMAGE_ALIAS: FAKE_IMAGE_REPO,
             "fake-video-alias": "fake/video-mlx",
+            "fake-qwen3-tts": "fake/qwen3-tts",
+            "fake-whisper-small": "fake/whisper-small",
+            "qwen3.8-27b-4bit": "rapid-mlx/Qwen3.8-27B-4bit-MTP-MLX",
         }.get(alias, FAKE_REPO)
         print(f"Alias: {alias} -> {repo}")
         return True
@@ -978,6 +1079,10 @@ def main():
             # for the AX flow to inspect the in-flight progress card.
             print("[bytes] 663748608/590348288", flush=True)
             time.sleep(5)
+            state_path = _setting("FAKE_AUDIO_PULL_STATE")
+            if state_path and args.alias in {"fake-qwen3-tts", "fake-whisper-small"}:
+                with open(state_path, "a") as stream:
+                    stream.write(f"{args.alias}\n")
             sys.exit(0)
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)

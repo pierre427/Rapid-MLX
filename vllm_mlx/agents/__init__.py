@@ -33,7 +33,14 @@ _LOADED = False
 # adding duplicate rows to ``rapid-mlx agents``.  Claude's executable is named
 # ``claude``, while the product and launch adapter use ``claude-code``; users
 # reasonably try either spelling.
-_PROFILE_ALIASES = {"claude": "claude-code"}
+_PROFILE_ALIASES = {
+    "claude": "claude-code",
+    "dsh": "deepseek-harness",
+    # ``rapid-mlx launch`` calls the same product ``continue-dev`` (the
+    # launch registry avoids the bare Python keyword in its module
+    # names), so both slugs must resolve here too — see issue #2082.
+    "continue-dev": "continue",
+}
 
 PROFILES_DIR = Path(__file__).parent / "profiles"
 
@@ -103,6 +110,12 @@ def _load_profile_from_yaml(path: Path) -> AgentProfile:
     return AgentProfile(
         name=data["name"],
         display_name=data.get("display_name", data["name"]),
+        # Clamp to the two known kinds: an unknown value (typo in a user
+        # overlay YAML) counts as a plain agent instead of poisoning the
+        # footer arithmetic or hard-failing profile loading.
+        kind=(
+            data.get("kind") if data.get("kind") in ("agent", "framework") else "agent"
+        ),
         repo=data.get("repo"),
         stars=data.get("stars"),
         config=_parse_config(data),

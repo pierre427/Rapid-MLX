@@ -66,9 +66,24 @@ final class MarkdownTextRenderer {
     /// streaming typing dot. Custom-drawn text views publish this through AX.
     var accessibleText: String {
         guard let storage = textContentStorage.textStorage else { return "" }
-        return (storage.string as NSString).substring(
-            with: NSRange(location: 0, length: min(proseLength, storage.length))
-        )
+        let range = NSRange(location: 0, length: min(proseLength, storage.length))
+        let source = NSMutableString(string: (storage.string as NSString).substring(with: range))
+
+        // NSTextAttachment occupies one U+FFFC character in the backing
+        // string. That is correct for layout, but this custom-drawn view uses
+        // this value as its entire accessibility surface: leaving the object
+        // replacement character here makes VoiceOver announce a hole where
+        // the formula is. Replace math attachments from the tail so earlier
+        // ranges stay valid while the string grows.
+        var replacements: [(NSRange, String)] = []
+        storage.enumerateAttribute(.attachment, in: range) { value, attachmentRange, _ in
+            guard let math = value as? InlineMathAttachment else { return }
+            replacements.append((attachmentRange, "$\(math.latex)$"))
+        }
+        for (attachmentRange, latex) in replacements.reversed() {
+            source.replaceCharacters(in: attachmentRange, with: latex)
+        }
+        return source as String
     }
 
     private func typingDotString(trailing prose: NSAttributedString) -> NSAttributedString {
@@ -118,15 +133,48 @@ final class MarkdownTextRenderer {
     /// Resolve a rendered link at a view-local point. TextKit's drawing-only
     /// host has no NSTextView delegate to do this on our behalf.
     func link(at point: CGPoint) -> URL? {
-        guard let storage = textContentStorage.textStorage else { return nil }
+        linkRegions().first { $0.rect.contains(point) }?.url
+    }
+
+    /// Bounding rects of every link run, for cursor tracking.
+    ///
+    /// One rect per run rather than per character: adjacent character rects on
+    /// the same line are merged, so a link is a single tracking area instead of
+    /// dozens.
+    func linkRects() -> [CGRect] {
+        linkRegions().map(\.rect)
+    }
+
+    /// Geometry for each laid-out line segment carrying a link.
+    ///
+    /// TextKit already splits an attributed range at line boundaries. Asking
+    /// it for those segments avoids both per-character geometry calls and the
+    /// fragile `minY` tolerance previously used to merge character rects.
+    private func linkRegions() -> [(url: URL, rect: CGRect)] {
+        guard let storage = textContentStorage.textStorage else { return [] }
         textLayoutManager.ensureLayout(for: textContentStorage.documentRange)
-        for offset in 0..<min(proseLength, storage.length) {
-            guard let rect = rect(forCharacterAt: offset), rect.contains(point),
-                  let url = storage.attribute(.link, at: offset, effectiveRange: nil) as? URL
-            else { continue }
-            return url
+        var regions: [(url: URL, rect: CGRect)] = []
+        storage.enumerateAttribute(
+            .link,
+            in: NSRange(location: 0, length: min(proseLength, storage.length))
+        ) { value, range, _ in
+            guard let url = value as? URL,
+                  let start = textContentStorage.location(
+                    textContentStorage.documentRange.location,
+                    offsetBy: range.location
+                  ),
+                  let end = textContentStorage.location(start, offsetBy: range.length),
+                  let textRange = NSTextRange(location: start, end: end)
+            else { return }
+
+            textLayoutManager.enumerateTextSegments(
+                in: textRange, type: .standard, options: []
+            ) { _, frame, _, _ in
+                regions.append((url, frame))
+                return true
+            }
         }
-        return nil
+        return regions
     }
 
     /// Lay out at a given width and report the height the text needs.
@@ -264,6 +312,33 @@ final class MarkdownTextRenderer {
             .paragraphStyle: paragraphStyle,
             .foregroundColor: options.textColor,
         ]
+
+        // Inline math becomes one attachment character. Falling through to the
+        // prose path when rasterising fails is deliberate: an unparseable body
+        // renders as the `$…$` the author typed, which is worse than a formula
+        // and much better than a blank.
+        if let latex = run.math,
+           let image = InlineMathImage.image(
+               latex: latex,
+               pointSize: options.textPointSize,
+               color: options.textColor
+           ) {
+            let attachment = InlineMathAttachment(
+                latex: latex, image: image, pointSize: options.textPointSize
+            )
+            let string = NSMutableAttributedString(attachment: attachment)
+            string.addAttributes(
+                [.paragraphStyle: paragraphStyle],
+                range: NSRange(location: 0, length: string.length)
+            )
+            if let link = run.link {
+                string.addAttribute(
+                    .link, value: link,
+                    range: NSRange(location: 0, length: string.length)
+                )
+            }
+            return string
+        }
 
         if run.isInlineCode {
             attributes[.font] = NSFont.monospacedSystemFont(

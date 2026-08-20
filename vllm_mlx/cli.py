@@ -146,6 +146,25 @@ def non_negative_int(value: str) -> int:
     return n
 
 
+def positive_int(value: str) -> int:
+    """Argparse ``type`` callable: parse a strictly positive integer."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {value!r}"
+        ) from None
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {n}")
+    return n
+
+
+def _vision_pixel_bounds_error(min_pixels: int, max_pixels: int) -> str | None:
+    if min_pixels and max_pixels and min_pixels > max_pixels:
+        return "--vision-min-pixels must not exceed --vision-max-pixels"
+    return None
+
+
 def positive_finite_float(value: str) -> float:
     """Argparse type for positive, finite resource-budget values."""
     import math
@@ -275,6 +294,19 @@ def _port_preflight_or_die(host: str, port: int, *, model: str) -> None:
     the ``AF_INET`` socket and was misreported as "port already in use").
     """
     import socket
+
+    # Validate the port range up front. ``socket.bind()`` raises
+    # ``OverflowError`` (NOT an ``OSError`` subclass) for a port outside
+    # 0-65535, so the ``except OSError`` collision handler below would let
+    # it escape as a raw traceback (dogfood #2125: ``--port 99999`` printed
+    # ``OverflowError: bind(): port must be 0-65535`` instead of a friendly
+    # message). Catch the typo here — before any probe — and emit the same
+    # actionable style as the port-in-use path. ``0`` stays valid: it asks
+    # the OS for an ephemeral port, which uvicorn binds normally.
+    if not 0 <= port <= 65535:
+        print(f"\n  Error: --port {port} is out of range. Ports must be 0-65535.")
+        print(f"  Try a valid port: rapid-mlx serve {model} --port 8000")
+        sys.exit(1)
 
     wildcards = _wildcard_host_aliases()
     if host in wildcards:
@@ -509,14 +541,20 @@ def _print_unknown_model_help(name: str, *, full_path_example: str) -> None:
     supported). Now: always show *something* — fuzzy matches when we have
     them, curated popular aliases when we don't.
     """
-    from vllm_mlx.model_aliases import POPULAR_ALIASES, list_aliases, suggest_similar
+    from vllm_mlx.model_aliases import POPULAR_ALIASES, suggest_similar
 
     suggestions = suggest_similar(name)
     if suggestions:
         print(f"  Did you mean: {', '.join(suggestions)}?")
     else:
         print(f"  Try one of: {', '.join(POPULAR_ALIASES)}")
-    print(f"  Run `rapid-mlx models` to see all {len(list_aliases())} aliases,")
+    # No hardcoded alias total here. ``models`` splits the registry into
+    # tagged sections (chat / audio / video / image), each with its own
+    # accurate per-section count, so a single grand total printed here can
+    # only contradict the first header a user lands on (dogfood #2126:
+    # this line said "182 aliases" while ``models`` opened with "172").
+    # Let ``models`` be the single source of truth for the counts.
+    print("  Run `rapid-mlx models` to see all available aliases,")
     print(f"  or pass a full path like: {full_path_example}")
 
 
@@ -729,6 +767,8 @@ def _serve_audio_mode(args, entry) -> None:
 
     # CORS — same friendly default the text path uses.
     server.configure_cors_from_env(args.cors_origins)
+    # WH-1: OPT-IN Host-header allowlist (DNS-rebinding hardening).
+    server.configure_trusted_hosts(getattr(args, "trusted_hosts", None))
     if args.rate_limit > 0:
         server._rate_limiter = configure_rate_limiter(args.rate_limit, enabled=True)
 
@@ -1887,6 +1927,47 @@ def _build_benchmark_context(target_tokens: int) -> str:
     return (block * repeats).strip()
 
 
+def _alias_mtp_declaration(model_name) -> tuple[str | None, int | None]:
+    """Return ``(mtp_draft_model, mtp_speculative_tokens)`` declared by an alias.
+
+    ``(None, None)`` when the model is not a known alias, declares no MTP
+    sidecar, or the registry cannot be read. Resolution is best-effort by
+    design: this only supplies DEFAULTS for a request that already asked for
+    MTP, so a registry problem must degrade to "no default" and let the
+    injector's own hard-fail speak — never turn a serve into a crash of its
+    own (#1998).
+
+    ``mtp_speculative_tokens`` is returned only when it is a positive int. The
+    alias schema already rejects the alternatives (``model_aliases`` requires
+    ``mtp_draft_model`` alongside it), so this is belt-and-braces against a
+    hand-edited registry rather than a live shape.
+    """
+    if not model_name:
+        return None, None
+    try:
+        from .model_aliases import resolve_profile as _resolve_alias
+
+        profile = _resolve_alias(model_name)
+    except Exception:  # noqa: BLE001 — see docstring: never fail the serve here
+        return None, None
+    if profile is None:
+        return None, None
+    # Type-check BEFORE ``.strip()``: the value reaches us straight off a
+    # profile object, and a non-str there would raise ``AttributeError`` out of
+    # this helper — breaking the totality the docstring promises, in the exact
+    # hand-edited-registry case it promises it for (codex nit).
+    raw_sidecar = getattr(profile, "mtp_draft_model", None)
+    sidecar = raw_sidecar.strip() or None if isinstance(raw_sidecar, str) else None
+    if sidecar is None:
+        # Depth without a sidecar is meaningless — the injector has nothing to
+        # load — so don't hand back a lone K either.
+        return None, None
+    depth = getattr(profile, "mtp_speculative_tokens", None)
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
+        depth = None
+    return sidecar, depth
+
+
 def _normalize_speculative_config_or_exit(args):
     """Parse ``--speculative-config`` and map methods to runtime fields."""
     import json
@@ -2195,9 +2276,23 @@ def _normalize_speculative_config_or_exit(args):
                 args.mtp_num_draft_tokens = config.num_speculative_tokens
             if legacy_mtp_optimistic_requested:
                 args.mtp_optimistic = True
-        args.mtp_sidecar = config.model
+        # #1998: an alias may DECLARE its own MTP sidecar and draft depth
+        # (``mtp_draft_model`` / ``mtp_speculative_tokens``). Those were
+        # rendered by ``rapid-mlx models`` as ``✓ MTP  MTP@<repo>@<k>`` and
+        # then read NOWHERE on the serve path, so the command that listing
+        # implies — ``serve <alias> --speculative-config '{"method":"mtp"}'``
+        # — reached the injector with ``sidecar=None`` and hard-failed at
+        # boot, quoting an unrelated model in the remedy. Fill ONLY what the
+        # request left unset; an explicit ``model`` /
+        # ``num_speculative_tokens`` in the JSON always wins.
+        alias_sidecar, alias_k = _alias_mtp_declaration(getattr(args, "model", None))
+        args.mtp_sidecar = config.model or alias_sidecar
         if config.num_speculative_tokens is not None:
             args.mtp_max_k = config.num_speculative_tokens
+        elif alias_k is not None:
+            # A depth the alias declares for THIS checkpoint beats the generic
+            # --force-spec-decode fallback below: it is the more specific fact.
+            args.mtp_max_k = alias_k
         elif getattr(args, "force_spec_decode", False):
             # User explicitly opted into spec-decode via --force-spec-decode
             # but didn't pin a draft depth. K=1 chain-of-1 carries draft
@@ -2388,6 +2483,89 @@ def _resolve_hybrid_cache_entries(
     return explicit_value
 
 
+def _config_declares_sliding_window(config: dict | None) -> bool:
+    """True if the checkpoint config declares sliding-window (local) attention.
+
+    Gemma-2/3/4 and other local-attention families run their sliding layers on
+    ``RotatingKVCache``, which reports ``is_trimmable() == False`` once the ring
+    has rotated past its window (the front is overwritten, so a trim-then-
+    continue would reconstruct wrong KV — see ``memory_cache`` ``_layer_forbids_
+    trim``). Such a cache is non-trimmable but still REUSABLE at an exact token
+    boundary, so these models need the bounded trim-free snapshot path — exactly
+    like the recurrent-state families — or every agentic turn re-prefills the
+    whole accumulated context (#2061).
+
+    The signal is read straight off the checkpoint config so it is
+    architecture-driven rather than a name list: it covers the whole sliding-
+    window family, future additions, and bare local paths that resolve to no
+    alias.
+
+    The LANGUAGE backbone's attention config is authoritative — VLM checkpoints
+    nest it under ``text_config``, so that is judged first and alone when it
+    carries a signal (a top-level ``sliding_window`` scalar on such a checkpoint
+    is often a vision/default value unrelated to the LM's attention). Within the
+    chosen config, ``layer_types`` (Gemma-3/4's explicit per-layer attention
+    kinds) is authoritative: a config listing only ``full_attention`` is NOT
+    sliding even if it also carries a leftover ``sliding_window`` value (that
+    field is inert without a sliding layer to apply it). A bare positive
+    ``sliding_window`` is consulted only as the fallback for older configs that
+    omit ``layer_types``. Only if the nested language config carries no signal
+    at all does the top level get a look, for checkpoints that place attention
+    fields at the root.
+    """
+    if not isinstance(config, dict):
+        return False
+
+    def _level_signal(cfg: object) -> bool | None:
+        """True/False if ``cfg`` declares sliding-window state, None if it
+        carries no attention signal at all (so the caller may look elsewhere)."""
+        if not isinstance(cfg, dict):
+            return None
+        layer_types = [
+            lt for lt in (cfg.get("layer_types") or []) if isinstance(lt, str)
+        ]
+        if layer_types:
+            return any("sliding" in lt for lt in layer_types)
+        # Qwen2 / Mistral carry a ``sliding_window`` scalar but gate it behind an
+        # explicit ``use_sliding_window`` flag — a positive scalar with the flag
+        # off is inert, so honour the disable before the legacy scalar. Treating
+        # it as active would auto-allocate bounded snapshots and regress memory.
+        if cfg.get("use_sliding_window") is False:
+            return False
+        sliding_window = cfg.get("sliding_window")
+        if isinstance(sliding_window, int):
+            return sliding_window > 0
+        return None
+
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        nested = _level_signal(text_config)
+        if nested is not None:
+            return nested
+    return bool(_level_signal(config))
+
+
+def _resolve_checkpoint_config(model_name: str, profile) -> dict | None:
+    """Read the checkpoint ``config.json`` for ``model_name`` offline.
+
+    Works for a bare local path or HF repo id directly, and for a registered
+    alias by resolving it to its ``hf_path`` (the alias name itself is not a
+    readable checkpoint dir). Never touches the network — mirrors the offline
+    metadata probes ``is_mllm_model`` already relies on.
+    """
+    from .api.utils import read_model_metadata
+
+    metadata = read_model_metadata(model_name)
+    if metadata is not None and metadata.config:
+        return metadata.config
+    hf_path = getattr(profile, "hf_path", None) if profile is not None else None
+    if isinstance(hf_path, str) and hf_path and hf_path != model_name:
+        metadata = read_model_metadata(hf_path)
+        if metadata is not None and metadata.config:
+            return metadata.config
+    return None
+
+
 def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
     """Whether this model's cache can reuse prefixes but not trim exact hits."""
     from .model_aliases import resolve_profile as _resolve_alias
@@ -2416,6 +2594,20 @@ def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
         # so no throttle, no snapshot path, no wedge.
         if profile.is_hybrid_explicit and not profile.is_hybrid:
             return True
+
+    # Sliding-window attention families (Gemma-2/3/4, …) carry RotatingKVCache
+    # local-attention layers that go non-trimmable once the ring rotates past
+    # their window, so — like the recurrent families above — they can only
+    # reuse a prefix through the bounded snapshot path, never the ordinary
+    # trimmable prefix cache. Without this, --enable-prefix-cache is a silent
+    # no-op for them and every agentic turn re-prefills the whole accumulated
+    # context (#2061). Detected from the checkpoint config (architecture-driven,
+    # so it also covers a bare local path that resolves to no alias, which is
+    # exactly how #2061 was served). This does NOT touch routing — is_hybrid is
+    # untouched, so no throttle and no hybrid allocation path / wedge.
+    if _config_declares_sliding_window(_resolve_checkpoint_config(model_name, profile)):
+        return True
+
     return is_deepseek_v4_0731(model_name)
 
 
@@ -2519,6 +2711,13 @@ def serve_command(args):
     import logging
     import os
     import sys
+
+    if bounds_error := _vision_pixel_bounds_error(
+        getattr(args, "vision_min_pixels", 0),
+        getattr(args, "vision_max_pixels", 0),
+    ):
+        print(f"error: {bounds_error}", file=sys.stderr)
+        raise SystemExit(2)
 
     if os.environ.get("RAPID_PYSAMPLE"):
         from ._pysample import install as _pysample_install
@@ -2855,6 +3054,13 @@ def serve_command(args):
     if getattr(args, "resident_model_idle_ttl", 0.0) < 0:
         print("Error: --resident-model-idle-ttl must be >= 0")
         sys.exit(1)
+    idle_cache_clear_seconds = getattr(args, "idle_cache_clear_seconds", None)
+    if idle_cache_clear_seconds is not None:
+        import math
+
+        if not math.isfinite(idle_cache_clear_seconds) or idle_cache_clear_seconds < 0:
+            print("Error: --idle-cache-clear-seconds must be finite and >= 0")
+            sys.exit(1)
 
     # Validate PFlash config and reject unsupported model combinations
     # at startup. Done here (not lazily in the scheduler) so a typo in
@@ -3128,6 +3334,9 @@ def serve_command(args):
     # when ``*`` is in the origin list. Operators who need cookie /
     # ``Authorization`` auto-forwarding must pin to specific origins.
     cors_origins = server.configure_cors_from_env(args.cors_origins)
+
+    # WH-1: OPT-IN Host-header allowlist (DNS-rebinding hardening).
+    server.configure_trusted_hosts(getattr(args, "trusted_hosts", None))
 
     # Request logging middleware — installed AFTER CORS so it is the
     # outermost layer (Starlette prepends, so last install runs first).
@@ -3583,6 +3792,7 @@ def serve_command(args):
         use_memory_aware_cache=not args.no_memory_aware_cache,
         cache_memory_mb=args.cache_memory_mb,
         cache_memory_percent=args.cache_memory_percent,
+        idle_cache_clear_seconds=getattr(args, "idle_cache_clear_seconds", None),
         # #1103/#1122: bounded trim-free hybrid (recurrent-state) prefix reuse.
         # Auto-defaulted to 8 for hybrid models when prefix cache is enabled.
         hybrid_cache_entries=_hybrid_cache_entries,
@@ -3607,6 +3817,8 @@ def serve_command(args):
         # accepted but never used. See #400 and the CLI ↔ Config fidelity
         # audit at scripts/audit_cli_config_fidelity.py.
         prefill_step_size=args.prefill_step_size,
+        vision_min_pixels=getattr(args, "vision_min_pixels", 0),
+        vision_max_pixels=getattr(args, "vision_max_pixels", 0),
         # Speculative decoding selection.
         enable_mtp=getattr(args, "enable_mtp", False),
         mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", 1),
@@ -4325,7 +4537,7 @@ def _run_submit_flow(
     # thread executor spins up. Without this, ``mlx_lm.load`` runs inside
     # the executor and delegates to ``huggingface_hub.snapshot_download``
     # directly, skipping the mirror entirely (bug: --submit diverged from
-    # ``serve``/``chat``/``pull``/``jlens`` which all prefetch via the
+    # ``serve``/``chat``/``pull`` which all prefetch via the
     # mirror first). Running this in the main thread — before the executor
     # is created — surfaces the mirror's per-file progress lines to the
     # contributor's terminal; if we deferred to the executor, the tqdm
@@ -4378,9 +4590,12 @@ def _run_submit_flow(
             # in mlx-vlm (the model classes are vision-aware even for the
             # text-only checkpoints), so a bare ``pip install rapid-mlx``
             # without the ``[vision]`` extras hits this every time. The
-            # README still recommends ``gemma-4-*`` aliases so newcomers
-            # would otherwise see a raw traceback and conclude the model
-            # is broken — translate to an actionable hint. Placed BEFORE
+            # ``gemma-4-*`` aliases are still in the served catalog (no
+            # recommendation surface points at them anymore, but
+            # ``rapid-mlx models`` lists them), so anyone picking one on
+            # a base install would otherwise see a raw traceback and
+            # conclude the model is broken — translate to an actionable
+            # hint. Placed BEFORE
             # the broader ``OSError`` clause so a future maintainer can't
             # accidentally make the broad branch swallow it (Codex PR
             # #600 round-1 BLOCKING).
@@ -4616,7 +4831,7 @@ def bench_command(args):
     # heavy bench boot. Without this, ``bench`` falls into ``mlx_lm.load``
     # → ``huggingface_hub.snapshot_download`` directly and skips the
     # mirror entirely, wasting the user's bandwidth and hitting HF rate
-    # limits (bug: bench diverged from ``serve``/``chat``/``pull``/``jlens``
+    # limits (bug: bench diverged from ``serve``/``chat``/``pull``
     # which all prefetch via the mirror first).
     # ``_ensure_model_downloaded`` is a no-op on local paths and on
     # fully-cached repos and swallows mirror errors gracefully (mlx_lm.load
@@ -5253,9 +5468,14 @@ def _cache_entry_is_runnable(repo: str) -> bool:
         from vllm_mlx._download_gate import (
             _snapshot_is_complete_mflux_model,
             _snapshot_is_complete_split_model,
+            _snapshot_is_complete_whisper_model,
             is_repo_cached,
         )
+        from vllm_mlx.audio.registry import resolve_audio_alias
 
+        audio_entry = resolve_audio_alias(repo)
+        if audio_entry is not None and audio_entry.family == "whisper":
+            return _snapshot_is_complete_whisper_model(repo)
         return (
             is_repo_cached(repo)
             or _snapshot_is_complete_split_model(repo)
@@ -5344,10 +5564,11 @@ def _print_cached_models() -> None:
         if is_external_row:
             alias = "(external)"
         # Keep partial directories visible for disk cleanup, but never label
-        # a known alias as downloaded/runnable. The desktop parser deliberately
-        # rejects parenthesized status rows, so this also prevents a 61 MiB
-        # metadata stub for a 26B model from receiving a green checkmark.
-        elif alias != "(unmapped)" and not _cache_entry_is_runnable(repo):
+        # one as downloaded/runnable. This includes unmapped audio repos: the
+        # desktop joins those to its audio registry by HF id, so leaving a
+        # partial row as `(unmapped)` gives it a green checkmark and Start.
+        # The desktop deliberately rejects `(incomplete)` status rows.
+        elif not _cache_entry_is_runnable(repo):
             alias = "(incomplete)"
         # Render modified as a human delta: "2 days ago" beats raw epoch.
         if mtime <= 0:
@@ -5384,10 +5605,18 @@ def _print_cached_models() -> None:
 
 
 def recipe_command(args) -> None:
-    """Recommend exactly two curated models for this Mac's RAM tier."""
+    """Recommend exactly two curated models for this Mac's RAM tier.
+
+    Recommendations stay anchored to the shared, curated RAM-tier SSOT. Disk
+    pressure is presentation state, not a reason to silently substitute a
+    lower-quality model: an unavailable pick remains visible, but we do not
+    print a copy-paste ``serve`` command that is known to fail mid-download.
+    """
     import json
+    import math
 
     from vllm_mlx.model_aliases import resolve_profile
+    from vllm_mlx.model_sizes import size_bytes
     from vllm_mlx.recommendations import physical_ram_gb, recommendation_payload
 
     ram_gb = (
@@ -5399,6 +5628,14 @@ def recipe_command(args) -> None:
         raise SystemExit("Could not detect physical RAM. Pass --max-ram GB explicitly.")
     payload = recommendation_payload(ram_gb)
     cached_repos = {repo.casefold() for repo, _, _ in _scan_hf_cache_models()}
+    free_disk_gb = _recipe_free_disk_gb()
+    # Free space rounds DOWN while required space below rounds UP for display.
+    # Fit itself still compares the unrounded measurements: presentation must
+    # not reject a download that really has enough room. Two directed decimal
+    # places ensure a failing boundary cannot render as equal values.
+    payload["free_disk_gb"] = (
+        None if free_disk_gb is None else math.floor(free_disk_gb * 100) / 100
+    )
     for pick in payload["picks"]:
         try:
             profile = resolve_profile(pick["alias"])
@@ -5406,7 +5643,35 @@ def recipe_command(args) -> None:
         except ValueError:
             hf_path = None
         pick["hf_path"] = hf_path
-        pick["cached"] = bool(hf_path and hf_path.casefold() in cached_repos)
+        pick["cached"] = bool(
+            hf_path
+            and hf_path.casefold() in cached_repos
+            and _cache_entry_is_runnable(hf_path)
+        )
+        # ``footprint_gb`` is measured 8K peak RAM, not bytes on disk. Use the
+        # checked-in download-size manifest that powers ``rapid-mlx models``;
+        # this keeps recipe offline and prevents a 20 GB RAM peak from being
+        # misreported as a 20 GB download. Match the live download gate's 10%
+        # headroom for xet temporary files and the final cache move.
+        download_bytes = 0 if pick["cached"] else size_bytes(hf_path or "")
+        required_disk_gb = (
+            None if download_bytes is None else (download_bytes * 1.1) / float(1 << 30)
+        )
+        pick["download_size_gb"] = (
+            None
+            if download_bytes is None
+            else round(download_bytes / float(1 << 30), 1)
+        )
+        pick["required_disk_gb"] = (
+            None
+            if required_disk_gb is None
+            else math.ceil(required_disk_gb * 100) / 100
+        )
+        pick["disk_fit"] = (
+            None
+            if free_disk_gb is None or required_disk_gb is None
+            else free_disk_gb >= required_disk_gb
+        )
 
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -5418,7 +5683,11 @@ def recipe_command(args) -> None:
     )
     labels = {"smart": "Smart", "fast": "Fast"}
     for index, pick in enumerate(payload["picks"], start=1):
-        stats = [f"{pick['footprint_gb']:.1f} GB"]
+        # Label the footprint as RAM: it is measured 8K peak memory, a
+        # different axis from the on-disk ``required_disk_gb`` shown in the
+        # won't-fit line below. Without the label the two GB numbers read as
+        # contradictory (e.g. "20.0 GB" then "needs ~16.72 GB").
+        stats = [f"{pick['footprint_gb']:.1f} GB RAM"]
         if pick.get("caveat"):
             stats.append(pick["caveat"])
         else:
@@ -5428,10 +5697,158 @@ def recipe_command(args) -> None:
         cache_badge = " · cached" if pick["cached"] else ""
         print(f"\n{index}. {labels[pick['role']]} — {pick['alias']}{cache_badge}")
         print(f"   {' · '.join(stats)}")
+        if pick["disk_fit"] is False:
+            print(
+                f"   ⚠ won't fit: needs ~{pick['required_disk_gb']:.2f} GB "
+                f"including download headroom; {payload['free_disk_gb']:.2f} GB free"
+            )
+            print("   Free disk space or set HF_HOME/HF_HUB_CACHE to another drive.")
+            continue
         command = f"rapid-mlx serve {pick['alias']}"
         if pick["launch_flags"]:
             command += " " + " ".join(pick["launch_flags"])
         print(f"   {command}")
+
+
+def _recipe_free_disk_gb() -> float | None:
+    """Return free GiB on the filesystem that receives HF downloads.
+
+    ``HF_HUB_CACHE`` can name a directory that does not exist yet, including
+    one on an external volume. Walk to its nearest existing ancestor before
+    probing, matching the real download gate rather than assuming ``$HOME``.
+    Unknown disk state is deliberately ``None``: recipe then preserves its
+    historical output instead of claiming that a model fits.
+    """
+    import shutil
+    from pathlib import Path
+
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except Exception:
+        HF_HUB_CACHE = str(Path.home() / ".cache" / "huggingface" / "hub")
+    try:
+        probe = Path(HF_HUB_CACHE).expanduser().absolute()
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        if not probe.exists():
+            return None
+        return shutil.disk_usage(probe).free / float(1 << 30)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _cached_models_json_payload() -> dict:
+    """Structured form of the ``models --cached`` view — the same rows the
+    text table renders, with stable keys instead of fixed-width columns.
+
+    Sizes are raw bytes; ``state`` is one of ``ok`` / ``unmapped`` /
+    ``incomplete`` / ``external`` mirroring the alias column's parenthesized
+    tags; ``alias`` is ``None`` for any non-``ok`` row (those are not
+    launchable by alias). Sorted biggest-first, like the table.
+    """
+    import time as _time
+
+    from vllm_mlx.model_aliases import list_profiles
+
+    rows = _scan_hf_cache_models()
+    external_rows = _scan_external_model_dirs()
+    runnable_hub_repos = {repo for repo, _, _ in rows if _cache_entry_is_runnable(repo)}
+    external_rows = [r for r in external_rows if r[0] not in runnable_hub_repos]
+
+    profiles = list_profiles()
+    hf_to_alias: dict[str, str] = {}
+    for alias, p in profiles.items():
+        hf_to_alias.setdefault(p.hf_path, alias)
+
+    now = _time.time()
+    tagged = [(*row, False) for row in rows] + [(*row, True) for row in external_rows]
+    models = []
+    total_bytes = 0
+    for repo, size, mtime, is_external in tagged:
+        total_bytes += size
+        if is_external:
+            alias, state = None, "external"
+        elif not _cache_entry_is_runnable(repo):
+            alias, state = None, "incomplete"
+        else:
+            mapped = hf_to_alias.get(repo)
+            alias, state = (mapped, "ok") if mapped is not None else (None, "unmapped")
+        models.append(
+            {
+                "alias": alias,
+                "repo": repo,
+                "size_bytes": int(size),
+                "modified_epoch": int(mtime) if mtime and mtime > 0 else None,
+                "age_seconds": int(max(0, now - mtime))
+                if mtime and mtime > 0
+                else None,
+                "state": state,
+                "external": is_external,
+            }
+        )
+    models.sort(key=lambda m: -m["size_bytes"])
+    return {"cached": models, "count": len(models), "total_bytes": int(total_bytes)}
+
+
+def _available_models_json_payload() -> dict:
+    """Structured form of the default ``models`` view: every alias with the
+    profile facts the table shows, split by modality (text / audio / video /
+    image) exactly as the text sections are. Sizes are download bytes from the
+    checked-in manifest (``None`` when unknown); no per-invocation HF I/O.
+    """
+    from vllm_mlx.model_aliases import list_profiles
+    from vllm_mlx.model_sizes import size_bytes
+
+    all_profiles = list_profiles()
+
+    def _modality(p) -> str:
+        return getattr(p, "modality", "text") or "text"
+
+    def _profile_dict(alias, p) -> dict:
+        raw = None
+        try:
+            raw = size_bytes(p.hf_path)
+        except Exception:
+            raw = None
+        return {
+            "alias": alias,
+            "hf_path": p.hf_path,
+            "size_bytes": int(raw) if isinstance(raw, int) and raw > 0 else None,
+            "tool_call_parser": p.tool_call_parser,
+            "reasoning_parser": p.reasoning_parser,
+            "is_hybrid": bool(getattr(p, "is_hybrid", False)),
+            "is_moe": bool(getattr(p, "is_moe", False)),
+            "supports_spec_decode": bool(getattr(p, "supports_spec_decode", False)),
+            "modality": _modality(p),
+        }
+
+    text, video, image = {}, {}, {}
+    for alias, p in all_profiles.items():
+        bucket = {"video-gen": video, "image-gen": image}.get(_modality(p), text)
+        bucket[alias] = p
+
+    payload = {
+        "text": [_profile_dict(a, text[a]) for a in sorted(text)],
+        "video": [_profile_dict(a, video[a]) for a in sorted(video)],
+        "image": [_profile_dict(a, image[a]) for a in sorted(image)],
+        "audio": [],
+    }
+    try:
+        from vllm_mlx.audio.registry import list_audio_aliases
+
+        payload["audio"] = [
+            {
+                "alias": e.alias,
+                "hf_id": e.hf_id,
+                "kind": e.type,
+                "family": e.family,
+                "modality": "audio",
+            }
+            for e in list_audio_aliases()
+        ]
+    except Exception:
+        payload["audio"] = []
+    return payload
 
 
 def models_command(args):
@@ -5450,6 +5867,17 @@ def models_command(args):
     from vllm_mlx._version_check import print_staleness_warning_if_any
     from vllm_mlx.model_aliases import list_profiles
     from vllm_mlx.model_sizes import format_size
+
+    # JSON mode emits ONLY the payload on stdout — no staleness banner, no
+    # table — so a caller can pipe it straight into a parser.
+    if getattr(args, "json", False):
+        import json as _json
+
+        if getattr(args, "cached", False):
+            print(_json.dumps(_cached_models_json_payload()))
+        else:
+            print(_json.dumps(_available_models_json_payload()))
+        return
 
     print_staleness_warning_if_any()
 
@@ -5496,21 +5924,35 @@ def models_command(args):
     # floor — never shrink below it so short rows still feel padded.
     # Other widths sized to fit values currently in aliases.json:
     # tool 16 (qwen3_coder_xml + 1 pad), reasoning 12 (deepseek_r1 + 1),
-    # spec 10 ("✗ hybrid"), tier 11, dflash 7, ddtree 7.
+    # spec 10 ("✗ hybrid"), tier 11, dflash 7, ddtree 7, preset 8.
     alias_width = max(24, max((len(a) for a in profiles), default=0) + 2)
     # Size ("438.3 GiB" is the widest current value) comes right after the
     # alias so the "how big before I pull?" answer is the first thing a user
     # sees next to the name (issue #1286). Values come from the checked-in
     # model_sizes.json manifest — no per-invocation HuggingFace round-trip.
+    # Tools and Reasoning carry parser keys whose length is unbounded
+    # (``deepseek_r1_distill`` is 19 chars, wider than the old fixed 12).
+    # Size them to the data like the alias column so a long value never
+    # overflows and shifts every field to its right out of the header's
+    # columns (#1999). Preset is last, so its long ``MTP@…`` values can
+    # overrun harmlessly and stay unbounded.
+    tools_width = max(
+        16, max((len(p.tool_call_parser or "—") for p in profiles.values()), default=0)
+    )
+    reasoning_width = max(
+        12,
+        max((len(p.reasoning_parser or "—") for p in profiles.values()), default=0),
+    )
     cols = (
         ("Alias", alias_width),
         ("Size", 10),
-        ("Tools", 16),
-        ("Reasoning", 12),
+        ("Tools", tools_width),
+        ("Reasoning", reasoning_width),
         ("Spec-Decode", 10),
         ("Suffix Tier", 11),
         ("DFlash", 7),
         ("DDTree", 7),
+        ("Preset", 8),
     )
     width = sum(w for _, w in cols) + len(cols) - 1
     sep = "  " + "─" * width
@@ -5523,7 +5965,11 @@ def models_command(args):
         p = profiles[alias]
         tools = p.tool_call_parser or "—"
         reasoning = p.reasoning_parser or "—"
-        if p.is_hybrid:
+        if p.mtp_draft_model:
+            spec = "✓ MTP"
+            tier = "n/a"
+            preset = f"MTP@{p.mtp_draft_model}@{p.mtp_speculative_tokens}"
+        elif p.is_hybrid:
             # Hybrid models cannot use spec-decode or suffix-decode regardless
             # of the supports_spec_decode flag (mlx-lm BatchGenerator gate).
             spec = "✗ hybrid"
@@ -5531,6 +5977,9 @@ def models_command(args):
         else:
             spec = "✓" if p.supports_spec_decode else "✗"
             tier = p.suffix_decoding_tier
+            preset = "Suffix" if p.supports_spec_decode else "—"
+        if p.is_hybrid and not p.mtp_draft_model:
+            preset = "—"
         # DFlash column — eligible aliases show ✓, everything else "—" so
         # the visual scan immediately surfaces what supports it. We don't
         # re-run the eligibility gate here (which would also check that
@@ -5540,8 +5989,9 @@ def models_command(args):
         ddtree = "✓" if p.supports_ddtree else "—"
         size = format_size(p.hf_path)
         row = (
-            f"  {alias:<{alias_width}} {size:<10} {tools:<16} {reasoning:<12} "
-            f"{spec:<10} {tier:<11} {dflash:<7} {ddtree:<7}"
+            f"  {alias:<{alias_width}} {size:<10} {tools:<{tools_width}} "
+            f"{reasoning:<{reasoning_width}} "
+            f"{spec:<10} {tier:<11} {dflash:<7} {ddtree:<7} {preset:<8}"
         )
         print(row)
 
@@ -5570,12 +6020,15 @@ def models_command(args):
         )
         print()
         print(f"  Audio models ({len(audio_entries)} aliases)")
-        audio_sep = "  " + "─" * width
-        print(audio_sep)
         audio_header = (
             f"  {'Alias':<{audio_alias_width}} {'Size':<10} {'Kind':<10} "
             f"{'Family':<12} {'HF id':<40}"
         )
+        # Size the rule to THIS table's header, not the text table's width —
+        # the text table's Tools/Reasoning columns are data-sized now (#1999),
+        # so reusing its width would stretch every secondary rule.
+        audio_sep = "  " + "─" * (len(audio_header) - 2)
+        print(audio_sep)
         print(audio_header)
         print(audio_sep)
         for entry in audio_entries:
@@ -5598,11 +6051,12 @@ def models_command(args):
         )
         print()
         print(f"  Video models ({len(video_profiles)} aliases)")
-        video_sep = "  " + "─" * width
-        print(video_sep)
-        print(
+        video_header = (
             f"  {'Alias':<{video_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
         )
+        video_sep = "  " + "─" * (len(video_header) - 2)
+        print(video_sep)
+        print(video_header)
         print(video_sep)
         for alias in sorted(video_profiles):
             p = video_profiles[alias]
@@ -5624,11 +6078,12 @@ def models_command(args):
         )
         print()
         print(f"  Image models ({len(image_profiles)} aliases)")
-        image_sep = "  " + "─" * width
-        print(image_sep)
-        print(
+        image_header = (
             f"  {'Alias':<{image_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
         )
+        image_sep = "  " + "─" * (len(image_header) - 2)
+        print(image_sep)
+        print(image_header)
         print(image_sep)
         for alias in sorted(image_profiles):
             p = image_profiles[alias]
@@ -5661,6 +6116,19 @@ def models_command(args):
     print("       `rapid-mlx serve <alias>` for an OpenAI-compatible server")
     if audio_entries:
         print("       `rapid-mlx serve kokoro|whisper-large-v3|parakeet` for audio")
+    # User mappings are rendered explicitly so support output never makes a
+    # private nickname look like an immutable catalog alias.
+    from vllm_mlx.model_aliases import list_builtin_aliases, user_alias_reserved_names
+    from vllm_mlx.user_aliases import validated_user_aliases
+
+    user_aliases = validated_user_aliases(
+        list_builtin_aliases(), user_alias_reserved_names()
+    )
+    if user_aliases:
+        print()
+        print(f"  User aliases ({len(user_aliases)})")
+        for name, target in sorted(user_aliases.items()):
+            print(f"  {name} -> {target}")
     print()
 
 
@@ -5931,6 +6399,57 @@ def rm_command(args):
     print(f"Freed {size_str}")
 
 
+def alias_command(args) -> None:
+    """Create, remove, or list user-owned model aliases."""
+    from vllm_mlx.model_aliases import list_builtin_aliases, user_alias_reserved_names
+    from vllm_mlx.user_aliases import (
+        UserAliasError,
+        remove_user_alias,
+        set_user_alias,
+        validated_user_aliases,
+    )
+
+    builtins = list_builtin_aliases()
+    reserved = user_alias_reserved_names()
+    try:
+        if args.alias_action == "set":
+            set_user_alias(args.name, args.target, builtins, reserved)
+            print(f"  User alias: {args.name} -> {args.target}")
+        elif args.alias_action == "remove":
+            if not remove_user_alias(args.name, builtins, reserved):
+                print(f"  User alias {args.name!r} does not exist.", file=sys.stderr)
+                raise SystemExit(1)
+            print(
+                f"  Removed user alias {args.name!r}; cached weights were not changed."
+            )
+        else:
+            aliases = validated_user_aliases(builtins, reserved)
+            if not aliases:
+                print("  No user aliases configured.")
+            else:
+                for name, target in sorted(aliases.items()):
+                    print(f"  {name} -> {target}")
+    except UserAliasError as exc:
+        print(f"\n  Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _elide_front(text: str, width: int) -> str:
+    """Trim ``text`` to at most ``width`` chars, keeping the TAIL.
+
+    For a served model that is a filesystem path, the tail (the model name) is
+    the distinctive part, so the head is what gets replaced by a leading ``…``.
+    The result never exceeds ``width`` (widths <= 1 leave no room for the ``…``).
+    """
+    if len(text) <= width:
+        return text
+    if width <= 0:
+        return ""
+    if width == 1:
+        return text[-1:]
+    return "…" + text[-(width - 1) :]
+
+
 def ps_command(_args):
     """List running rapid-mlx servers (process scan)."""
     import time
@@ -5973,6 +6492,7 @@ def ps_command(_args):
             "--log-level",
             "--mcp-config",
             "--cors-origins",
+            "--trusted-hosts",
             "--served-model-name",
             "--max-tokens",
             "--gpu-memory-utilization",
@@ -6021,9 +6541,14 @@ def ps_command(_args):
     print()
     print(f"  {'PID':<8}{'PORT':<8}{'MODEL':<40}{'UPTIME':<10}")
     print(f"  {'-' * 66}")
+    # Serving a local path (not an alias) is the normal case for a converted
+    # model, and those paths routinely exceed the 40-char column — the old
+    # code let them run straight into UPTIME with no gap (#1999). Elide from
+    # the FRONT so the distinctive tail (the model name) survives, capped at 38
+    # so the ``<40`` pad always leaves at least two spaces before UPTIME.
     # Sort numerically by port — string sort would put "10000" before "8000".
     for pid, port, model, uptime in sorted(rows, key=lambda r: int(r[1])):
-        print(f"  {pid:<8}{port:<8}{model:<40}{uptime:<10}")
+        print(f"  {pid:<8}{port:<8}{_elide_front(model, 38):<40}{uptime:<10}")
     print()
 
 
@@ -6034,6 +6559,7 @@ def _spawn_chat_server(
     *,
     register_in: list | None = None,
     log_handle=None,
+    disable_prefix_cache: bool = False,
 ) -> tuple[object, str]:
     """Spawn a `serve` subprocess on an ephemeral port for chat REPL use.
 
@@ -6086,6 +6612,8 @@ def _spawn_chat_server(
     ]
     if served_name and served_name != model:
         cmd.extend(["--served-model-name", served_name])
+    if disable_prefix_cache:
+        cmd.append("--disable-prefix-cache")
     log = open(log_path, "w")  # noqa: SIM115 — kept open for proc lifetime
     # Tell the child main() that the parent already gated (or that this is
     # an internal spawn, where prompting would deadlock anyway because the
@@ -6356,11 +6884,79 @@ def _has_short_pattern_dominating_suffix(
     return period < n and period <= max_period
 
 
+def _accumulate_tool_call_deltas(
+    parts: dict[int, dict],
+    deltas: list,
+) -> None:
+    """Merge one chunk's ``delta.tool_calls`` into an index-keyed accumulator.
+
+    Streaming tool calls arrive split across chunks: the first carries ``id``
+    and ``function.name``, later ones append ``function.arguments`` fragments
+    that are only valid JSON once concatenated. ``index`` — not ``id``, which
+    later fragments omit — is the field that ties the fragments together, so
+    it is the accumulator key.
+
+    A server that streams several calls interleaves their indices, which is
+    why fragments are appended per index rather than to a single buffer.
+    """
+
+    import json
+
+    for delta in deltas:
+        if not isinstance(delta, dict):
+            continue
+        # Fall back to positional order for servers that omit ``index`` when
+        # only one call is in flight.
+        index = delta.get("index")
+        if not isinstance(index, int):
+            index = 0
+        part = parts.setdefault(index, {"id": None, "name": None, "arguments": ""})
+
+        if delta.get("id"):
+            part["id"] = str(delta["id"])
+        function = delta.get("function")
+        if not isinstance(function, dict):
+            continue
+        if function.get("name"):
+            part["name"] = str(function["name"])
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            part["arguments"] += arguments
+        elif arguments is not None:
+            # Some servers send the whole object once instead of fragments.
+            part["arguments"] = json.dumps(arguments, ensure_ascii=False)
+
+
+def _finalize_tool_calls(parts: dict[int, dict]) -> list[dict]:
+    """Render the accumulator into OpenAI-shape tool calls, in index order."""
+
+    finalized = []
+    for position, index in enumerate(sorted(parts)):
+        part = parts[index]
+        if not part["name"]:
+            # No function name ever arrived — there is nothing to dispatch,
+            # and forwarding it would only produce an "unknown tool" round
+            # trip.
+            continue
+        finalized.append(
+            {
+                "id": part["id"] or f"call_{position}",
+                "type": "function",
+                "function": {
+                    "name": part["name"],
+                    "arguments": part["arguments"] or "{}",
+                },
+            }
+        )
+    return finalized
+
+
 def _stream_chat_response(
     base_url: str,
     payload: dict,
     timeout_s: int,
     metrics: dict | None = None,
+    tool_calls: list | None = None,
 ) -> str:
     """POST /v1/chat/completions with stream=True and print tokens as they
     arrive. Returns the full assistant content (concatenated content deltas).
@@ -6374,6 +6970,11 @@ def _stream_chat_response(
     with one correct Rich Markdown render containing structured headings,
     lists, links, tables, and code. Pipes, CI, dumb terminals, and
     ``NO_COLOR`` retain byte-for-byte plain streaming.
+
+    When *tool_calls* is a list, streamed ``delta.tool_calls`` fragments are
+    accumulated and the assembled calls are appended to it. This is what lets
+    the MCP agent loop stream: the tool round is no longer a reason to fall
+    back to a blocking request.
     """
     import json
 
@@ -6387,6 +6988,8 @@ def _stream_chat_response(
     is_tty = supports_rich_output(sys.stdout)
     in_reasoning = False
     full = ""
+    full_reasoning = ""
+    tool_call_parts: dict[int, dict] = {}
 
     # ----- Repetition guard ----------------------------------------------
     # Models occasionally degenerate into the same token repeated until
@@ -6460,7 +7063,12 @@ def _stream_chat_response(
                     metrics["finish_reason"] = fr
             reasoning = delta.get("reasoning_content")
             piece = delta.get("content")
+            if tool_calls is not None:
+                streamed_calls = delta.get("tool_calls")
+                if isinstance(streamed_calls, list):
+                    _accumulate_tool_call_deltas(tool_call_parts, streamed_calls)
             if reasoning:
+                full_reasoning += reasoning
                 if not in_reasoning:
                     if is_tty:
                         sys.stdout.write(f"{MAGENTA}[thinking]{RESET} {DIM}")
@@ -6543,6 +7151,10 @@ def _stream_chat_response(
     if in_reasoning and is_tty:
         sys.stdout.write(RESET)
         sys.stdout.flush()
+    if tool_calls is not None:
+        tool_calls.extend(_finalize_tool_calls(tool_call_parts))
+    if metrics is not None and full_reasoning:
+        metrics["reasoning_content"] = full_reasoning
     if repetition_aborted:
         msg = (
             f"\n\n  {DIM}(response cut: model began repeating itself — "
@@ -6564,96 +7176,86 @@ def _complete_chat_with_mcp(
     max_rounds: int = 8,
     on_tool_event=None,
 ) -> tuple[str, dict]:
-    """Run the chat agent loop with MCP tools using non-streaming responses.
+    """Run the chat agent loop with MCP tools, streaming every round.
 
     vLLM and SGLang use the same loop shape: expose MCP tools as ordinary
     function tools, append the assistant tool call and matching tool output,
     then ask the model again.  MCP transport and execution stay inside the
     chat runtime; the inference server only sees standard Chat Completions
     messages.
+
+    Every round streams, including the ones that end in a tool call. The
+    blocking variant this replaced left the screen empty for the whole
+    multi-round turn, which on a local model is the slowest part of the
+    session and the part the user most needs feedback during.
     """
     import json
-
-    import requests
 
     messages = payload["messages"]
     request_payload = {
         **payload,
-        "stream": False,
+        "stream": True,
+        "stream_options": {"include_usage": True},
         "tools": mcp_runtime.tools,
         "tool_choice": "auto",
     }
-    request_payload.pop("stream_options", None)
     total_usage: dict[str, int | float] = {}
 
     for round_index in range(max_rounds + 1):
-        response = requests.post(
-            f"{base_url}/v1/chat/completions",
-            json=request_payload,
-            timeout=timeout_s,
+        round_metrics: dict = {}
+        streamed_calls: list[dict] = []
+        content = _stream_chat_response(
+            base_url,
+            request_payload,
+            timeout_s=timeout_s,
+            metrics=round_metrics,
+            tool_calls=streamed_calls,
         )
-        if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
-        try:
-            body = response.json()
-            choice = body["choices"][0]
-            message = choice["message"]
-            if not isinstance(message, dict):
-                raise TypeError
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise RuntimeError("Malformed chat completion response") from exc
 
-        usage = body.get("usage") or {}
-        if not isinstance(usage, dict):
-            raise RuntimeError("Malformed chat completion response")
-        for name, value in usage.items():
+        for name in ("prompt_tokens", "completion_tokens"):
+            value = round_metrics.get(name)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 total_usage[name] = total_usage.get(name, 0) + value
 
-        tool_calls = message.get("tool_calls") or []
-        if not isinstance(tool_calls, list):
-            raise RuntimeError("Malformed chat completion response")
-        if not tool_calls:
-            content = message.get("content") or ""
-            if not isinstance(content, str):
-                content = json.dumps(content, ensure_ascii=False)
+        if not streamed_calls:
             metrics = dict(total_usage)
-            metrics["finish_reason"] = choice.get("finish_reason")
-            reasoning = message.get("reasoning_content")
-            if reasoning:
-                metrics["reasoning_content"] = reasoning
+            metrics["finish_reason"] = round_metrics.get("finish_reason")
             return content, metrics
         if round_index == max_rounds:
-            raise RuntimeError(f"MCP tool loop exceeded {max_rounds} rounds")
+            # Budget exhausted. The tool results already in ``messages`` are
+            # real work — the model read files, ran commands — so raising here
+            # would send the caller down ``_recover_failed_chat_turn`` and
+            # delete all of it. Return instead, with the partial content the
+            # model did produce and a finish_reason the caller can report.
+            # The assistant message requesting this round's calls is
+            # deliberately not appended: unanswered ``tool_calls`` in history
+            # make the next request malformed.
+            metrics = dict(total_usage)
+            metrics["finish_reason"] = "tool_call_limit"
+            metrics["tool_rounds_exhausted"] = max_rounds
+            return content, metrics
 
         normalized_calls = []
-        for position, tool_call in enumerate(tool_calls):
-            if not isinstance(tool_call, dict):
-                raise RuntimeError("Malformed chat completion response")
-            function = tool_call.get("function") or {}
-            if not isinstance(function, dict):
-                raise RuntimeError("Malformed chat completion response")
-            arguments = function.get("arguments", "{}")
-            if not isinstance(arguments, str):
-                arguments = json.dumps(arguments, ensure_ascii=False)
+        for position, tool_call in enumerate(streamed_calls):
+            function = tool_call["function"]
             normalized_calls.append(
                 {
                     "id": str(tool_call.get("id") or f"call_{round_index}_{position}"),
                     "type": "function",
                     "function": {
                         "name": str(function.get("name") or ""),
-                        "arguments": arguments,
+                        "arguments": function.get("arguments") or "{}",
                     },
                 }
             )
 
         assistant_message = {
             "role": "assistant",
-            "content": message.get("content"),
+            "content": content or None,
             "tool_calls": normalized_calls,
         }
-        if message.get("reasoning_content"):
-            assistant_message["reasoning_content"] = message["reasoning_content"]
+        if round_metrics.get("reasoning_content"):
+            assistant_message["reasoning_content"] = round_metrics["reasoning_content"]
         messages.append(assistant_message)
         completed_messages = {}
 
@@ -6685,7 +7287,9 @@ def _complete_chat_with_mcp(
                 )
             raise
 
-    raise RuntimeError(f"MCP tool loop exceeded {max_rounds} rounds")
+    # Unreachable: the ``round_index == max_rounds`` branch returns on the
+    # final iteration. Kept so the function has no implicit ``None`` return.
+    raise AssertionError("MCP tool loop exited without a result")
 
 
 def _recover_failed_chat_turn(messages: list[dict], turn_start: int) -> None:
@@ -6921,6 +7525,8 @@ def chat_command(args):
         pass
     atexit.register(_cleanup)
 
+    attached_to_existing = bool(args.base_url or args.port is not None)
+
     if args.base_url:
         base_url = args.base_url.rstrip("/")
         if base_url.endswith("/v1"):
@@ -6974,12 +7580,18 @@ def chat_command(args):
             # If main() resolved an alias, expose the alias as the API model name
             # so the chat request body matches what the user typed.
             original = getattr(args, "_original_alias", None)
+            privacy_kwargs = (
+                {"disable_prefix_cache": True}
+                if getattr(args, "disable_prefix_cache", False)
+                else {}
+            )
             proc, base_url = _spawn_chat_server(
                 args.model,
                 log_path,
                 served_name=original,
                 register_in=_active_procs,
                 log_handle=_log_handle,
+                **privacy_kwargs,
             )
 
         try:
@@ -6988,6 +7600,37 @@ def chat_command(args):
             print(f"\n  {RED}Failed to start server:{RESET} {e}")
             sys.exit(1)
         print(f"  {GREEN}✓ Ready.{RESET}\n")
+
+    # When attaching without an explicit model, trust the server's advertised
+    # model instead of the client's independently configured starter alias.
+    # The latter commonly differs from a manually started server and turns the
+    # very first request into an avoidable 404. Direct callers predating this
+    # marker are treated as explicit to preserve their existing behavior.
+    if attached_to_existing and not getattr(args, "_model_was_explicit", True):
+        try:
+            import requests
+
+            response = requests.get(f"{base_url}/v1/models", timeout=2)
+            response.raise_for_status()
+            payload = response.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            discovered = next(
+                (
+                    item.get("id")
+                    for item in models
+                    if isinstance(item, dict)
+                    and isinstance(item.get("id"), str)
+                    and item["id"].strip()
+                ),
+                None,
+            )
+        except (requests.RequestException, ValueError, TypeError):
+            discovered = None
+        if discovered:
+            args.model = discovered
+            if hasattr(args, "_original_alias"):
+                delattr(args, "_original_alias")
+            print(f"  Connected model: {discovered} (discovered from server)")
 
     from vllm_mlx._version_check import print_staleness_warning_if_any
 
@@ -7259,12 +7902,18 @@ def chat_command(args):
             # readiness wait, before any further Python statement runs in
             # this scope. A SIGTERM/Ctrl-C during the (possibly multi-second)
             # load tears the child down via the cleanup walk.
+            privacy_kwargs = (
+                {"disable_prefix_cache": True}
+                if getattr(args, "disable_prefix_cache", False)
+                else {}
+            )
             new_proc, new_base_url = _spawn_chat_server(
                 resolved,
                 new_log_path,
                 served_name=new_alias,
                 register_in=_active_procs,
                 log_handle=_new_log_handle,
+                **privacy_kwargs,
             )
         try:
             _wait_for_chat_server(new_base_url, new_proc, timeout_s=args.ready_timeout)
@@ -7434,14 +8083,13 @@ def chat_command(args):
                         payload,
                         mcp_runtime,
                         timeout_s=args.response_timeout,
+                        max_rounds=getattr(args, "mcp_max_rounds", 8),
                         on_tool_event=_show_mcp_tool_event,
                     )
-                    reasoning = metrics.get("reasoning_content")
-                    if reasoning:
-                        sys.stdout.write(f"{DIM}[thinking] {reasoning}{RESET}\n")
-                    from .chat_render import render_markdown
-
-                    render_markdown(assistant)
+                    # No re-render here: every round streamed its own tokens
+                    # (reasoning included) through the same renderer the
+                    # non-MCP path uses, so rendering again would print the
+                    # final answer twice.
             except KeyboardInterrupt:
                 print(f"\n  {YELLOW}(response interrupted){RESET}\n")
                 _recover_failed_chat_turn(messages, turn_start)
@@ -7485,6 +8133,16 @@ def chat_command(args):
                 print(
                     f"  {YELLOW}(reasoning consumed the full --max-tokens "
                     f"budget; bump --max-tokens for a final answer){RESET}\n"
+                )
+            # The turn stopped because the tool budget ran out, not because the
+            # model was done. Say so — the tool results are kept in history, so
+            # the user can simply ask it to continue.
+            if metrics.get("finish_reason") == "tool_call_limit":
+                exhausted = metrics.get("tool_rounds_exhausted")
+                print(
+                    f"  {YELLOW}(stopped after {exhausted} tool rounds; "
+                    f"tool results are kept — ask it to continue, or raise "
+                    f"--mcp-max-rounds){RESET}\n"
                 )
             if assistant:
                 messages.append({"role": "assistant", "content": assistant})
@@ -7745,11 +8403,23 @@ def agents_command(args):
     # No agent specified → list all profiles
     if not agent_name:
         profiles = list_profiles()
+        # Size the name column to the widest alias so a name that meets or
+        # exceeds the old hardcoded 15 (e.g. "deepseek-harness", 16 chars)
+        # can't eat its own separator space and shift every later column
+        # right on that one row. Floor at 15 so short rosters keep the
+        # familiar layout.
+        name_w = max(15, max((len(p.name) for p in profiles), default=15))
         print()
         print("  Supported AI Agents")
-        print("  " + "─" * 56)
+        print(
+            f"  {'name':<{name_w}} {'client':<20} {'GitHub':>6}  "
+            f"{'tools':<5}  recommended models"
+        )
+        # Grow the divider in step with the name column so it doesn't fall
+        # short of the header once a long alias widens the table.
+        print("  " + "─" * (78 + name_w - 15))
         for p in profiles:
-            fc = "FC" if p.needs_function_calling else "  "
+            tools = "FC" if p.needs_function_calling else "—"
             stars = f"{p.stars // 1000}K" if p.stars and p.stars >= 1000 else ""
             if p.recommended_models:
                 shown = p.recommended_models[:3]
@@ -7758,9 +8428,26 @@ def agents_command(args):
                     models += f" +{len(p.recommended_models) - 3}"
             else:
                 models = ""
-            print(f"  {p.name:<15} {p.display_name:<20} {stars:>5}  [{fc}]  {models}")
+            print(
+                f"  {p.name:<{name_w}} {p.display_name:<20} "
+                f"{stars:>6}  {tools:<5}  {models}"
+            )
+        print("  FC = function calling")
         print()
-        print(f"  {len(profiles)} agents supported")
+        # Frameworks (langchain, pydanticai, smolagents) are libraries
+        # you build agents with, not agents themselves — count them
+        # separately so "N agents" stays honest (#2082).
+        framework_count = sum(1 for p in profiles if p.kind == "framework")
+        agent_count = len(profiles) - framework_count
+        agents_label = "agent" if agent_count == 1 else "agents"
+        frameworks_label = "framework" if framework_count == 1 else "frameworks"
+        if framework_count:
+            print(
+                f"  {agent_count} {agents_label} + "
+                f"{framework_count} {frameworks_label} supported"
+            )
+        else:
+            print(f"  {agent_count} {agents_label} supported")
         print("  Usage: rapid-mlx agents <name>          Show setup guide")
         print("         rapid-mlx agents <name> --setup   Auto-configure")
         print("         rapid-mlx agents <name> --test    Run integration tests")
@@ -7820,12 +8507,12 @@ def agents_command(args):
             # User specified model — look up *that* model's context window
             context_length = fetch_context_window(base_url, model_id)
 
-        # Claude Code and Continue are the first first-class setup flows. They
+        # Claude Code, Continue and DSH have first-class setup flows. They
         # preview an exact diff, require consent, back up existing config,
-        # write atomically, and verify the server afterwards. Keep the generic
-        # profile writer below for the remaining integrations until each one
-        # receives an equally precise adapter.
-        if profile.name in {"claude-code", "continue"}:
+        # write atomically, and verify the server afterwards. The generic
+        # profile writer below still lacks the diff/consent/backup half, but
+        # it does honour --dry-run, so a preview never writes on either path.
+        if profile.name in {"claude-code", "continue", "deepseek-harness"}:
             from vllm_mlx.agents.setup import (
                 apply_setup_plan,
                 build_setup_plan,
@@ -7833,8 +8520,24 @@ def agents_command(args):
                 verify_server,
             )
 
+            # DSH renders a reasoning-effort control from what we write, so
+            # it needs the model's real capability, not a blanket claim.
+            # Scoped to the one profile that consumes it — the other
+            # first-class flows don't, and this is a second HTTP round trip.
+            supports_reasoning = None
+            if profile.name == "deepseek-harness":
+                from vllm_mlx.agents.adapter import fetch_reasoning_support
+
+                supports_reasoning = fetch_reasoning_support(base_url, model_id)
+
             try:
-                plan = build_setup_plan(profile.name, base_url, model_id)
+                plan = build_setup_plan(
+                    profile.name,
+                    base_url,
+                    model_id,
+                    context_length=context_length,
+                    supports_reasoning=supports_reasoning,
+                )
             except (OSError, ValueError) as exc:
                 print(f"\n  {profile.display_name} setup failed: {exc}\n")
                 sys.exit(1)
@@ -7879,12 +8582,17 @@ def agents_command(args):
             model_id,
             agent_version=args.agent_version,
             context_length=context_length,
+            dry_run=args.dry_run,
         )
         if summary.startswith("Cannot"):
             print(f"\n  {profile.display_name} setup failed.")
             print(f"  {summary}")
             print()
             sys.exit(1)
+        if args.dry_run:
+            print(f"\n  {summary}")
+            print("\n  Dry run only; nothing was written.\n")
+            return
         print(f"\n  {profile.display_name} configured!")
         print(f"  {summary}")
         print()
@@ -7911,7 +8619,7 @@ def connect_command(args):
     lifespan banner uses — so ``ready``/``openai``/``anthropic`` and the
     machine form can never drift from what a running server prints.
     """
-    from vllm_mlx.connect import render_banner, resolve_endpoints
+    from vllm_mlx.connect import probe_server_alive, render_banner, resolve_endpoints
 
     eps = resolve_endpoints(host=args.host, port=args.port, model=args.model)
 
@@ -7924,7 +8632,10 @@ def connect_command(args):
         print(eps.to_json())
         return
 
-    print(render_banner(eps), end="")
+    # Don't announce "Ready:" for a server that isn't there (#1999): probe the
+    # target first so a stopped server reads as "no server", not "warming up".
+    running = eps.listen_fd is not None or probe_server_alive(eps.host, eps.port)
+    print(render_banner(eps, running=running), end="")
 
 
 def _connect_target(args, eps):
@@ -8338,7 +9049,7 @@ Examples:
         allow_abbrev=False,
     )
     serve_parser.add_argument(
-        "model", type=str, help="Model to serve"
+        "model", nargs="?", type=str, help="Model to serve"
     ).completer = alias_completer
     serve_parser.add_argument(
         "--served-model-name",
@@ -8502,6 +9213,16 @@ Examples:
         type=float,
         default=0.20,
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
+    )
+    serve_parser.add_argument(
+        "--idle-cache-clear-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Clear reusable prefix/KV cache after this many seconds with no "
+            "active requests, preserving loaded model weights. 0 disables; "
+            "default: RAPID_MLX_IDLE_CACHE_CLEAR_SECONDS or disabled."
+        ),
     )
     # #1103: bounded trim-free prefix reuse for "non-trimmable" cache entries.
     # Opt-in: the default 0 keeps the #1075 policy of dropping them at store
@@ -8998,6 +9719,25 @@ Examples:
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048)",
     )
+    serve_parser.add_argument(
+        "--vision-min-pixels",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Minimum pixels used by dynamic-resolution VLM image processors. "
+            "0 keeps the model default (default: 0)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--vision-max-pixels",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Maximum pixels used by dynamic-resolution VLM image processors. "
+            "Lower values trade image detail for lower TTFT and memory. "
+            "0 keeps the model default (default: 0)."
+        ),
+    )
     # MCP options
     serve_parser.add_argument(
         "--mcp-config",
@@ -9029,6 +9769,22 @@ Examples:
         help=(
             "Allowed CORS origins (default: * for all origins). "
             "Example: --cors-origins http://localhost:3000 https://myapp.com"
+        ),
+    )
+    serve_parser.add_argument(
+        "--trusted-hosts",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="HOST",
+        help=(
+            "OPT-IN Host-header allowlist (DNS-rebinding hardening): only "
+            "requests whose Host header matches one of these values are "
+            "accepted; everything else gets 400. Off by default so "
+            "rapid-mlx share and LAN access keep working. Values may be "
+            "space- or comma-separated. Example: --trusted-hosts localhost "
+            "127.0.0.1 (also settable via "
+            "RAPID_MLX_TRUSTED_HOSTS)."
         ),
     )
     serve_parser.add_argument(
@@ -9657,6 +10413,14 @@ Examples:
         help="Only list models that are downloaded to the local HuggingFace "
         "cache (alias, HF repo, size on disk, last modified).",
     )
+    models_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit the model list as machine-readable JSON instead of the "
+        "human table (stable keys; pairs with --cached). Prefer this over "
+        "scraping the text columns.",
+    )
     recipe_parser = subparsers.add_parser(
         "recipe", help="Recommend the smart and fast models for this Mac"
     )
@@ -9702,6 +10466,18 @@ Examples:
         action="store_true",
         help="Skip the confirmation prompt and remove the model immediately.",
     )
+    alias_parser = subparsers.add_parser(
+        "alias", help="Manage user-owned model aliases"
+    )
+    alias_subparsers = alias_parser.add_subparsers(
+        dest="alias_action", required=True, help="Alias action"
+    )
+    alias_set = alias_subparsers.add_parser("set", help="Create or replace an alias")
+    alias_set.add_argument("name", help="Private alias name")
+    alias_set.add_argument("target", help="Built-in alias or Hugging Face repo id")
+    alias_remove = alias_subparsers.add_parser("remove", help="Remove an alias mapping")
+    alias_remove.add_argument("name", help="Private alias name")
+    alias_subparsers.add_parser("list", help="List user alias mappings")
     subparsers.add_parser("ps", help="List running rapid-mlx servers")
 
     # Upgrade — detect install method and run the right upgrade command
@@ -9833,6 +10609,24 @@ Examples:
         default=None,
         help="Path to an MCP config file whose tools are available in this chat",
     )
+    chat_parser.add_argument(
+        "--mcp-max-rounds",
+        type=positive_int,
+        default=8,
+        help=(
+            "Maximum tool-call rounds per turn when --mcp-config is set "
+            "(default: 8). Multi-step tasks may need more."
+        ),
+    )
+    chat_parser.add_argument(
+        "--disable-prefix-cache",
+        action="store_true",
+        help=(
+            "Disable reusable prefix-cache persistence in the server spawned "
+            "by chat, so prompt token IDs are not written to disk. Has no "
+            "effect with --port or --base-url; configure that server directly."
+        ),
+    )
 
     # Info command — show the per-model profile (parsers + capability gates)
     info_parser = subparsers.add_parser(
@@ -9844,39 +10638,6 @@ Examples:
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (e.g. mlx-community/SmolLM3-3B-4bit)",
     ).completer = alias_completer
 
-    # Jlens command — read a model's internal "draft" with the Jacobian lens
-    jlens_parser = subparsers.add_parser(
-        "jlens",
-        help="Read a model's internal thoughts across layers (Jacobian lens)",
-    )
-    jlens_parser.add_argument(
-        "prompt",
-        help='Prompt to trace, e.g. "why is the sky blue"',
-    )
-    jlens_parser.add_argument(
-        "--model",
-        "-m",
-        default="qwen3-1.7b",
-        help="Model alias or HF repo to inspect (default: qwen3-1.7b)",
-    ).completer = alias_completer
-    jlens_parser.add_argument(
-        "--step",
-        type=int,
-        default=2,
-        help="Probe every Nth layer (default: 2; use 1 for full-resolution)",
-    )
-    jlens_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON instead of the rendered view",
-    )
-    jlens_parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Show full per-layer readouts and the answer's rank trajectory",
-    )
-
     # Agents command
     agents_parser = subparsers.add_parser(
         "agents", help="List, configure, and test agent integrations"
@@ -9885,7 +10646,10 @@ Examples:
         "agent_name",
         nargs="?",
         default=None,
-        help="Agent name (e.g. codex, opencode, qwen-code, aider). Omit to list all.",
+        help=(
+            "Agent name (e.g. codex, opencode, qwen-code, aider; "
+            "continue-dev is accepted for continue). Omit to list all."
+        ),
     )
     agents_parser.add_argument(
         "--setup",
@@ -10122,6 +10886,21 @@ def main():
     # Systematic serve-flag passthrough for ``share`` via the standard ``--``
     # end-of-options separator — see ``_parse_args_with_share_passthrough``.
     args = _parse_args_with_share_passthrough(parser, sys.argv[1:])
+    # A missing required positional normally makes argparse print the entire
+    # serve help (dozens of expert flags) before its one actionable error.
+    # Keep the positional optional at parse time so this first-run mistake gets
+    # a short recovery path. Explicit ``serve --help`` still exits from
+    # argparse above and retains the complete reference.
+    if getattr(args, "command", None) == "serve" and not args.model:
+        print("rapid-mlx serve: a model is required.", file=sys.stderr)
+        print("  Pick one for this Mac:  rapid-mlx recipe", file=sys.stderr)
+        print(
+            "  Or start a small one:   rapid-mlx serve qwen3.5-4b-4bit",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if getattr(args, "command", None) in ("chat", "run"):
+        args._model_was_explicit = getattr(args, "model", None) is not None
 
     # First-run consent prompt — fires at most once per machine, only on
     # interactive subcommands when stdin is a tty. Safe no-op otherwise.
@@ -10317,7 +11096,7 @@ def main():
         _cmd = getattr(args, "command", "chat")
         _sel_alias, _starter_cached = select_chat_default()
         args.model = _sel_alias
-        if sys.stdin.isatty():
+        if sys.stdin.isatty() and not (args.base_url or args.port is not None):
             if _starter_cached:
                 print(
                     f"  No model specified — using {_sel_alias} (already downloaded)."
@@ -10350,22 +11129,15 @@ def main():
         and getattr(args, "command", None) != "doctor"
     ):
         from vllm_mlx.model_aliases import RetiredModelAliasError, resolve_model
+        from vllm_mlx.user_aliases import UserAliasError
 
         try:
             resolved = resolve_model(args.model)
-        except RetiredModelAliasError as exc:
+        except (RetiredModelAliasError, UserAliasError) as exc:
             print(f"\n  Error: {exc}", file=sys.stderr)
             raise SystemExit(1) from None
         if resolved != args.model:
-            # Keep stdout pure JSON for machine-readable modes (jlens --json);
-            # the human-facing alias banner goes to stderr there.
-            _alias_stream = (
-                sys.stderr
-                if getattr(args, "command", None) == "jlens"
-                and getattr(args, "json", False)
-                else sys.stdout
-            )
-            print(f"  Alias: {args.model} → {resolved}", file=_alias_stream)
+            print(f"  Alias: {args.model} → {resolved}")
             args._original_alias = args.model
             args.model = resolved
         elif "/" not in args.model and not os.path.exists(args.model):
@@ -10451,7 +11223,7 @@ def main():
     # NOT inherit the bypass. Codex round-2 BLOCKING #2.
     _chat_spawn_child = os.environ.pop("RAPID_MLX_CHAT_SPAWN", "") == "1"
 
-    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench", "jlens"}
+    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench"}
     if (
         getattr(args, "command", None) in _GATED_COMMANDS
         and hasattr(args, "model")
@@ -10528,6 +11300,8 @@ def main():
         pull_command(args)
     elif args.command == "rm":
         rm_command(args)
+    elif args.command == "alias":
+        alias_command(args)
     elif args.command == "ps":
         ps_command(args)
     elif args.command in ("upgrade", "update"):
@@ -10542,10 +11316,6 @@ def main():
         chat_command(args)
     elif args.command == "info":
         info_command(args)
-    elif args.command == "jlens":
-        from vllm_mlx.jlens import jlens_command
-
-        jlens_command(args)
     elif args.command == "agents":
         agents_command(args)
     elif args.command == "connect":

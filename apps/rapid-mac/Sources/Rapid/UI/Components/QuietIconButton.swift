@@ -41,10 +41,20 @@ struct QuietIconButton: View {
     private var resolvedOpacity: Double { isEnabled ? 1.0 : 0.55 }
 
     var body: some View {
+        // ax-exempt: callers attach action/entity-specific identifiers to this wrapper
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: symbolSize, weight: .medium))
                 .foregroundStyle(foreground)
+                // These buttons are overwhelmingly toggles — copy/checkmark,
+                // show/hide, play/pause — and a hard glyph swap gave no signal
+                // that the press registered. `.replace` cross-fades the old
+                // symbol out and the new one in, which is what carries "copied"
+                // once the word "Copied" is gone. Animating on the symbol name
+                // keeps it to genuine changes: a button whose glyph is constant
+                // never animates, and Reduce Motion drops it entirely (see
+                // ``rapidAnimation``).
+                .contentTransition(.symbolEffect(.replace))
                 .frame(width: size, height: size)
                 .background(
                     RoundedRectangle(cornerRadius: RapidTheme.Radius.button, style: .continuous)
@@ -58,6 +68,7 @@ struct QuietIconButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .rapidAnimation(RapidMotion.quick, value: hovering)
+        .rapidAnimation(RapidMotion.quick, value: symbol)
         .help(help ?? label)
         .accessibilityLabel(label)
     }
@@ -75,5 +86,6 @@ struct SheetCloseButton: View {
             help: "Close — Esc",
             action: action
         )
+        .accessibilityIdentifier("Sheet.Close")
     }
 }

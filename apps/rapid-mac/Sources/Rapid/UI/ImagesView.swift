@@ -12,6 +12,7 @@ struct ImagesView: View {
     @Bindable var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @Environment(SettingsRouter.self) private var settingsRouter
+    @Environment(DownloadManager.self) private var downloads
 
     private let contentMaxWidth: CGFloat = RapidTheme.Layout.contentMaxWidth
 
@@ -193,7 +194,18 @@ struct ImagesView: View {
     /// engine resident beside the chat engine; otherwise the shared resolver
     /// presents the same on-demand load guidance used by Chat.
     private var readiness: ModelReadiness {
-        ModelReadiness.resolve(
+        // In-process image admission leaves the chat sidecar globally
+        // `.ready`, so the generic resolver cannot infer that this alias is
+        // downloading/loading. Use ServerManager's alias-scoped SSOT; without
+        // it the CTA appears dead and remains repeatedly pressable while HF is
+        // already writing gigabytes to disk.
+        if server.isResidentLoadInFlight(viewModel.selectedAlias) {
+            return .starting(
+                alias: viewModel.selectedAlias,
+                detail: "Downloading or loading the image model…"
+            )
+        }
+        return ModelReadiness.resolve(
             serverState: server.readinessState(for: viewModel.selectedAlias),
             alias: viewModel.selectedAlias,
             cacheState: imageCacheState,
@@ -211,7 +223,8 @@ struct ImagesView: View {
             // different models cannot clobber one another).
             failure: server.residentLoadFailure(for: viewModel.selectedAlias).map {
                 ModelReadiness.Failure(message: $0.message, alias: $0.alias)
-            }
+            },
+            downloadInFlight: downloads.isDownloading(viewModel.selectedAlias)
         )
     }
 
@@ -241,7 +254,17 @@ struct ImagesView: View {
         switch action {
         case .chooseModel:
             break  // the composer's model picker owns this step
-        case .downloadAndStart(let target), .start(let target), .retry(let target):
+        case .download(let target):
+            // Download-only: stage the weights, don't load. The banner flips
+            // to "Start" once cached (see ModelReadiness two-step).
+            guard let entry = viewModel.imageModels.first(where: { $0.alias == target }),
+                  !downloads.isDownloading(target) else { break }
+            _ = downloads.startDownload(
+                alias: target,
+                hfPath: entry.hfRepo,
+                totalBytes: ModelCacheActions.parseSizeBytes(entry.sizeOnDisk)
+            )
+        case .start(let target), .retry(let target):
             let hf = viewModel.imageModels.first { $0.alias == target }?.hfRepo
             // Same shared helper as Chat: ``ensureServing`` (not ``start``),
             // because the user is almost always switching FROM a running chat
@@ -272,6 +295,10 @@ struct ImagesView: View {
             ),
             imageMode: viewModel.isEditing ? .editing : .generation
         )
+        // A cold resident load can change the cache while the sidecar stays
+        // globally ready. Refresh this surface so its cached/downloaded copy
+        // cannot remain stale after the request settles.
+        await viewModel.refreshCatalog()
     }
 
     private var sendEnabled: Bool {
@@ -288,6 +315,7 @@ struct ImagesView: View {
             let phase = (context.date.timeIntervalSinceReferenceDate
                 .truncatingRemainder(dividingBy: 1.6)) / 1.6
             let denoising = viewModel.phase == .denoising && viewModel.progress != nil
+            let finalizing = viewModel.phase == .finalizing
             let total = max(viewModel.progress?.total ?? 0, viewModel.estimatedSteps)
             let step = max(1, viewModel.progress?.step ?? 0)
             let fraction = (denoising && total > 0) ? min(1, Double(step) / Double(total)) : 0
@@ -300,7 +328,7 @@ struct ImagesView: View {
 
                 VStack(spacing: 14) {
                     HStack(spacing: 10) {
-                        if denoising {
+                        if denoising || finalizing {
                             // Breathing, and only when Reduce Motion is
                             // off: this is a perpetual loop, so it is
                             // fully suppressed rather than merely slowed.
@@ -320,7 +348,9 @@ struct ImagesView: View {
                                         ? 0.65 + 0.35 * (0.5 + 0.5 * sin(phase * .pi * 2))
                                         : 1
                                 )
-                            Text(viewModel.cancelling ? "Stopping…" : "Generating")
+                            Text(viewModel.cancelling
+                                 ? "Stopping…"
+                                 : (finalizing ? "Finalizing image…" : "Generating"))
                                 .font(.system(size: 14, weight: .semibold))
                                 .foregroundStyle(RapidTheme.bandInk)
                         } else {
@@ -353,7 +383,11 @@ struct ImagesView: View {
                         .accessibilityIdentifier("Images.Cancel")
                     }
 
-                    ShimmerProgressBar(fraction: fraction, indeterminate: !denoising, phase: phase)
+                    ShimmerProgressBar(
+                        fraction: fraction,
+                        indeterminate: !denoising || finalizing,
+                        phase: phase
+                    )
                         .frame(height: 10)
 
                     HStack {
@@ -366,9 +400,12 @@ struct ImagesView: View {
                         // otherwise cold-load time inflates the per-step estimate.
                         let denoiseElapsed = viewModel.denoiseStartedAt
                             .map { context.date.timeIntervalSince($0) } ?? elapsed
-                        Text(denoising
-                             ? (etaText(step: step, total: total, elapsed: denoiseElapsed) ?? "finishing…")
-                             : "First run — only happens once")
+                        Text(finalizing
+                             ? "Decoding and saving…"
+                             : (denoising
+                                ? (etaText(step: step, total: total, elapsed: denoiseElapsed)
+                                   ?? "Finalizing next…")
+                                : "First run — only happens once"))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(RapidTheme.bandInkSecondary)
                     }
@@ -650,7 +687,7 @@ struct ImagesView: View {
     private var starters: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 7) {
-                ForEach(ImageGenViewModel.starters, id: \.self) { starter in
+                ForEach(Array(ImageGenViewModel.starters.enumerated()), id: \.offset) { index, starter in
                     Button {
                         viewModel.use(starter: starter)
                     } label: {
@@ -664,7 +701,7 @@ struct ImagesView: View {
                             .overlay(Capsule().stroke(RapidTheme.hairline, lineWidth: 1))
                     }
                     .buttonStyle(.plain)
-                    .accessibilityIdentifier("Images.Starter")
+                    .accessibilityIdentifier("Images.Starter.\(index)")
                 }
             }
         }
@@ -694,7 +731,6 @@ struct ImagesView: View {
                 .accessibilityAddTraits(on ? .isSelected : [])
             }
         }
-        .accessibilityIdentifier("Images.Aspect")
     }
 
     /// Output dimensions are explicit rather than hidden inside the aspect
@@ -1049,6 +1085,17 @@ private struct ShimmerProgressBar: View {
                     .offset(x: slideX)
                     .animation(indeterminate ? nil : .easeOut(duration: 0.3), value: fraction)
             }
+            // The indeterminate sweep deliberately travels from `-fillW` to
+            // `w`, i.e. it starts and ends OUTSIDE the track so the shuttle
+            // enters and leaves rather than popping into existence at the
+            // edges. Without a clip that overhang is drawn: the fill escapes
+            // the track and paints over the HUD card's padding — visible as an
+            // orange bar bleeding past the card's left/right edges during the
+            // "Finalizing image…" phase, which is indeterminate for its whole
+            // duration and therefore shows the bug on every single render.
+            // Clipping to the track's own capsule keeps the motion intact and
+            // confines the paint to the groove it belongs in.
+            .clipShape(Capsule())
         }
     }
 }

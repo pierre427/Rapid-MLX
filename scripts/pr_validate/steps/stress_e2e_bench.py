@@ -163,7 +163,7 @@ class StressE2EBenchStep(Step):
 
                     # Bench FIRST, on a server that has served nothing
                     # else. It used to run last, after the stress battery
-                    # and the whole agent matrix had hammered this same
+                    # and the whole SDK matrix had hammered this same
                     # process — so it measured residual state, not the
                     # code under review.
                     #
@@ -916,10 +916,27 @@ def _bench_ab_against_base(
         for arm in ("base", "pr")
         for metric in ("cold", "warm")
     }
-    noisy = [
+    # Warm is the steady-state latency users actually live with; if either arm's
+    # WARM capture is noisy the machine genuinely is not quiet enough to judge.
+    #
+    # Cold-start latency is different in kind, not just degree: on the large-model
+    # matrix each round evicts the previous model from the page cache and pays a
+    # fresh per-process Metal kernel compilation, so cold spread is dominated by
+    # intrinsic, non-ambient variance (see #2118 and the artifact note in
+    # ``_measure_bench``). Gating on it made the quiet-machine check structurally
+    # unsatisfiable for high-blast PRs — every run went INCONCLUSIVE while the
+    # measured A/B delta was within noise. So a noisy cold spread no longer blocks:
+    # the warm A/B still decides the verdict, and the cold delta is demoted to
+    # advisory (unmeasurable here) rather than forcing a maintainer merge call.
+    warm_noisy = [
         f"{name} {value:.1f}%"
         for name, value in spreads.items()
-        if value > thresholds[name.rsplit("_", 1)[1]]
+        if name.endswith("_warm") and value > thresholds["warm"]
+    ]
+    cold_noisy = [
+        f"{name} {value:.1f}%"
+        for name, value in spreads.items()
+        if name.endswith("_cold") and value > thresholds["cold"]
     ]
     best = {
         arm: {
@@ -932,6 +949,8 @@ def _bench_ab_against_base(
         metric: (best["pr"][metric] / best["base"][metric] - 1) * 100
         for metric in ("cold", "warm")
     }
+    # Judge cold only when its capture was quiet; otherwise warm alone decides.
+    judged = ("cold", "warm") if not cold_noisy else ("warm",)
     artifact = ctx.artifact_path(f"bench-ab-{_safe_name(choice.model_id)}.json")
     artifact.write_text(
         json.dumps(
@@ -943,28 +962,37 @@ def _bench_ab_against_base(
                 "capture_spread_pct": spreads,
                 "best": best,
                 "delta_pct": delta,
+                "judged_metrics": list(judged),
+                "cold_advisory": bool(cold_noisy),
             },
             indent=2,
         )
     )
     detail = f"cold {delta['cold']:+.1f}%, warm {delta['warm']:+.1f}% vs base"
-    if noisy:
+    if warm_noisy:
+        noisy = warm_noisy + cold_noisy
         return {
             "status": "skip",
             "summary": f"machine not quiet enough to judge ({', '.join(noisy)}); {detail}",
             "artifact": str(artifact),
             "executed": True,
         }
-    if any(delta[m] > thresholds[m] for m in ("cold", "warm")):
+    advisory = ""
+    if cold_noisy:
+        advisory = (
+            f"; cold spread too high to judge ({', '.join(cold_noisy)}) — "
+            "cold delta advisory only, verdict on warm"
+        )
+    if any(delta[m] > thresholds[m] for m in judged):
         return {
             "status": "fail",
-            "summary": f"perf regression confirmed: {detail}",
+            "summary": f"perf regression confirmed: {detail}{advisory}",
             "artifact": str(artifact),
             "executed": True,
         }
     return {
         "status": "pass",
-        "summary": f"not this PR: {detail}",
+        "summary": f"not this PR: {detail}{advisory}",
         "artifact": str(artifact),
         "executed": True,
     }
@@ -1026,7 +1054,7 @@ def _resolve_bench_against_base(
             ),
         }
 
-    # The base is measured after the stress battery and the agent matrix have
+    # The base is measured after the stress battery and the SDK matrix have
     # run for this model, so the machine is warmer than it was for the PR's
     # bench on a fresh server. That biases the base SLOW, and a slow base is
     # exactly what excuses a PR — the wrong direction. Requiring the base to

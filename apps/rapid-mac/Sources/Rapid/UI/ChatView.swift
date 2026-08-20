@@ -219,8 +219,18 @@ struct ChatView: View {
 
     @State private var draft: String = ""
     @State private var imageAttachments: [ChatImageAttachment] = []
+    @State private var fileAttachments: [ChatFileAttachment] = []
+    /// Source path per attachment, image or document, so the same file cannot
+    /// be added twice.
+    ///
+    /// Kept beside the attachments rather than on the attachment types: both
+    /// are `Codable` and persist with the conversation, and an absolute path
+    /// written into chat history carries the user's account name and stops
+    /// being true the moment the file moves.
+    @State private var attachedSourcePaths: [UUID: String] = [:]
     @State private var attachmentNotice: String?
-    @State private var isImageDropTarget = false
+    @State private var isAttachmentDropTarget = false
+    @State private var isImportingFiles = false
     @State private var composeFocusToken: Int = 0
     /// Incremented every time the user tries to send while gated. Drives
     /// the banner's brief emphasis so a blocked Return is never silent.
@@ -241,6 +251,9 @@ struct ChatView: View {
     /// preference arrives after the scroll event, which leaves a window
     /// where the next streamed token can still yank the reader downward.
     @State private var isPinnedToBottom = true
+    /// Incremented to ask the probe for an explicit scroll — see
+    /// ``TranscriptScrollPositionProbe/scrollToBottomRequest``.
+    @State private var scrollToBottomRequest = 0
 
     private var messages: [ChatMessage] { viewModel.messages }
 
@@ -323,7 +336,8 @@ struct ChatView: View {
                         TranscriptScrollPositionProbe(
                             isPinnedToBottom: $isPinnedToBottom,
                             bottomResumeSlack: bottomResumeSlack,
-                            isStreaming: viewModel.isStreaming
+                            isStreaming: viewModel.isStreaming,
+                            scrollToBottomRequest: scrollToBottomRequest
                         )
                     )
             }
@@ -352,9 +366,11 @@ struct ChatView: View {
     private var jumpToBottomOverlay: some View {
         if !isPinnedToBottom {
             JumpToBottomButton(isStreaming: viewModel.isStreaming) {
-                // The probe owns positioning: re-pinning re-enters
-                // `updateNSView` → `attach`, which scrolls to the bottom.
+                // The probe owns positioning, so ask it — re-pinning alone
+                // only restores following, and following has nothing to react
+                // to once an answer has finished arriving.
                 isPinnedToBottom = true
+                scrollToBottomRequest += 1
             }
             .padding(.bottom, RapidTheme.Space.md)
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
@@ -583,7 +599,7 @@ struct ChatView: View {
             // tall and read as a card that happened to contain a text
             // area; this reads as a text field with controls in it.
             VStack(spacing: RapidTheme.Space.sm - 2) {
-                if !imageAttachments.isEmpty {
+                if !imageAttachments.isEmpty || !fileAttachments.isEmpty {
                     attachmentStrip
                 }
                 // The field stays live in every state — a user may draft
@@ -598,7 +614,7 @@ struct ChatView: View {
                     placeholder: readiness.composerPlaceholder,
                     onSubmit: send,
                     onCancel: { viewModel.stop() },
-                    onPasteImages: pasteImagesFromClipboard,
+                    onPasteAttachments: pasteAttachmentsFromClipboard,
                     onRecallLastUser: {
                         messages.last(where: { $0.role == .user })?.content
                     }
@@ -614,19 +630,14 @@ struct ChatView: View {
             .overlay(
                 RoundedRectangle(cornerRadius: RapidTheme.Radius.input, style: .continuous)
                     .strokeBorder(
-                        isImageDropTarget ? RapidTheme.brandPrimary : RapidTheme.hairlineStrong,
-                        lineWidth: isImageDropTarget ? 2 : 1
+                        isAttachmentDropTarget ? RapidTheme.brandPrimary : RapidTheme.hairlineStrong,
+                        lineWidth: isAttachmentDropTarget ? 2 : 1
                     )
             )
             .dropDestination(for: URL.self) { urls, _ in
-                guard supportsImageInput else {
-                    rejectImageInputForCurrentModel()
-                    return false
-                }
-                addImageURLs(urls)
-                return true
+                addAttachmentURLs(urls)
             } isTargeted: { targeted in
-                isImageDropTarget = targeted && supportsImageInput
+                isAttachmentDropTarget = targeted
             }
             .frame(maxWidth: contentMaxWidth)
             .frame(maxWidth: .infinity)
@@ -640,26 +651,18 @@ struct ChatView: View {
     /// right, then the send/stop button — Ollama's `model ▾  ⬆` cluster.
     private var composerControls: some View {
         HStack(spacing: RapidTheme.Space.sm) {
-            Button(action: chooseImages) {
+            Button(action: chooseAttachments) {
                 Image(systemName: "plus")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(supportsImageInput ? Color.primary : Color.secondary)
+                    .foregroundStyle(Color.primary)
                     .frame(width: 28, height: 28)
-                    .background(Circle().fill(Color.primary.opacity(supportsImageInput ? 0.06 : 0.02)))
+                    .background(Circle().fill(Color.primary.opacity(0.06)))
             }
             .buttonStyle(.plain)
-            .disabled(!supportsImageInput || viewModel.isStreaming)
-            .help(supportsImageInput ? "Add photos" : "This model doesn't support images")
-            .accessibilityLabel("Add photos")
-            // Identifier BEFORE hint, matching ChatView.SendOrStopButton. On
-            // macOS 26 a disabled .buttonStyle(.plain) button whose hint is
-            // applied after the identifier drops out of the AX tree entirely
-            // (the enabled Send button, ordered the other way, survives) — so
-            // the "Add photos" control became unreachable to VoiceOver and
-            // invisible to the golden-flow harness whenever the model is
-            // text-only. Ordering identifier first keeps it addressable.
-            .accessibilityIdentifier("ChatView.AddPhotos")
-            .accessibilityHint(supportsImageInput ? "" : "This model doesn't support images")
+            .disabled(viewModel.isStreaming || isImportingFiles)
+            .help(supportsImageInput ? "Add files or photos" : "Add PDF, CSV, or TXT files")
+            .accessibilityLabel("Add attachments")
+            .accessibilityIdentifier("ChatView.AddAttachments")
             Button {
                 conversationInstructionsDraft = viewModel.conversationInstructions
                 showsConversationInstructions = true
@@ -762,12 +765,14 @@ struct ChatView: View {
     /// replaces the old behaviour where pressing Send on a cold model
     /// silently kicked off a multi-gigabyte download behind a spinner.
     private var sendEnabled: Bool {
-        hasDraft && readiness.sendAllowed && (imageAttachments.isEmpty || supportsImageInput)
+        hasDraft && readiness.sendAllowed && !isImportingFiles
+            && (imageAttachments.isEmpty || supportsImageInput)
     }
 
     private var hasDraft: Bool {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !imageAttachments.isEmpty
+            || !fileAttachments.isEmpty
     }
 
     // MARK: - Actions
@@ -775,8 +780,10 @@ struct ChatView: View {
     private func send() {
         let text = draft
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || !imageAttachments.isEmpty else { return }
+                || !imageAttachments.isEmpty
+                || !fileAttachments.isEmpty else { return }
         guard !viewModel.isStreaming else { return }
+        guard !isImportingFiles else { return }
         guard imageAttachments.isEmpty || supportsImageInput else {
             rejectImageInputForCurrentModel()
             return
@@ -794,10 +801,18 @@ struct ChatView: View {
         guard acknowledgeIfNotReady() else { return }
         draft = ""
         let images = imageAttachments
+        let files = fileAttachments
         imageAttachments = []
+        fileAttachments = []
+        attachedSourcePaths = [:]
         attachmentNotice = nil
         composeFocusToken &+= 1
-        viewModel.send(text, alias: alias, imageAttachments: images)
+        viewModel.send(
+            text,
+            alias: alias,
+            imageAttachments: images,
+            fileAttachments: files
+        )
     }
 
     private var supportsImageInput: Bool {
@@ -818,6 +833,7 @@ struct ChatView: View {
                         }
                         Button {
                             imageAttachments.removeAll { $0.id == attachment.id }
+                            attachedSourcePaths[attachment.id] = nil
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .symbolRenderingMode(.palette)
@@ -831,55 +847,208 @@ struct ChatView: View {
                         )
                     }
                 }
+                ForEach(fileAttachments) { attachment in
+                    HStack(spacing: RapidTheme.Space.sm) {
+                        Image(systemName: attachment.kind.systemImage)
+                            .font(.system(size: 20))
+                            .foregroundStyle(RapidTheme.brandPrimary)
+                            .frame(width: 28)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(attachment.filename)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                            Text(attachment.detailText)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Button {
+                            fileAttachments.removeAll { $0.id == attachment.id }
+                            attachedSourcePaths[attachment.id] = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove \(attachment.filename)")
+                        .accessibilityIdentifier(
+                            "ChatView.Attachment.Remove.\(attachment.filename)"
+                        )
+                    }
+                    .padding(.horizontal, RapidTheme.Space.sm)
+                    .frame(width: 220, height: 54, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: RapidTheme.Radius.input, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                    )
+                }
             }
             .padding(.top, 5)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func chooseImages() {
-        guard supportsImageInput else {
-            rejectImageInputForCurrentModel()
-            return
-        }
+    private func chooseAttachments() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.png, .jpeg, .gif]
+        panel.allowedContentTypes = supportsImageInput
+            ? [.pdf, .commaSeparatedText, .plainText, .png, .jpeg, .gif]
+            : [.pdf, .commaSeparatedText, .plainText]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         guard panel.runModal() == .OK else { return }
-        addImageURLs(panel.urls)
+        _ = addAttachmentURLs(panel.urls)
+    }
+
+    @discardableResult
+    private func addAttachmentURLs(_ urls: [URL]) -> Bool {
+        guard !isImportingFiles else { return false }
+        // Filter before splitting, so images and documents get the same
+        // answer to "is this already here". Re-attaching is not merely
+        // redundant for a document: the per-message character budget is split
+        // evenly across attachments (``fittedForMessage``), so the same PDF
+        // added four times sends a quarter of it four times over instead of
+        // the whole thing once, and says so only with a "partial" chip.
+        let (urls, duplicates) = Self.withoutAlreadyAttached(
+            urls, attached: Set(attachedSourcePaths.values)
+        )
+        guard !urls.isEmpty else {
+            attachmentNotice = duplicates == 1
+                ? "That file is already attached."
+                : "Those files are already attached."
+            return false
+        }
+        var imageURLs: [URL] = []
+        var fileURLs: [URL] = []
+        var unsupported = false
+        var accepted = false
+        for url in urls {
+            let type = UTType(filenameExtension: url.pathExtension)
+            if ChatFileAttachment.recognizesDocument(at: url) {
+                fileURLs.append(url)
+            } else if type?.conforms(to: .image) == true {
+                imageURLs.append(url)
+            } else {
+                unsupported = true
+            }
+        }
+
+        if !imageURLs.isEmpty {
+            if supportsImageInput {
+                addImageURLs(imageURLs)
+                accepted = true
+            } else {
+                rejectImageInputForCurrentModel()
+            }
+        }
+        if !fileURLs.isEmpty {
+            accepted = addFileURLs(fileURLs) || accepted
+        }
+        if unsupported {
+            attachmentNotice = "Choose PDF, CSV, TXT, PNG, JPEG, or GIF files."
+        }
+        return accepted
     }
 
     private func addImageURLs(_ urls: [URL]) {
         var accepted: [ChatImageAttachment] = []
         var rejection: String?
         for url in urls {
-            do { accepted.append(try ChatImageAttachment(contentsOf: url)) }
+            do {
+                let attachment = try ChatImageAttachment(contentsOf: url)
+                attachedSourcePaths[attachment.id] = Self.attachmentKey(for: url)
+                accepted.append(attachment)
+            }
             catch { rejection = error.localizedDescription }
         }
         imageAttachments.append(contentsOf: accepted)
         attachmentNotice = rejection
     }
 
-    private func pasteImagesFromClipboard() -> Bool {
+    @discardableResult
+    private func addFileURLs(_ urls: [URL]) -> Bool {
+        let selection = ChatFileAttachment.importCandidates(
+            urls,
+            existingCount: fileAttachments.count
+        )
+        guard !selection.accepted.isEmpty else {
+            attachmentNotice = "Attach up to \(ChatFileAttachment.maxAttachmentsPerMessage) PDF, CSV, or TXT files per message."
+            return false
+        }
+        isImportingFiles = true
+        Task { @MainActor in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.loadFileAttachments(selection.accepted)
+            }.value
+
+            let combined = fileAttachments + outcome.0.map(\.attachment)
+            fileAttachments = ChatFileAttachment.fittedForMessage(combined)
+            for imported in outcome.0 {
+                attachedSourcePaths[imported.attachment.id] = Self.attachmentKey(
+                    for: imported.sourceURL
+                )
+            }
+            if selection.rejectedCount > 0 {
+                attachmentNotice = "Attach up to \(ChatFileAttachment.maxAttachmentsPerMessage) PDF, CSV, or TXT files per message."
+            } else {
+                attachmentNotice = outcome.1
+            }
+            isImportingFiles = false
+        }
+        return true
+    }
+
+    /// Parse candidates without losing which source produced each attachment.
+    /// Failed candidates may appear anywhere in the batch, so pairing a
+    /// filtered attachments array with the original URL array by index would
+    /// associate every success after a failure with the wrong path.
+    nonisolated static func loadFileAttachments(
+        _ urls: [URL]
+    ) -> (
+        accepted: [(attachment: ChatFileAttachment, sourceURL: URL)],
+        rejection: String?
+    ) {
+        var accepted: [(attachment: ChatFileAttachment, sourceURL: URL)] = []
+        var rejection: String?
+        for url in urls {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed { url.stopAccessingSecurityScopedResource() }
+            }
+            do {
+                accepted.append((
+                    attachment: try ChatFileAttachment(contentsOf: url),
+                    sourceURL: url
+                ))
+            } catch {
+                rejection = error.localizedDescription
+            }
+        }
+        return (accepted, rejection)
+    }
+
+    private func pasteAttachmentsFromClipboard() -> Bool {
         let pasteboard = NSPasteboard.general
         let urls = (pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL] ?? []).filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true }
+        ) as? [URL] ?? []).filter {
+            let type = UTType(filenameExtension: $0.pathExtension)
+            return type?.conforms(to: .image) == true
+                || ChatFileAttachment.recognizesDocument(at: $0)
+        }
         let pastedImage = NSImage(pasteboard: pasteboard)
         guard !urls.isEmpty || pastedImage != nil else { return false }
-        guard supportsImageInput else {
-            rejectImageInputForCurrentModel()
-            return true
-        }
         if !urls.isEmpty {
-            addImageURLs(urls)
+            _ = addAttachmentURLs(urls)
         } else if let image = pastedImage,
                   let tiff = image.tiffRepresentation,
                   let rep = NSBitmapImageRep(data: tiff),
                   let png = rep.representation(using: .png, properties: [:]) {
+            guard supportsImageInput else {
+                rejectImageInputForCurrentModel()
+                return true
+            }
             do {
                 imageAttachments.append(try ChatImageAttachment(
                     filename: "Pasted image.png", mimeType: "image/png", data: png
@@ -888,6 +1057,30 @@ struct ChatView: View {
             } catch { attachmentNotice = error.localizedDescription }
         }
         return true
+    }
+
+    /// Identity for "the same file". Symlinks and `..` segments are resolved
+    /// so two spellings of one path do not read as two files; the same bytes
+    /// living at two real paths deliberately still count as two, because
+    /// deciding otherwise would mean reading every candidate before we know
+    /// whether we want it.
+    nonisolated static func attachmentKey(for url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// Split incoming URLs into ones not yet attached and a count of the rest.
+    /// Also collapses repeats WITHIN one batch — selecting the same file twice
+    /// in the open panel is the same mistake as pasting it twice.
+    nonisolated static func withoutAlreadyAttached(
+        _ urls: [URL], attached: Set<String>
+    ) -> (fresh: [URL], duplicates: Int) {
+        var seen = attached
+        var fresh: [URL] = []
+        for url in urls {
+            let key = attachmentKey(for: url)
+            if seen.insert(key).inserted { fresh.append(url) }
+        }
+        return (fresh, urls.count - fresh.count)
     }
 
     private func rejectImageInputForCurrentModel() {
@@ -972,6 +1165,30 @@ private struct MessageRow: View {
                     userEditor
                 } else {
                     VStack(alignment: .leading, spacing: RapidTheme.Space.sm) {
+                        if !message.fileAttachments.isEmpty {
+                            VStack(alignment: .leading, spacing: RapidTheme.Space.xs) {
+                                ForEach(message.fileAttachments) { attachment in
+                                    HStack(spacing: RapidTheme.Space.sm) {
+                                        Image(systemName: attachment.kind.systemImage)
+                                            .foregroundStyle(RapidTheme.userBubbleText.opacity(0.8))
+                                            .frame(width: 20)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(attachment.filename)
+                                                .font(.caption.weight(.medium))
+                                                .lineLimit(1)
+                                            Text(attachment.detailText)
+                                                .font(.caption2)
+                                                .foregroundStyle(RapidTheme.userBubbleText.opacity(0.7))
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                    .accessibilityElement(children: .combine)
+                                    .accessibilityLabel(
+                                        "\(attachment.kind.displayName) file, \(attachment.filename), \(attachment.detailText)"
+                                    )
+                                }
+                            }
+                        }
                         if !message.imageAttachments.isEmpty {
                             LazyVGrid(
                                 columns: [GridItem(.adaptive(minimum: 120, maximum: 220))],
@@ -1028,6 +1245,7 @@ private struct MessageRow: View {
             .foregroundStyle(RapidTheme.userBubbleText)
             .scrollContentBackground(.hidden)
             .focused($editFieldFocused)
+            .accessibilityIdentifier(actionIdentifier("EditField"))
             .task {
                 await Task.yield()
                 guard !Task.isCancelled else { return }
@@ -1079,7 +1297,11 @@ private struct MessageRow: View {
                 }
                 .disabled(
                     isStreaming
-                        || editDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || (
+                            editDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                && message.imageAttachments.isEmpty
+                                && message.fileAttachments.isEmpty
+                        )
                 )
                 .accessibilityIdentifier(actionIdentifier("SaveEdit"))
             } else {
@@ -1321,6 +1543,7 @@ private struct MessageRow: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(reasoningAccessibilityLabel)
         }
+        .accessibilityIdentifier(actionIdentifier("ReasoningDisclosure"))
         .onAppear {
             // Auto-expand a truncated reasoning-only turn so the user
             // sees the partial trace instead of an empty bubble.
@@ -1555,6 +1778,7 @@ private struct ToolCallChip: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Tool call \(call.function.name)")
+            .accessibilityIdentifier("ToolCallChip.Toggle.\(call.id)")
 
             if expanded {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1621,7 +1845,7 @@ struct ComposeField: View {
     /// No-op (returns control to AppKit's default Esc handling)
     /// when nothing is streaming.
     var onCancel: () -> Void
-    var onPasteImages: () -> Bool = { false }
+    var onPasteAttachments: () -> Bool = { false }
     /// Resolves the text of the last user message in the active
     /// session, or ``nil`` when there's nothing to recall. Bound to
     /// the Up-arrow-in-empty-compose recall affordance (Claude /
@@ -1648,6 +1872,11 @@ struct ComposeField: View {
     /// NSTextView balloon to a giant centred textarea).
     @State private var contentHeight: CGFloat = 22
 
+    /// True while an input method is showing pre-edit text. ``text`` is
+    /// empty for that whole phase, so this is what keeps the placeholder
+    /// from rendering underneath a half-typed pinyin / kana run.
+    @State private var isComposing = false
+
     var body: some View {
         // v0.5 (Phase 5b): explicit height. The editor measures its own
         // text and reports it; we clamp and apply it via `.frame(height:)`.
@@ -1665,11 +1894,12 @@ struct ComposeField: View {
                 isStreaming: isStreaming,
                 onSubmit: onSubmit,
                 onCancel: onCancel,
-                onPasteImages: onPasteImages,
+                onPasteAttachments: onPasteAttachments,
                 onRecallLastUser: onRecallLastUser,
                 axIdentifier: axIdentifier,
                 axLabel: axLabel,
                 axRoleDescription: axRoleDescription,
+                onComposingChange: { isComposing = $0 },
                 onMeasuredHeight: { measured in
                     let clamped = min(max(measured, minHeight), maxHeight)
                     if abs(clamped - contentHeight) > 0.5 {
@@ -1677,7 +1907,7 @@ struct ComposeField: View {
                     }
                 }
             )
-            if text.isEmpty {
+            if text.isEmpty, !isComposing {
                 Text(placeholder)
                     // Overlays the 15pt NSTextView — must match its
                     // size or the placeholder visibly shrinks the
@@ -1705,6 +1935,56 @@ final class AutosizingTextView: NSTextView {
     /// view's width changes. The receiver owns the clamping; this only
     /// reports what the layout manager actually used.
     var onMeasuredHeight: ((CGFloat) -> Void)?
+
+    /// Called when input-method pre-edit text (marked text) appears or
+    /// clears.
+    ///
+    /// AppKit does NOT post a text-did-change notification while an IME
+    /// is composing, so ``text`` stays empty through the whole pinyin /
+    /// kana / jamo phase. ``ComposeField`` keyed its placeholder off
+    /// that binding alone, so "Send a message…" kept rendering
+    /// underneath the candidate text the user was typing. Marked text is
+    /// the only signal that the field is non-empty here.
+    var onComposingChange: ((Bool) -> Void)?
+    /// Gives the chat composer first refusal on file/image pasteboard items.
+    /// AppKit routes Command-V through ``paste(_:)`` directly; it does not
+    /// reliably consult the text-view delegate's ``doCommandBy`` hook.
+    var onPasteAttachments: (() -> Bool)?
+    private var lastReportedCompositionState = false
+
+    private func reportCompositionState() {
+        let isComposing = hasMarkedText()
+        guard isComposing != lastReportedCompositionState else { return }
+        lastReportedCompositionState = isComposing
+        onComposingChange?(isComposing)
+    }
+
+    override func setMarkedText(
+        _ string: Any,
+        selectedRange: NSRange,
+        replacementRange: NSRange
+    ) {
+        super.setMarkedText(
+            string,
+            selectedRange: selectedRange,
+            replacementRange: replacementRange
+        )
+        reportCompositionState()
+        // Pre-edit text occupies real lines — a long pinyin run wraps
+        // and must grow the field like committed text does.
+        remeasure()
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        reportCompositionState()
+        remeasure()
+    }
+
+    override func paste(_ sender: Any?) {
+        if onPasteAttachments?() == true { return }
+        super.paste(sender)
+    }
 
     /// Height of the laid-out text plus the editor's vertical insets.
     var measuredHeight: CGFloat {
@@ -1792,7 +2072,7 @@ struct ComposeTextEditor: NSViewRepresentable {
     var isStreaming: Bool
     var onSubmit: () -> Void
     var onCancel: () -> Void
-    var onPasteImages: () -> Bool
+    var onPasteAttachments: () -> Bool
     var onRecallLastUser: () -> String?
     /// Accessibility identity of the underlying ``NSTextView``. Defaults to
     /// the chat compose field so every existing call site — and the external
@@ -1804,9 +2084,25 @@ struct ComposeTextEditor: NSViewRepresentable {
     var axIdentifier: String = AutosizingTextView.composeAccessibilityIdentifier
     var axLabel: String = AutosizingTextView.composeAccessibilityLabel
     var axRoleDescription: String = AutosizingTextView.composeAccessibilityRoleDescription
+    /// Reports whether an input method is currently showing pre-edit
+    /// text, so the placeholder can yield to it. Defaults to a no-op:
+    /// call sites that don't draw a placeholder don't need to care.
+    var onComposingChange: (Bool) -> Void = { _ in }
     /// Reports the editor's laid-out content height so ``ComposeField``
     /// can size the field to the draft.
     var onMeasuredHeight: (CGFloat) -> Void
+
+    /// Keep this decision pure so the IME regression stays testable without
+    /// constructing SwiftUI's private representable context. Marked text is
+    /// owned by AppKit until the input method commits it; the binding must not
+    /// overwrite that temporary editor value.
+    static func shouldApplyBindingText(
+        viewHasMarkedText: Bool,
+        editorText: String,
+        bindingText: String
+    ) -> Bool {
+        !viewHasMarkedText && editorText != bindingText
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         let tv = AutosizingTextView()
@@ -1839,6 +2135,8 @@ struct ComposeTextEditor: NSViewRepresentable {
             width: 0, height: CGFloat.greatestFiniteMagnitude
         )
         tv.onMeasuredHeight = onMeasuredHeight
+        tv.onComposingChange = onComposingChange
+        tv.onPasteAttachments = onPasteAttachments
         // Bug 3-A residual P2: NSTextView already advertises role
         // ``.textArea`` by default, but with no label / identifier
         // AppleScript and cliclick can't tell which text area is the
@@ -1866,7 +2164,18 @@ struct ComposeTextEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? AutosizingTextView else { return }
-        if view.string != text {
+        // Never write over an in-flight IME composition. While marked
+        // text is up, ``view.string`` holds the pre-edit run and ``text``
+        // is still empty (AppKit posts no text-did-change until the user
+        // commits), so this branch would look like a stale draft and
+        // assigning ``text`` would erase the pinyin mid-word. Any
+        // unrelated SwiftUI update landing on this view — including the
+        // placeholder's own state change — is enough to trigger it.
+        if Self.shouldApplyBindingText(
+            viewHasMarkedText: view.hasMarkedText(),
+            editorText: view.string,
+            bindingText: text
+        ) {
             view.string = text
             // A programmatic assignment does not fire ``didChangeText``,
             // so the parent would keep the height of the previous draft
@@ -1874,9 +2183,11 @@ struct ComposeTextEditor: NSViewRepresentable {
             view.remeasure()
         }
         view.onMeasuredHeight = onMeasuredHeight
+        view.onComposingChange = onComposingChange
+        view.onPasteAttachments = onPasteAttachments
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onCancel = onCancel
-        context.coordinator.onPasteImages = onPasteImages
+        context.coordinator.onPasteAttachments = onPasteAttachments
         context.coordinator.isStreaming = isStreaming
         context.coordinator.onRecallLastUser = onRecallLastUser
         // Cmd+L (or any other external focus request) bumps the
@@ -1897,7 +2208,7 @@ struct ComposeTextEditor: NSViewRepresentable {
             text: $text,
             onSubmit: onSubmit,
             onCancel: onCancel,
-            onPasteImages: onPasteImages,
+            onPasteAttachments: onPasteAttachments,
             isStreaming: isStreaming,
             onRecallLastUser: onRecallLastUser
         )
@@ -1908,7 +2219,7 @@ struct ComposeTextEditor: NSViewRepresentable {
         var text: Binding<String>
         var onSubmit: () -> Void
         var onCancel: () -> Void
-        var onPasteImages: () -> Bool
+        var onPasteAttachments: () -> Bool
         var isStreaming: Bool
         /// Resolves text of the last user message for Up-arrow recall;
         /// nil = nothing to recall, fall through to AppKit default.
@@ -1921,14 +2232,14 @@ struct ComposeTextEditor: NSViewRepresentable {
             text: Binding<String>,
             onSubmit: @escaping () -> Void,
             onCancel: @escaping () -> Void,
-            onPasteImages: @escaping () -> Bool,
+            onPasteAttachments: @escaping () -> Bool,
             isStreaming: Bool,
             onRecallLastUser: @escaping () -> String?
         ) {
             self.text = text
             self.onSubmit = onSubmit
             self.onCancel = onCancel
-            self.onPasteImages = onPasteImages
+            self.onPasteAttachments = onPasteAttachments
             self.isStreaming = isStreaming
             self.onRecallLastUser = onRecallLastUser
         }
@@ -1939,7 +2250,7 @@ struct ComposeTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSText.paste(_:)), onPasteImages() {
+            if commandSelector == #selector(NSText.paste(_:)), onPasteAttachments() {
                 return true
             }
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
@@ -2384,6 +2695,9 @@ private struct CodeBlockWithCopy: View {
         }
         .buttonStyle(.plain)
         .help("Copy code")
+        .accessibilityIdentifier(
+            "ChatView.CodeBlock.Copy.\(config.content.utf8.count)"
+        )
         .task(id: copiedRecently) {
             guard copiedRecently else { return }
             // 1.2 s feels like ChatGPT Desktop's flash; long enough

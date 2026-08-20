@@ -73,21 +73,23 @@ config, plus an honest test-backed [support matrix](../agents/matrix.md):
 [OpenCode](../agents/opencode.md) ·
 [Qwen Code](../agents/qwen-code.md) ·
 [OpenHands](../agents/openhands.md) ·
-[Hermes Agent](../agents/hermes-agent.md).
+[Hermes Agent](../agents/hermes-agent.md) ·
+[DeepSeek Harness](../agents/deepseek-harness.md).
 
 | Client | Type | Setup | Status | Notes |
 |--------|------|-------|--------|-------|
 | [Aider](https://aider.chat) | CLI | `OPENAI_API_BASE=http://localhost:8000/v1 aider --model openai/default` | Verified | Architect mode, edit-and-commit |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | CLI / TUI / web | `rapid-mlx agents dsh --setup` | Verified | Tier-1 release gate; generic `openai-completions` provider, never `deepseek-official`. Needs Node 22.15+ |
 | [OpenCode](https://github.com/sst/opencode) | TUI | `rapid-mlx agents opencode --setup` | Compatible | Claude Code-like terminal UX |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | CLI | `rapid-mlx agents claude-code --setup` | Compatible | Safe diff/confirm/backup flow; uses Anthropic `/v1/messages` |
 | [Cursor](https://cursor.com) | IDE | `RAPID_MLX_API_KEY=your-secret rapid-mlx launch cursor --server-url https://your-public-host` | Not compatible locally | BYOK requests pass through Cursor's servers; public HTTPS and server auth are required |
+| [Continue.dev](https://continue.dev) | IDE Extension | `rapid-mlx agents continue --setup` | Compatible | Safe diff/confirm/backup flow; VS Code / JetBrains |
+| [pi](https://shittycodingagent.ai) | TUI | `OPENAI_BASE_URL=http://localhost:8000/v1` | Community-reported | Works with Qwen3.5/Qwen3.6 models |
 
 Rapid-MLX rejects explicit local/private Cursor addresses, but it does not use
 your Mac's DNS result as proof that Cursor's backend can reach a hostname.
 Split-horizon DNS may look different from Cursor's network, so verify the
 authenticated HTTPS endpoint from an external network before configuring it.
-| [Continue.dev](https://continue.dev) | IDE Extension | `rapid-mlx agents continue --setup` | Compatible | Safe diff/confirm/backup flow; VS Code / JetBrains |
-| [pi](https://shittycodingagent.ai) | TUI | `OPENAI_BASE_URL=http://localhost:8000/v1` | Community-reported | Works with Qwen3.5/Qwen3.6 models |
 
 ### Web UIs
 
@@ -114,12 +116,12 @@ see [Testing Methodology](#testing-methodology).
 - **Windsurf** (IDE) — Settings > OpenAI Base URL
 - **Zed** (IDE) — `assistant.openai_api_url: "http://localhost:8000/v1"` in settings
 
-Clients with a `rapid-mlx agents` profile (pre-built config, no automated tests yet):
+Clients with a `rapid-mlx agents` profile (pre-built config) not covered
+in the tables above:
 
-- **codex** (CLI) — `rapid-mlx agents codex --setup`
-- **Goose** (CLI) — `rapid-mlx agents goose --setup`
+- **Codex CLI** (CLI) — `rapid-mlx agents codex --setup`
+- **Kilo Code** (IDE Extension) — `rapid-mlx agents kilo-code --setup`
 - **OpenHands** (Web/Docker) — `rapid-mlx agents openhands --setup`
-- **OpenClaude** (CLI) — `rapid-mlx agents openclaude --setup`
 
 ## Testing Methodology
 
@@ -208,19 +210,20 @@ Currently supported profiles (in `vllm_mlx/agents/profiles/`):
 
 | Profile | Agent | Auto-setup | Automated Tests |
 |---------|-------|------------|----------------|
-| `aider` | Aider | Yes | Yes (`test_aider.sh`) |
-| `cline` | Cline (VS Code) | Config template | No |
-| `codex` | OpenAI Codex CLI | Yes | No |
-| `generic` | Any OpenAI client | Env vars | No |
-| `goose` | Block Goose | Yes | No |
-| `hermes` | Hermes Agent | Yes | Yes (`test_hermes.py`) |
-| `langchain` | LangChain | Python snippet | Yes (`test_langchain.py`) |
-| `openclaude` | OpenClaude | Yes | No |
-| `opencode` | OpenCode | Yes | No |
-| `openhands` | OpenHands | Yes | No |
-| `pydanticai` | PydanticAI | Python snippet | Yes (`test_pydantic_ai_full.py`) |
-| `smolagents` | smolagents | Python snippet | Yes (`test_smolagents_full.py`) |
+| `aider` | Aider | Env vars | Yes (`test_aider.sh`) |
+| `claude-code` | Claude Code | Env vars | Yes (`test_agents_matrix.py`) |
+| `codex` | Codex CLI | TOML config | Yes (`test_agents_matrix.py`) |
+| `continue` | Continue.dev | JSON config | No |
+| `deepseek-harness` | DeepSeek Harness | YAML config | Yes (`test_deepseek_harness_tier1.py`) |
+| `hermes` | Hermes Agent | YAML config | Yes (`test_hermes.py`) |
+| `kilo-code` | Kilo Code | JSON config | Yes (`test_agents_matrix.py`) |
+| `langchain` | LangChain | Env vars | Yes (`test_langchain.py`) |
+| `opencode` | OpenCode | JSON config | Yes (`test_agents_matrix.py`) |
+| `openhands` | OpenHands | Env vars | Yes (`test_openhands.sh`) |
+| `pydanticai` | PydanticAI | Env vars | Yes (`test_pydantic_ai_full.py`) |
+| `qwen-code` | Qwen Code | JSON config | Yes (`test_agents_matrix.py`) |
+| `smolagents` | smolagents | Env vars | Yes (`test_smolagents_full.py`) |
 
 To add a new agent profile, create a YAML file in
 `vllm_mlx/agents/profiles/` following the structure in
-`generic.yaml`. See `vllm_mlx/agents/base.py` for the data model.
+`aider.yaml`. See `vllm_mlx/agents/base.py` for the data model.

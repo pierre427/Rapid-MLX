@@ -30,6 +30,15 @@ struct FailureDiagnosis: Equatable, Sendable {
         case toolFailed
         case userDeclined
         case downloadFailed
+        /// The user stopped the pull themselves. Distinct from
+        /// ``downloadFailed`` because the two differ in the only thing the
+        /// copy is for: nothing went wrong, and "check your connection" is
+        /// advice about a fault that did not happen. Paper 05.1 flags the
+        /// collapsed reading explicitly ("For a user-initiated stop that
+        /// connection advice is wrong … the fix belongs in FailureDiagnoser,
+        /// not in the design"), so the split lives here rather than in a
+        /// screen deciding to say something different about the same kind.
+        case downloadCancelled
         case downloadSourceUnavailable
         case requestFailed
 
@@ -63,6 +72,12 @@ struct FailureDiagnosis: Equatable, Sendable {
                 return .webSearchUnavailable
             case .browsePageTooLarge:
                 return .toolFailed
+            // Added after the same release, and carrying the same hazard. A
+            // download outcome is never written into a transcript today, but
+            // the ancestor is named anyway so that stays true by construction
+            // rather than by nobody having tried it.
+            case .downloadCancelled:
+                return .downloadFailed
             case .modelOutOfMemory, .modelLoadFailed, .engineNotRunning,
                  .webSearchOffline, .webSearchUnavailable,
                  .commandPermissionDenied, .commandFailed,
@@ -192,7 +207,11 @@ extension FailureDiagnosis.Kind {
     /// chose, rather than inheriting the alarming lane by omission.
     var severity: FailureDiagnosis.Severity {
         switch self {
-        case .userDeclined:
+        // Both of these are the user's own answer, not a malfunction: one
+        // declines a permission prompt, the other stops a transfer already
+        // running. Painting either red tells somebody their own decision
+        // broke something.
+        case .userDeclined, .downloadCancelled:
             return .notice
         // A throttled backend is something that went wrong out in the world,
         // not something the user picked — it stays on the error lane, and its
@@ -246,8 +265,10 @@ enum FailureDiagnoser {
             // endpoint per IP within a handful of searches, so the honest
             // remedy is a different backend, and the message has to say which
             // ones and where. Kept to one sentence of situation + one of
-            // remedy so it still reads inside the tool card.
-            message = "DuckDuckGo is rate-limiting web searches from this Mac. Switch to Brave Search or Tavily in Settings → Tools and add a free key."
+            // remedy so it still reads inside the tool card. Not Brave any
+            // more (#2043): Brave requires a card on file now, so pitching it
+            // as the free fix would steer the user into surprise billing.
+            message = "DuckDuckGo is rate-limiting web searches from this Mac. Switch to Keenable (no key) or add a free Parallel or Tavily key in Settings → Tools."
             action = .openWebSearchSettings
         case .browsePageTooLarge:
             message = "This page is too large for Rapid to read at once. Search it or open a smaller page instead."
@@ -289,6 +310,16 @@ enum FailureDiagnoser {
             action = nil
         case .downloadFailed:
             message = "The model download didn't finish. Check your connection, then try again."
+            action = .retry
+        case .downloadCancelled:
+            // States what the user did, what it left behind, and what the one
+            // button will do — and stops. No connection advice (nothing was
+            // wrong with the connection), and deliberately silent about
+            // whether a fresh pull reuses bytes already on disk: that is a
+            // property of the downloader, not a promise this app is in a
+            // position to make. See Paper 05.1 state 10 — "No Pause and no
+            // resume."
+            message = "You stopped this download, so the model isn't installed. Download it again, or choose a different model."
             action = .retry
         case .downloadSourceUnavailable:
             message = "The current download source couldn't be reached. Switch source and try again."

@@ -440,16 +440,6 @@ class TempFileManager:
 _temp_manager = TempFileManager()
 
 
-def cleanup_temp_file(path: str) -> bool:
-    """Clean up a specific temporary file."""
-    return _temp_manager.cleanup(path)
-
-
-def cleanup_all_temp_files() -> int:
-    """Clean up all tracked temporary files. Returns count of cleaned files."""
-    return _temp_manager.cleanup_all()
-
-
 # Video processing constants
 FRAME_FACTOR = 2  # Frames must be divisible by this
 DEFAULT_FPS = 2.0  # Default frames per second for video
@@ -899,16 +889,6 @@ def process_image_input(image: str | dict) -> str:
     raise ValueError(f"Cannot process image: {image[:50]}...")
 
 
-def round_by_factor(x: int, factor: int) -> int:
-    """Round to nearest multiple of factor."""
-    return round(x / factor) * factor
-
-
-def ceil_by_factor(x: float, factor: int) -> int:
-    """Ceiling to next multiple of factor."""
-    return math.ceil(x / factor) * factor
-
-
 def floor_by_factor(x: float, factor: int) -> int:
     """Floor to previous multiple of factor."""
     return math.floor(x / factor) * factor
@@ -1093,10 +1073,31 @@ class MLXMultimodalLM:
             from mlx_vlm import load
             from mlx_vlm.utils import load_config
 
+            from ..utils.tokenizer import apply_remote_code_policy
+
             logger.info(f"Loading MLLM: {self.model_name}")
 
-            self.model, self.processor = load(self.model_name)
-            self.config = load_config(self.model_name)
+            _, trust_remote_code = apply_remote_code_policy(
+                {"trust_remote_code": self.trust_remote_code}
+            )
+            if trust_remote_code:
+                # Preserve mlx-vlm's historical call shape (and compatibility
+                # with older versions/wrappers) unless the operator opts out.
+                self.model, self.processor = load(self.model_name)
+                self.config = load_config(self.model_name)
+            else:
+                self.model, self.processor = load(
+                    self.model_name,
+                    trust_remote_code=False,
+                )
+                # mlx-vlm 0.6.x currently reads config.json directly, but
+                # forwarding the policy here makes the process-wide opt-out
+                # explicit and prevents a future/config-loader implementation
+                # from silently re-enabling repository code.
+                self.config = load_config(
+                    self.model_name,
+                    trust_remote_code=False,
+                )
 
             # Augment the wrapped tokenizer's EOS set with the chat-
             # template terminator ids from ``generation_config.json``.

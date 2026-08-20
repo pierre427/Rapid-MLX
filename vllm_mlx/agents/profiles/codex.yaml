@@ -31,11 +31,22 @@ config:
     [model_providers.rapid-mlx]
     name = "Rapid-MLX (local)"
     base_url = "{base_url}"
-    # No auth field — rapid-mlx is unauthed by default and Codex
-    # `--strict-config` rejects an inline literal like `api_key = "..."`.
-    # If you start the server with `--api-key`, add:
+    # Auth: rapid-mlx requires a bearer whenever it was started with
+    # `--api-key` or with `RAPID_MLX_API_KEY` set. That is ALWAYS true of
+    # the Rapid-MLX desktop app, which mints a fresh key per launch — an
+    # unauthenticated request there gets 401, not a response. In that
+    # case add:
     #     env_key = "RAPID_MLX_API_KEY"
-    # and `export RAPID_MLX_API_KEY=<your-key>` in your shell.
+    # and `export RAPID_MLX_API_KEY=<your-key>` in the shell you run
+    # Codex from.
+    #
+    # Leave `env_key` out ONLY for a bare `rapid-mlx serve` with no key
+    # set. Codex hard-errors — "Missing environment variable: `NAME`" —
+    # when `env_key` names a variable that is not exported, so this is
+    # not a safe thing to leave in unconditionally.
+    #
+    # Codex `--strict-config` rejects an inline literal like
+    # `api_key = "..."`, so the env var is the only route.
     # The /v1/responses path is the hot path Codex uses; rapid-mlx
     # exposes it directly. No wire_api override needed.
 
@@ -78,6 +89,5 @@ capabilities:
 known_issues:
   - "Codex CLI runs commands via Landlock (Linux) / Seatbelt (macOS) — first run prompts for sandbox permissions; this is Codex behaviour, unrelated to rapid-mlx."
   - "`previous_response_id` is not implemented (openai/codex#3841) and the rapid-mlx shim is stateless — Codex re-sends the full conversation in `input[]` each turn, which is what makes the local backend work."
-  - "Codex hardcodes `stream: true`; rapid-mlx's /v1/responses emits the 7 SSE events Codex parses (response.created, response.output_text.delta, response.function_call_arguments.delta, response.completed, etc.)."
-  - "Codex's `reasoning.effort` field is accepted but not yet mapped to enable_thinking — set thinking via `rapid-mlx serve --enable-thinking` instead."
+  - "Codex hardcodes `stream: true`; rapid-mlx's /v1/responses emits the SSE lifecycle events Codex parses (response.created, response.output_text.delta, response.function_call_arguments.delta, response.completed, etc.)."
   - "gemma-4-12b-it (any quant) hangs Codex ~60% of trials on tool-use prompts due to a model-side `thought\\n…` degenerate loop — model bug filed at huggingface.co/google/gemma-4-12B-it/discussions/41 (downstream tracking issue #686 closed). Use qwen3.5/3.6 models for Codex CLI agent workflows."

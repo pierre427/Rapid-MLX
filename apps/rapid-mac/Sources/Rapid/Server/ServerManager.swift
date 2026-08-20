@@ -158,6 +158,14 @@ final class ServerManager {
     /// consuming one another's confirmation (#1463).
     private var memoryConfirmations = MemoryLoadConfirmationQueue()
 
+    /// Live-memory source. Production uses the host probe; tests replace it so
+    /// launch auto-start semantics can be verified without depending on the
+    /// runner's current pressure.
+    @ObservationIgnored
+    internal var memorySnapshotProvider: () -> MemoryProbe.Snapshot? = {
+        MemoryProbe.snapshot()
+    }
+
     /// Confirmed launches still running, by sequence number. Polled by
     /// ``awaitConfirmedLaunch`` instead of awaiting the task's ``value``:
     /// awaiting a non-throwing Task is NOT cancellation-aware, so a caller
@@ -247,6 +255,18 @@ final class ServerManager {
     /// reason verbatim, so a rejected resident load is an actionable message
     /// instead of a silent no-op (#1838).
     private(set) var residentLoadFailures: [String: ResidentLoadFailure] = [:]
+
+    /// Aliases currently being admitted through the in-process residency
+    /// endpoint. Unlike a cold process start, this work does not change the
+    /// global ``state`` to `.starting`, so surfaces need this alias-scoped
+    /// signal to acknowledge a Download & start tap immediately.
+    private(set) var residentLoadsInFlight: [String: Int] = [:]
+
+    func isResidentLoadInFlight(_ alias: String) -> Bool {
+        residentLoadsInFlight[
+            alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        ] != nil
+    }
 
     /// The most recent rejection for `alias`, or `nil` if the last attempt
     /// for that model succeeded or no rejection has been recorded. Read by
@@ -366,6 +386,20 @@ final class ServerManager {
     /// same per-model opinion or Settings would silently work only for the
     /// first model in the sidecar (#1717 + #1788).
     var perfConfigProvider: ((String) -> ModelPerfConfig?)?
+
+    /// Exact performance argv applied to the process-owning model. Dynamic
+    /// residency can apply KV/prefix settings per engine, but speculative
+    /// decoding patches the model during process startup, so Settings decides
+    /// whether a speculative-decoding change needs a real restart.
+    private(set) var launchedPerformanceAlias: String?
+    private(set) var launchedPerformanceFlags: [String] = []
+
+    func hasAppliedSpeculativeDecoding(forAlias alias: String) -> Bool {
+        guard child != nil,
+              launchedPerformanceAlias?.caseInsensitiveCompare(alias) == .orderedSame
+        else { return false }
+        return launchedPerformanceFlags.contains("--speculative-config")
+    }
 
     /// Health-check budget — interpreted as a **stall window** since
     /// v0.7.13, not a wall-clock-from-launch cap. The deadline slides
@@ -613,11 +647,21 @@ final class ServerManager {
     /// [codex audit r1 ServerManager.swift:577]
     @ObservationIgnored
     private let healthSession: URLSession = {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 1.5
-        cfg.timeoutIntervalForResource = 1.5
-        return URLSession(configuration: cfg)
+        URLSession(configuration: ServerManager.loopbackHealthSessionConfiguration())
     }()
+
+    /// `/healthz` is always a loopback control-plane request. Inheriting the
+    /// user's system/PAC proxy can send it away from the local sidecar (or
+    /// wait for an unreachable corporate proxy), leaving a healthy process
+    /// permanently presented as Starting. Keep this session direct; external
+    /// network clients retain their ordinary proxy behaviour.
+    static func loopbackHealthSessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 1.5
+        configuration.timeoutIntervalForResource = 1.5
+        configuration.connectionProxyDictionary = [:]
+        return configuration
+    }
 
     /// Optional back-reference to the app's ``DownloadManager``. Wired
     /// from ``RapidApp.init`` after both singletons are constructed.
@@ -805,6 +849,19 @@ final class ServerManager {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Drop the last-served alias without going through a stop.
+    ///
+    /// ``stop()`` clears it, but only along the path that actually terminates
+    /// a child — `guard child != nil else { return }` means an idle app's
+    /// Stop is a no-op and the alias survives. That is right for Stop and
+    /// wrong for re-onboarding, which has to reach a state the wizard
+    /// considers fresh whether or not a model happened to be running
+    /// (``QuickstartCoordinator.isEligible`` gates on this alias
+    /// independently of its own flags). See ``ReonboardingReset``.
+    nonisolated static func forgetLastServedAlias(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: lastServedAliasKey)
+    }
+
     /// Bring the embedded child to ``.ready(alias)`` regardless of
     /// where the state machine currently sits.
     ///
@@ -854,15 +911,21 @@ final class ServerManager {
     ) async -> Bool {
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        let requestedPerformanceFlags = perfLaunchFlagsProvider?(trimmed) ?? []
+        let speculativeRequested = requestedPerformanceFlags.contains("--speculative-config")
+        let speculativeApplied = hasAppliedSpeculativeDecoding(forAlias: trimmed)
+        let speculativeSettingChanged = speculativeRequested != speculativeApplied
         // Replacement policy matters only when loading a different model.
         // The requested alias is already the active assistant, so asking the
         // residency endpoint to replace it is redundant and breaks legacy
         // sidecars: their 404 fallback stops and restarts the model on every
         // chat send before the request can leave the app.
-        if case .ready(let current) = state, current == trimmed {
+        if case .ready(let current) = state, current == trimmed, !speculativeSettingChanged {
             return true
         }
-        if replacementGroup == nil, isModelResident(trimmed) { return true }
+        if replacementGroup == nil, isModelResident(trimmed), !speculativeSettingChanged {
+            return true
+        }
 
         // Any fresh load attempt — resident, cold start, or the legacy
         // stop/start fallback — supersedes a stale rejection for THIS alias so
@@ -889,7 +952,23 @@ final class ServerManager {
         // surface as a hard failure instead of the process swap they actually
         // need — audio runs as its own ``serve <alias>`` (audio-mode) process.
         let readyWithChild: Bool = { if case .ready = state, child != nil { return true }; return false }()
-        if Self.residencyLoadApplies(residencyEligible: residencyEligible, readyWithChild: readyWithChild) {
+        if Self.residencyLoadApplies(
+            residencyEligible: residencyEligible && !speculativeRequested && !speculativeSettingChanged,
+            readyWithChild: readyWithChild
+        ) {
+            // Publish before crossing the network await so SwiftUI replaces
+            // the still-pressable CTA with an honest working state in the
+            // same run-loop turn. Count rather than coalescing here: callers
+            // outside the GUI retain latest-attempt-wins concurrency semantics.
+            residentLoadsInFlight[trimmed, default: 0] += 1
+            defer {
+                let remaining = (residentLoadsInFlight[trimmed] ?? 1) - 1
+                if remaining == 0 {
+                    residentLoadsInFlight[trimmed] = nil
+                } else {
+                    residentLoadsInFlight[trimmed] = remaining
+                }
+            }
             let estimate = estimatedMemoryGB ?? ModelSizing.estimate(alias: trimmed).totalGB
             let result = await residencyClient.load(
                 alias: trimmed,
@@ -1021,6 +1100,14 @@ final class ServerManager {
         return result
     }
 
+    /// Speculative decoding is installed while the process-owning engine
+    /// starts, unlike the resident API's per-engine KV/prefix knobs. Rebuild
+    /// one setting changes; conversations and downloaded weights remain.
+    func restartForSpeculativePerformance(alias: String, hfPath: String? = nil) async -> Bool {
+        await stop()
+        return await ensureServing(alias: alias, hfPath: hfPath, residencyEligible: false)
+    }
+
     /// True when the child is serving exactly this alias.
     private func isServing(_ alias: String) -> Bool {
         if case .ready(let current) = state, current == alias { return true }
@@ -1084,11 +1171,46 @@ final class ServerManager {
 
     // MARK: - Public API
 
+    /// The outcome of the most recent user-initiated engine re-resolution.
+    ///
+    /// ## Why this exists
+    ///
+    /// ``refreshBinary()`` always did real work — it re-runs
+    /// ``ServerLocator/locate()`` from scratch. But when the engine is STILL
+    /// missing it changes nothing observable: ``state`` was ``.missing`` and
+    /// stays ``.missing``. So the one control on the missing-engine screen
+    /// looked inert to the user it exists for, which is indistinguishable
+    /// from a button wired to nothing. Recording the outcome — including the
+    /// attempt number, so two identical results are still two events — gives
+    /// the overlay something truthful to say without inventing a claim about
+    /// why the engine is absent.
+    ///
+    /// ``nil`` until the user asks. Nothing reads it as a cache: the answer to
+    /// "is the engine here?" remains ``state`` and ``binaryPath``.
+    struct BinaryRecheck: Equatable, Sendable {
+        /// Whether ``ServerLocator/locate()`` resolved a binary this time.
+        let found: Bool
+        /// 1-based count of user-initiated rechecks this session. Present so a
+        /// repeated "still missing" result is observably a NEW result rather
+        /// than an unchanged value the UI can coalesce away.
+        let attempt: Int
+    }
+
+    private(set) var lastBinaryRecheck: BinaryRecheck?
+
     /// Refreshes `binaryPath` and resets to `.idle` / `.missing`. Called
     /// from the app's launch hook after the orphan sweep so the UI shows
     /// the correct initial state even if the user installed rapid-mlx
     /// just before launching Rapid.
-    func refreshBinary() {
+    ///
+    /// - Parameter userInitiated: `true` only for the missing-engine screen's
+    ///   Recheck. Launch hooks and the Settings toggle pass `false` so they
+    ///   cannot leave a "you rechecked" state behind for a user who never
+    ///   pressed anything.
+    /// - Returns: whether a binary resolved, so a caller can react without
+    ///   re-reading ``state``.
+    @discardableResult
+    func refreshBinary(userInitiated: Bool = false) -> Bool {
         let resolution = ServerLocator.locate()
         self.binaryResolution = resolution
         self.binaryPath = resolution?.binary
@@ -1097,6 +1219,41 @@ final class ServerManager {
         } else if case .missing = state {
             state = .idle
         }
+        if userInitiated {
+            lastBinaryRecheck = BinaryRecheck(
+                found: resolution != nil,
+                attempt: (lastBinaryRecheck?.attempt ?? 0) + 1
+            )
+        } else {
+            // Launch and Settings refreshes are background maintenance, not
+            // evidence that the user just pressed Recheck. Retire any prior
+            // result so a later missing-engine render cannot replay stale
+            // feedback from an earlier interaction.
+            lastBinaryRecheck = nil
+        }
+        return resolution != nil
+    }
+
+    /// What the missing-engine screen says after a Recheck.
+    ///
+    /// Pure so the "must not look actionable while doing nothing" contract can
+    /// be pinned without a SwiftUI host. ``nil`` before the user has asked —
+    /// there is no result to report, and a placeholder would be noise.
+    ///
+    /// The found branch is deliberately still worded: resolving the binary
+    /// moves ``state`` off ``.missing`` and the overlay goes away on the next
+    /// render, but a caller that reads this during that frame must not be
+    /// handed the failure copy.
+    nonisolated static func recheckStatusMessage(for recheck: BinaryRecheck?) -> String? {
+        guard let recheck else { return nil }
+        if recheck.found {
+            return "Found it. Setting up…"
+        }
+        // Names what was done and what was found, and stops. No retry
+        // schedule, no diagnosis of WHY it is absent — nothing here knows.
+        return recheck.attempt == 1
+            ? "Checked again — Rapid-MLX still can't find its engine."
+            : "Checked again (\(recheck.attempt) times) — Rapid-MLX still can't find its engine."
     }
 
     /// Transitions a ``.crashed`` or ``.stopped`` state back to
@@ -1190,7 +1347,8 @@ final class ServerManager {
         hfPath: String? = nil,
         isAutoRespawn: Bool = false,
         bypassMemoryGuard: Bool = false,
-        memoryRequestID: UUID? = nil
+        memoryRequestID: UUID? = nil,
+        isLaunchAutoStart: Bool = false
     ) async {
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
@@ -1244,7 +1402,7 @@ final class ServerManager {
         // Respawn is also recovering a model that ALREADY fit when it first
         // started; a genuine free-RAM drop is bounded by the respawn-attempt
         // budget, and the user's manual restart still routes through the guard.
-        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = MemoryProbe.snapshot() {
+        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = memorySnapshotProvider() {
             let footprint = ModelSizing.estimate(alias: trimmedAlias)
             let safety = ModelSizing.memorySafety(
                 footprint: footprint,
@@ -1260,6 +1418,18 @@ final class ServerManager {
             // only what is genuinely dangerous, and surface "tight"
             // passively — the picker's static sizing bands already do.
             if safety == .unsafe {
+                // A launch auto-start must never greet the user with a scary
+                // modal they did not ask for. Opening the app is not "I want to
+                // chat now" — they may be heading to Audio/Images, or just
+                // checking in. Defer silently: leave the server ``.idle`` with
+                // the alias selected (the readiness banner still shows a Start
+                // affordance), and let this exact warning surface only when the
+                // user explicitly loads it (Start button or first message),
+                // which routes back through here WITHOUT ``isLaunchAutoStart``.
+                if isLaunchAutoStart {
+                    cancelAutoRespawn()
+                    return
+                }
                 let warning = ModelSizing.MemoryWarning(
                     alias: trimmedAlias,
                     hfPath: hfPath,
@@ -1485,13 +1655,14 @@ final class ServerManager {
         // HERE, alongside the recommendation, for the same reason it is
         // computed here — every start path reaches `start(alias:)` and none of
         // them thread flags.
-        var extraFlags = Self.mergedPerformanceFlags(
+        let performanceFlags = Self.mergedPerformanceFlags(
             recommended: RAMBucketedDefault.launchFlags(
                 forAlias: trimmedAlias,
                 physicalRAMGB: hardware.physicalRAMGB
             ),
             userOverrides: perfLaunchFlagsProvider?(trimmedAlias) ?? []
         )
+        var extraFlags = performanceFlags
         extraFlags.append(contentsOf: [
             "--resident-memory-limit-gb",
             String(format: "%.0f", ModelSizing.residentMemoryCeilingGB(on: hardware)),
@@ -1648,6 +1819,8 @@ final class ServerManager {
         }
 
         self.child = process
+        self.launchedPerformanceAlias = trimmedAlias
+        self.launchedPerformanceFlags = performanceFlags
         // Codex r1 P3 (#17): only publish the bearer after the spawn
         // has succeeded — see comment at the bearer guard above.
         self.activeBearer = bearer
@@ -2603,6 +2776,7 @@ final class ServerManager {
     /// token after them when the user's override supersedes them.
     nonisolated private static let perfValueCarryingFlags: Set<String> = [
         "--kv-cache-dtype", "--kv-cache-turboquant", "--cache-memory-mb",
+        "--speculative-config",
     ]
 
     /// Flags that move as a unit: an override for any member supersedes the
@@ -2618,6 +2792,7 @@ final class ServerManager {
         ["--kv-cache-dtype", "--kv-cache-turboquant"],
         ["--enable-prefix-cache", "--disable-prefix-cache"],
         ["--cache-memory-mb"],
+        ["--speculative-config"],
     ]
 
     /// Merge the RAM-tier recommendation with the user's per-model overrides.

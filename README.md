@@ -49,7 +49,7 @@ or Homebrew — prebuilt bottle straight from homebrew-core:
 brew install rapid-mlx
 ```
 
-Both land the same `rapid-mlx` CLI. The curl installer additionally installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–15 GB → `lfm2.5-2.6b-4bit`; 16–17 GB → `qwen3.5-4b-4bit`; 18–23 GB → `qwen3.5-9b-4bit`; 24–31 GB → `bonsai-27b-2bit`; 32–63 GB → `gemma-4-26b-4bit`; 64–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `qwen3.5-122b-mxfp4`).
+Both land the same `rapid-mlx` CLI. The curl installer additionally installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–15 GB → `lfm2.5-2.6b-4bit`; 16–17 GB → `qwen3.5-4b-4bit`; 18–23 GB → `qwen3.5-9b-4bit`; 24–31 GB → `bonsai-27b-2bit`; 32 GB+ → `qwen3.8-27b-4bit`).
 
 > **Install security.** `install.sh` is served over HTTPS (HSTS-preload) from `rapidmlx.com` and is a byte-identical mirror of [`install.sh`](install.sh) at the release commit — read it before running if you like. If you want a cryptographically verified installer rather than trusting the website pipe, don't `curl | bash` the URL above: instead download the release's `install.sh` asset, verify it against the cosign-signed `SHA256SUMS.txt` shipped alongside it, and run that verified copy — full recipe in [SECURITY.md](SECURITY.md). PyPI artifacts additionally carry Sigstore attestations (PEP 740). Two more low-trust paths:
 > - **Pin to a commit hash** — `curl -fsSL https://raw.githubusercontent.com/raullenchai/Rapid-MLX/<commit>/install.sh -o install.sh && shasum -a 256 install.sh && bash install.sh`
@@ -63,7 +63,7 @@ See [Alternative install methods](#alternative-install-methods) for the non-curl
 rapid-mlx chat
 ```
 
-Defaults to `qwen3.5-4b-4bit`. First run downloads the weights (~2.5 GB) with a progress bar and drops you into a REPL. Type `/help` for slash commands, `/exit` to quit.
+Defaults to `qwen3.5-4b-4bit`. First run downloads the weights (~3 GB) with a progress bar and drops you into a REPL. Type `/help` for slash commands, `/exit` to quit.
 
 **3. Or serve it for use from other apps:**
 
@@ -94,7 +94,7 @@ print(client.chat.completions.create(
 rapid-mlx launch claude-code
 ```
 
-With a server running (step 3), this patches Claude Code's local config (`~/.config/claude/settings.json`) to route at `http://localhost:8000` — no manual env vars, no editing JSON by hand. You get a fully local Claude Code: `$0` per token, nothing leaves your Mac. Swap in `cline` or `continue-dev` for the other IDE clients, or run `rapid-mlx launch list` to see what's detected on this machine.
+With a server running (step 3), this patches Claude Code's local config (`~/.claude/settings.json`) to route at `http://localhost:8000` — no manual env vars, no editing JSON by hand. You get a fully local Claude Code: `$0` per token, nothing leaves your Mac. Swap in `cline` or `continue-dev` for the other IDE clients, or run `rapid-mlx launch list` to see what's detected on this machine.
 
 > **Cursor:** Cursor currently routes BYOK requests through its own servers, so its servers cannot reach a Rapid-MLX endpoint on `localhost`. Rapid-MLX therefore does not generate a Cursor localhost config. If you intentionally expose the server through a public HTTPS tunnel, set `RAPID_MLX_API_KEY=your-secret` for both `rapid-mlx serve ...` and `rapid-mlx launch cursor --server-url https://your-public-host`. This is no longer a fully local connection; never expose an unauthenticated server. Rapid-MLX rejects explicit local/private addresses but cannot verify reachability from Cursor's network, whose DNS view may differ from your Mac.
 
@@ -148,7 +148,7 @@ compute per second of footage, not real time.
 
 ## Audio: speech, transcription, voice cloning
 
-41 audio aliases behind the OpenAI-compatible `/v1/audio/*` endpoints — any
+44 audio aliases behind the OpenAI-compatible `/v1/audio/*` endpoints — any
 OpenAI SDK works unchanged.
 
 ```bash
@@ -184,7 +184,7 @@ Beyond the basics, three things you may not expect to run locally:
 Also: word-level timestamps on transcription, and local text-to-music at
 `/v1/audio/music`.
 
-→ [All 41 aliases across 12 families](https://rapidmlx.com/docs/models/families/audio.html)
+→ [All 44 aliases across 13 families](https://rapidmlx.com/docs/models/families/audio.html)
 
 ---
 
@@ -194,7 +194,7 @@ Also: word-level timestamps on transcription, and local text-to-music at
 |---|---|
 | **Apple-Silicon-native** | Pure MLX kernels — no llama.cpp fallback, no Metal shim. Continuous batching, prompt cache (radix + DeltaNet RNN snapshots), and a quantized live KV cache (int4/int8 on the continuous-batching cache + TurboQuant K8V4 codec) run at native MLX bandwidth on M1 → M4. |
 | **Drop-in OpenAI / Anthropic API** | `/v1/chat/completions`, `/v1/responses` (Codex CLI), `/v1/messages` (Anthropic SDK / Claude Code), `/v1/embeddings`, `/v1/audio/*`, `/v1/videos` — same wire as ChatGPT / Claude, no client adapter. |
-| **First-class ecosystem coverage** | 11 agent CLIs and 3 Python frameworks are wire-verified against real weights every release (4 are Tier-1, re-verified on current binaries) — Codex CLI, Claude Code, OpenCode, Qwen Code, OpenHands, Hermes Agent, Aider, Kilo Code, GitHub Copilot, Factory Droid, Moonshot Kimi Code + LangChain, PydanticAI, smolagents. |
+| **First-class ecosystem coverage** | 12 agent CLIs and 3 Python frameworks are wire-verified against real weights every release (5 are Tier-1, re-verified on current binaries) — Codex CLI, Claude Code, OpenCode, Qwen Code, OpenHands, Hermes Agent, Aider, Kilo Code, DeepSeek Harness, GitHub Copilot, Factory Droid, Moonshot Kimi Code + LangChain, PydanticAI, smolagents. |
 
 → [Full feature breakdown](https://rapidmlx.com/docs/index.html)
 
@@ -206,7 +206,7 @@ Also: word-level timestamps on transcription, and local text-to-music at
 |---|---|---|
 | **Chat in the terminal** | `rapid-mlx chat qwen3.5-9b-4bit` | Streaming REPL, `/help` for slash commands, `--think` / `--no-think` to control CoT. |
 | **OpenAI server for your apps** | `rapid-mlx serve qwen3.5-9b-4bit` | Point Aider, LibreChat, Open WebUI, or LangChain at `http://localhost:8000/v1`. |
-| **Agent backends** | `rapid-mlx serve qwen3.6-35b-8bit &`<br>`rapid-mlx agents codex --setup && codex` | 8 agents auto-configure via `agents <name> --setup` once the server is up (11 wire-verified total, 4 Tier-1) — see [Agent support](#agent-support). |
+| **Agent backends** | `rapid-mlx serve qwen3.6-35b-8bit &`<br>`rapid-mlx agents codex --setup && codex` | 10 agents auto-configure via `agents <name> --setup` once the server is up (12 wire-verified total, 5 Tier-1) — see [Agent support](#agent-support). |
 | **Benchmark your Mac** | `rapid-mlx bench qwen3.5-9b-4bit --submit` | Standardized B=1 bench, opens a PR to publish your row on [rapidmlx.com](https://rapidmlx.com). |
 
 → [One-shot IDE setup](https://rapidmlx.com/docs/cli.html#launch) with `rapid-mlx launch <claude-code|cline|continue-dev>`
@@ -215,19 +215,21 @@ Also: word-level timestamps on transcription, and local text-to-music at
 
 ## Agent Support
 
-All 11 agents below are wire-verified against real weights every release via their own integration-test cell. Of these, four are **Tier-1** — **Claude Code, Codex CLI, Hermes, and Aider** — re-verified end-to-end against the *current* client binary every release, with one guardian per API wire (Anthropic `/v1/messages`, OpenAI `/v1/responses`, and `/v1/chat/completions` covered for both tool-calling depth and reach). The other seven are **Tier-2**: wire-verified in the matrix and configured on-demand. The first eight agents each ship a `rapid-mlx agents <name> --setup` config template (except Claude Code, which is one env-var); GitHub Copilot, Factory Droid, and Moonshot Kimi Code plug in through their own documented BYOK config (auth-gated, so the matrix cell is a wire smoke).
+All 12 agents below are wire-verified against real weights every release via their own integration-test cell. Of these, five are **Tier-1** — **Claude Code, Codex CLI, Hermes, Aider, and DeepSeek Harness** — re-verified end-to-end against the *current* client binary every release, with one guardian per API wire (Anthropic `/v1/messages`, OpenAI `/v1/responses`, and `/v1/chat/completions` covered for tool-calling depth, reach, and DeepSeek's own harness protocol). The other seven are **Tier-2**: wire-verified in the matrix and configured on-demand. The first nine agents each ship a `rapid-mlx agents <name> --setup` config template (except Claude Code, which is one env-var), and Continue.dev gets the same one-command setup via `rapid-mlx agents continue --setup` (ten setup-capable clients in all, though Continue.dev is not part of the wire-verified matrix below); GitHub Copilot, Factory Droid, and Moonshot Kimi Code plug in through their own documented BYOK config (auth-gated, so the matrix cell is a wire smoke).
 
-**Tier-1 (4):** Claude Code · Codex CLI · Hermes · Aider — last re-verified end-to-end 2026-07-28 on current binaries (claude 2.1.211, codex 0.145.0, hermes 0.9.0, aider 0.86.2) against rapid-mlx 0.11.1.
+Tier-1 is not a label — it is a job that blocks the release. `tests/integrations/agent_smoke.sh` drives each of the five through the same real multi-step bug-fix task against a local 35B model and asserts the repo's own test suite goes green afterwards; if any one of them fails, the version cannot tag or publish.
+
+**Tier-1 (5):** Claude Code · Codex CLI · Hermes · Aider — last re-verified end-to-end 2026-07-28 on current binaries (claude 2.1.211, codex 0.145.0, hermes 0.9.0, aider 0.86.2). DeepSeek Harness — promoted 2026-08-17, verified on dsh 0.1.0-rc.7 against `qwen3.6-35b-8bit`.
 **Tier-2 (7):** OpenCode · Qwen Code · OpenHands · Kilo Code · GitHub Copilot · Factory Droid · Moonshot Kimi Code.
 
-| Agents (11) | Frameworks (3) |
+| Agents (12) | Frameworks (3) |
 |---|---|
-| [Codex CLI](https://github.com/openai/codex) · [Claude Code](https://www.anthropic.com/claude-code) · [OpenCode](https://github.com/sst/opencode) · [Qwen Code](https://github.com/QwenLM/qwen-code) · [OpenHands](https://github.com/All-Hands-AI/OpenHands) · [Hermes Agent](https://github.com/NousResearch/hermes-agent) · [Aider](https://aider.chat) · [Kilo Code](https://github.com/Kilo-Org/kilocode) · [GitHub Copilot](https://github.com/features/copilot) · [Factory Droid](https://factory.ai) · [Moonshot Kimi Code](https://github.com/MoonshotAI/kimi-cli) | [LangChain](https://langchain.com) (+ [LangGraph](https://langchain-ai.github.io/langgraph/)) · [PydanticAI](https://ai.pydantic.dev) · [smolagents](https://github.com/huggingface/smolagents) |
+| [Codex CLI](https://github.com/openai/codex) · [Claude Code](https://www.anthropic.com/claude-code) · [OpenCode](https://github.com/sst/opencode) · [Qwen Code](https://github.com/QwenLM/qwen-code) · [OpenHands](https://github.com/All-Hands-AI/OpenHands) · [Hermes Agent](https://github.com/NousResearch/hermes-agent) · [Aider](https://aider.chat) · [Kilo Code](https://github.com/Kilo-Org/kilocode) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) · [GitHub Copilot](https://github.com/features/copilot) · [Factory Droid](https://factory.ai) · [Moonshot Kimi Code](https://github.com/MoonshotAI/kimi-cli) | [LangChain](https://langchain.com) (+ [LangGraph](https://langchain-ai.github.io/langgraph/)) · [PydanticAI](https://ai.pydantic.dev) · [smolagents](https://github.com/huggingface/smolagents) |
 
 Also compatible with OpenAI-compatible clients that allow direct local endpoints via `http://localhost:8000/v1` — LibreChat, Open WebUI, and more plug in with a single URL change.
 
-→ [Full 11-agent + 3-framework matrix (test cells + xfail reasons)](https://rapidmlx.com/docs/matrix.html)
-→ [Codex CLI](https://rapidmlx.com/docs/matrix.html#agent-codex-cli) · [Claude Code](https://rapidmlx.com/docs/matrix.html#agent-claude-code) · [OpenCode](https://rapidmlx.com/docs/matrix.html#agent-opencode) · [Qwen Code](https://rapidmlx.com/docs/matrix.html#agent-qwen-code) · [OpenHands](https://rapidmlx.com/docs/matrix.html#agent-openhands) · [Hermes](https://rapidmlx.com/docs/matrix.html#agent-hermes-agent) · [Aider](https://rapidmlx.com/docs/matrix.html#agent-aider) · [Kilo Code](https://rapidmlx.com/docs/matrix.html#agent-kilo-code) · [Copilot](https://rapidmlx.com/docs/matrix.html#agent-copilot) · [Droid](https://rapidmlx.com/docs/matrix.html#agent-droid) · [Kimi Code](https://rapidmlx.com/docs/matrix.html#agent-kimi-code)
+→ [Full 12-agent + 3-framework matrix (test cells + xfail reasons)](https://rapidmlx.com/docs/matrix.html)
+→ [Codex CLI](https://rapidmlx.com/docs/matrix.html#agent-codex-cli) · [Claude Code](https://rapidmlx.com/docs/matrix.html#agent-claude-code) · [OpenCode](https://rapidmlx.com/docs/matrix.html#agent-opencode) · [Qwen Code](https://rapidmlx.com/docs/matrix.html#agent-qwen-code) · [OpenHands](https://rapidmlx.com/docs/matrix.html#agent-openhands) · [Hermes](https://rapidmlx.com/docs/matrix.html#agent-hermes-agent) · [Aider](https://rapidmlx.com/docs/matrix.html#agent-aider) · [Kilo Code](https://rapidmlx.com/docs/matrix.html#agent-kilo-code) · [DeepSeek Harness](https://rapidmlx.com/docs/matrix.html#agent-deepseek-harness) · [Copilot](https://rapidmlx.com/docs/matrix.html#agent-copilot) · [Droid](https://rapidmlx.com/docs/matrix.html#agent-droid) · [Kimi Code](https://rapidmlx.com/docs/matrix.html#agent-kimi-code)
 
 ---
 
@@ -238,24 +240,27 @@ The installer and desktop app use the same RAM-tier recommendation catalog. Run 
 This table is the same one the desktop app's picker reads, and the installer
 prints the matching line for your Mac — a CI test parses both files and fails
 if they drift apart. Measured rows use the standard ~8K prompt peak of the
-complete `rapid-mlx serve` process tree on an M2 Pro 32 GB Mac mini.
+complete `rapid-mlx serve` process tree on an M2 Pro 32 GB Mac mini (the 32 GB+ row: M3 Ultra, 2026-08-18 — footprint is config-bound, speed reads lower on smaller chips).
 
 | RAM | Recommended | Peak RSS | One-shot |
 |---|---|---:|---|
-| **8–15 GB** MacBook Air / base Mini | `lfm2.5-2.6b-4bit` | 3.2 GB | `rapid-mlx serve lfm2.5-2.6b-4bit` |
-| **16–17 GB** MacBook Air / Pro | `qwen3.5-4b-4bit` | 5.8 GB | `rapid-mlx serve qwen3.5-4b-4bit` |
+| **8–15 GB** MacBook Air / base Mini | `lfm2.5-2.6b-4bit` | 3.0 GB | `rapid-mlx serve lfm2.5-2.6b-4bit` |
+| **16–17 GB** MacBook Air / Pro | `qwen3.5-4b-4bit` | 6.0 GB | `rapid-mlx serve qwen3.5-4b-4bit` |
 | **18–23 GB** MacBook Pro | `qwen3.5-9b-4bit` | 8.7 GB | `rapid-mlx serve qwen3.5-9b-4bit` |
 | **24–31 GB** Mac Mini / MacBook Pro | `bonsai-27b-2bit` | 13.0 GB | `rapid-mlx serve bonsai-27b-2bit` |
-| **32–63 GB** Mac Studio / high-spec Mini | `gemma-4-26b-4bit` | 20.0 GB | `rapid-mlx serve gemma-4-26b-4bit --no-mllm --kv-cache-dtype bf16 --cache-memory-mb 512` |
-| **64–95 GB** Mac Studio | `qwen3.6-35b-8bit` | 37.7 GB | `rapid-mlx serve qwen3.6-35b-8bit` |
-| **96 GB+** Mac Studio / Pro | `qwen3.5-122b-mxfp4` | — | `rapid-mlx serve qwen3.5-122b-mxfp4` |
+| **32 GB+** Mac Studio / MacBook Pro | `qwen3.8-27b-4bit` | 20.0 GB | `rapid-mlx serve qwen3.8-27b-4bit` |
 
-The 32–63 GB flags are not optional: Gemma 4 26B ships a vision tower that tier
-has no memory for, and an uncapped KV budget claims the headroom the rest of
-your Mac needs.
+Every Mac from 32 GB up gets the same pick, and that is the point: Qwen3.8-27B
+scores 52 on the Artificial Analysis Intelligence Index (2026-08-18) —
+GPT-5.6-class, the highest of any open-weights model we serve, ahead of the
+much larger 122B (33) and 35B (32) it replaces (the index scores the
+full-precision release; our 4-bit build's deltas are unmeasured — the
+standing caveat for every quantized pick here). Multi-token prediction is on by
+default (~40 tok/s decode, 8K prefill at ~324 tok/s, zero swap at every tier
+budget).
 
 → [Full RAM tier map + serve flags per tier](https://rapidmlx.com/docs/hardware-tiers.html)
-→ [Every alias, quant, and family (166 text + 41 audio + 8 video aliases, 215 total)](https://rapidmlx.com/docs/aliases.html) · interactive at [models.rapidmlx.com](https://models.rapidmlx.com/)
+→ [Every alias, quant, and family (170 text + 2 text-diffusion + 2 image + 8 video + 44 audio aliases, 226 total)](https://rapidmlx.com/docs/aliases.html) · interactive at [models.rapidmlx.com](https://models.rapidmlx.com/)
 
 ---
 
@@ -309,7 +314,7 @@ rapid-mlx --help                    # top-level command list
 rapid-mlx <subcommand> --help       # per-subcommand flags
 ```
 
-Covers chat, serve, share, agents (setup / test), bench, models, pull, rm, ps, info, doctor, upgrade, telemetry, launch, and jlens.
+Covers chat, serve, share, agents (setup / test), bench, recipe, models, ls, pull, rm, alias, ps, info, connect, doctor, upgrade, telemetry, and launch.
 
 → [Full CLI reference with every flag](https://rapidmlx.com/docs/cli.html)
 
@@ -369,6 +374,25 @@ Every avatar here shipped something in rapid-mlx — model support, tool-call pa
 
 ---
 
+## Acknowledgements
+
+Rapid-MLX began as **[vLLM-MLX](https://github.com/waybarrios/vllm-mlx)** by
+[Wayner Barrios](https://github.com/waybarrios), which is where this repository's
+history starts and where the engine's paged KV cache, prefix cache, and
+continuous batching were first built. It was renamed to Rapid-MLX in March 2026
+and has been heavily modified since. Thank you.
+
+It stands on Apple's MLX stack and the runtimes built around it:
+
+- **[MLX](https://github.com/ml-explore/mlx)** — Apple's array framework for Apple Silicon
+- **[mlx-lm](https://github.com/ml-explore/mlx-lm)** — LLM inference, KV cache, quantization
+- **[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)** — vision-language models
+- **[mlx-audio](https://github.com/Blaizzy/mlx-audio)** — speech and audio models
+
+Vendored third-party components and their licenses are listed in
+[NOTICE](NOTICE); what the macOS app ships is enumerated in
+[apps/rapid-mac/THIRD_PARTY.md](apps/rapid-mac/THIRD_PARTY.md).
+
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
