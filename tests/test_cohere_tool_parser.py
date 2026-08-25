@@ -91,7 +91,8 @@ def test_streaming_waits_for_complete_action_then_emits_native_delta() -> None:
                     "arguments": json.dumps({"path": "/etc/hostname"}),
                 },
             }
-        ]
+        ],
+        "preserve_post_tool_content": True,
     }
 
 

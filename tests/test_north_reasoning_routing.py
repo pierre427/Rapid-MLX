@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Focused coverage for Cohere North reasoning and wire-token hygiene."""
+"""Focused coverage for Cohere North reasoning routing and wire-token hygiene.
+
+North reasoning itself is parsed by ``CohereCommand4ReasoningParser`` (the
+protocol detector registered as ``cohere_command4``/``north``); these tests
+cover how that detector composes with ``NorthToolParser`` and the streaming
+postprocessor, plus the final-sanitizer exception for North's uppercase
+sentinels.
+"""
 
 from __future__ import annotations
 
@@ -7,61 +14,10 @@ import json
 from unittest.mock import MagicMock
 
 from vllm_mlx.api.utils import sanitize_output
-from vllm_mlx.reasoning import DeltaMessage, get_parser
-from vllm_mlx.reasoning.cohere_parser import CohereReasoningParser
+from vllm_mlx.reasoning import get_parser
 from vllm_mlx.service.helpers import _finalize_content_and_reasoning
 from vllm_mlx.service.postprocessor import StreamingPostProcessor
 from vllm_mlx.tool_parsers.cohere_tool_parser import NorthToolParser
-
-
-def test_north_reasoning_parser_is_registered() -> None:
-    assert get_parser("north") is CohereReasoningParser
-    assert get_parser("cohere_north") is CohereReasoningParser
-
-
-def test_implicit_start_splits_reasoning_from_final_text() -> None:
-    parser = CohereReasoningParser()
-
-    reasoning, content = parser.extract_reasoning(
-        "Check the instruction carefully."
-        "<|END_THINKING|><|START_TEXT|>READY<|END_TEXT|>"
-    )
-
-    assert reasoning == "Check the instruction carefully."
-    assert sanitize_output(content) == "READY"
-
-
-def test_explicit_start_splits_reasoning_from_final_text() -> None:
-    parser = CohereReasoningParser()
-
-    reasoning, content = parser.extract_reasoning(
-        "<|START_THINKING|>Plan.<|END_THINKING|><|START_TEXT|>Done.<|END_TEXT|>"
-    )
-
-    assert reasoning == "Plan."
-    assert sanitize_output(content) == "Done."
-
-
-def test_streaming_routes_implicit_reasoning_then_content() -> None:
-    parser = CohereReasoningParser()
-    parser.reset_state()
-
-    reasoning = parser.extract_reasoning_streaming("", "Plan.", "Plan.")
-    boundary = parser.extract_reasoning_streaming(
-        "Plan.",
-        "Plan.<|END_THINKING|>",
-        "<|END_THINKING|>",
-    )
-    content = parser.extract_reasoning_streaming(
-        "Plan.<|END_THINKING|>",
-        "Plan.<|END_THINKING|><|START_TEXT|>READY",
-        "<|START_TEXT|>READY",
-    )
-
-    assert reasoning == DeltaMessage(reasoning="Plan.")
-    assert boundary is None
-    assert content is not None
-    assert sanitize_output(content.content) == "READY"
 
 
 def test_uppercase_north_control_tokens_are_stripped_last_mile() -> None:
@@ -92,7 +48,7 @@ def test_tool_call_turn_does_not_duplicate_reasoning_as_content() -> None:
         raw_text=raw,
         cleaned_text=parsed.content or "",
         tool_calls=parsed.tool_calls,
-        reasoning_parser=CohereReasoningParser(),
+        reasoning_parser=get_parser("north")(),
     )
 
     assert reasoning == "The user asked for weather, so I should call the tool."
@@ -115,7 +71,7 @@ def test_non_north_equal_content_and_reasoning_is_not_erased() -> None:
     assert cleaned == "same legitimate text"
 
 
-def test_streaming_postprocessor_keeps_cohere_parser_active_when_flag_is_false() -> (
+def test_streaming_postprocessor_keeps_north_parser_active_when_flag_is_false() -> (
     None
 ):
     cfg = MagicMock()
@@ -261,3 +217,92 @@ def test_streaming_promotes_split_north_reasoning_action_with_quoted_end() -> No
         "literal <|END_ACTION|> marker"
     )
     assert visible_content == "READY"
+
+
+def _north_processor(request):
+    cfg = MagicMock()
+    cfg.engine = None
+    cfg.reasoning_parser = None
+    cfg.reasoning_parser_name = "north"
+    cfg.enable_auto_tool_choice = True
+    cfg.tool_call_parser = "north"
+    cfg.tool_parser_instance = None
+    processor = StreamingPostProcessor(
+        cfg, tools_requested=True, enable_thinking=False, request=request
+    )
+    processor.reset()
+    return processor
+
+
+def _chunk(text: str, *, finished: bool = False) -> MagicMock:
+    chunk = MagicMock()
+    chunk.new_text = text
+    chunk.finished = finished
+    chunk.channel = None
+    chunk.finish_reason = "stop" if finished else None
+    chunk.prompt_tokens = 10
+    chunk.completion_tokens = 5
+    chunk.tokens = []
+    chunk.logprobs = None
+    chunk.tool_calls = None
+    return chunk
+
+
+_READ_FILE_REQUEST = {
+    "tools": [
+        {
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object"}},
+        }
+    ]
+}
+
+
+def test_text_only_turn_is_not_replayed_at_finalize() -> None:
+    """Marker-free deltas take the fast path without engaging the tool
+    parser; ``flush_held_content`` must not replay them at stream end."""
+    processor = _north_processor(_READ_FILE_REQUEST)
+
+    events = []
+    events.extend(
+        processor.process_chunk(
+            _chunk("plan<|END_THINKING|><|START_TEXT|>Hello world<|END_TEXT|>")
+        )
+    )
+    events.extend(processor.process_chunk(_chunk("", finished=True)))
+    events.extend(processor.finalize())
+
+    visible_content = "".join(event.content or "" for event in events)
+    assert visible_content == "Hello world"
+
+
+def test_plain_prefix_then_action_emits_prefix_once() -> None:
+    """A fast-path prefix followed by an action must not be re-emitted when
+    the tool parser engages mid-stream with a stale cursor.
+
+    Configured without a reasoning parser so the prefix streams as plain
+    content through the marker-free fast path — the exact seam where the
+    parser's cursor would otherwise be stale.
+    """
+    processor = _north_processor(_READ_FILE_REQUEST)
+    processor.reasoning_parser = None
+
+    events = []
+    events.extend(processor.process_chunk(_chunk("Checking.")))
+    events.extend(
+        processor.process_chunk(
+            _chunk(
+                '<|START_ACTION|>{"tool_name":"read_file","parameters":{}}'
+                "<|END_ACTION|>",
+                finished=True,
+            )
+        )
+    )
+    events.extend(processor.finalize())
+
+    calls = [call for event in events for call in (event.tool_calls or [])]
+    visible_content = "".join(event.content or "" for event in events)
+
+    assert [call["function"]["name"] for call in calls] == ["read_file"]
+    assert visible_content.count("Checking.") == 1
+    assert "<|START_ACTION|>" not in visible_content

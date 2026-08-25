@@ -1329,14 +1329,14 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
     }:
         cfg = ModelConfig(
             tool_call_parser="north",
-            reasoning_parser="north",
+            reasoning_parser="cohere_command4",
             is_moe=True,
             supports_spec_decode=False,
         )
         _log_resolution_once(
             model_path,
             f"Auto-detected North-Mini-Code checkpoint '{model_path}' -> "
-            "tool_call_parser=north, reasoning_parser=north",
+            "tool_call_parser=north, reasoning_parser=cohere_command4",
         )
         return cfg
 

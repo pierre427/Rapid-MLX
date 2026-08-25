@@ -1552,13 +1552,6 @@ class StreamingPostProcessor:
         the live delta handy; those sites use the strict
         accumulated-buffer signal (sufficient post-first-chunk).
         """
-        # Some formats are unconditionally reasoning-wrapped by their
-        # checkpoint chat template. Cohere North, for example, always places
-        # ``<|START_THINKING|>`` in the prompt and has no per-request
-        # ``enable_thinking`` switch. Its parser must stay active even when
-        # the generic request resolver defaults that optional flag to False.
-        if getattr(self.reasoning_parser, "always_route", False) is True:
-            return True
         if self.enable_thinking is not False:
             return True
         # DeepSeek V4's protocol permits a bare ``</think>`` while already
@@ -2882,11 +2875,6 @@ class StreamingPostProcessor:
             if result.get("tool_calls"):
                 self._preserve_post_tool_content = bool(
                     result.get("preserve_post_tool_content")
-                ) or (
-                    getattr(
-                        type(self.tool_parser), "PRESERVE_POST_TOOL_CONTENT", False
-                    )
-                    is True
                 )
                 # When the streaming parser carries BOTH a content
                 # delta AND a tool-call delta in one return (one
@@ -3326,11 +3314,6 @@ class StreamingPostProcessor:
             if result.get("tool_calls"):
                 self._preserve_post_tool_content = bool(
                     result.get("preserve_post_tool_content")
-                ) or (
-                    getattr(
-                        type(self.tool_parser), "PRESERVE_POST_TOOL_CONTENT", False
-                    )
-                    is True
                 )
                 # Combined content+tool delta — emit content half
                 # regardless of how the parallel-cap rules out the
@@ -3548,11 +3531,6 @@ class StreamingPostProcessor:
             if result.get("tool_calls"):
                 self._preserve_post_tool_content = bool(
                     result.get("preserve_post_tool_content")
-                ) or (
-                    getattr(
-                        type(self.tool_parser), "PRESERVE_POST_TOOL_CONTENT", False
-                    )
-                    is True
                 )
                 # Combined content+tool delta — emit content half
                 # regardless of how the parallel-cap rules out the

@@ -263,7 +263,7 @@ class TestToolsCapability:
             restore()
 
         assert entry["tool_call_parser"] == "north"
-        assert entry["reasoning_parser"] == "north"
+        assert entry["reasoning_parser"] == "cohere_command4"
         assert entry["capabilities"] == ["text", "tools"]
 
     def test_profile_tool_parser_enables_tools_tag(self, monkeypatch):

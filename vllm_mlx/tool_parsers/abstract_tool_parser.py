@@ -186,12 +186,6 @@ class ToolParser(ABC):
     # without needing conversion to text format.
     SUPPORTS_NATIVE_TOOL_FORMAT: bool = False
 
-    # Most agent protocols terminate the assistant turn when a tool call is
-    # emitted, so the postprocessor historically suppresses later prose.
-    # Parsers for formats that explicitly allow content after a completed
-    # envelope opt in to preserving those later content deltas.
-    PRESERVE_POST_TOOL_CONTENT: bool = False
-
     # Wire-format openers that must be routed out of a reasoning lane and
     # through this parser.  Most thinking parsers promote ``<tool_call>``
     # themselves; model-specific formats can opt in here so the streaming

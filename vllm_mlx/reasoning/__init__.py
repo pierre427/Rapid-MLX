@@ -81,7 +81,6 @@ def list_parsers() -> list[str]:
 def _register_builtin_parsers():
     """Register built-in parsers."""
     from .cohere_command_parser import CohereCommand4ReasoningParser
-    from .cohere_parser import CohereReasoningParser
     from .deepseek_r1_parser import (
         DeepSeekR1DistillReasoningParser,
         DeepSeekR1ReasoningParser,
@@ -107,10 +106,6 @@ def _register_builtin_parsers():
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
     register_parser("deepseek_r1_distill", DeepSeekR1DistillReasoningParser)
     register_parser("deepseek_v4", DeepSeekV4ReasoningParser)
-    # North's channel protocol is checkpoint-specific; do not claim the
-    # generic ``cohere`` namespace for other Cohere-family wire formats.
-    register_parser("north", CohereReasoningParser)
-    register_parser("cohere_north", CohereReasoningParser)
     # ``vibethinker`` — DeepSeek-R1 variant with a 1024-char no-tag
     # threshold (vs. 64) to accommodate VibeThinker's preamble-before-
     # ``<think>`` shape. See ``VibeThinkerReasoningParser`` docstring

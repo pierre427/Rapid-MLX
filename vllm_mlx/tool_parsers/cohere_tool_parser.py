@@ -26,7 +26,6 @@ class NorthToolParser(ToolParser):
 
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("cohere_action_envelope",)
-    PRESERVE_POST_TOOL_CONTENT = True
 
     START = "<|START_ACTION|>"
     END = "<|END_ACTION|>"
@@ -37,11 +36,13 @@ class NorthToolParser(ToolParser):
         super().__init__(tokenizer)
         self._emitted_tool_count = 0
         self._content_emitted_len = 0
+        self._streaming_engaged = False
 
     def reset(self) -> None:
         super().reset()
         self._emitted_tool_count = 0
         self._content_emitted_len = 0
+        self._streaming_engaged = False
 
     @staticmethod
     def _tool_id(call: dict[str, Any]) -> str:
@@ -338,7 +339,15 @@ class NorthToolParser(ToolParser):
         delta_token_ids: Sequence[int] | None = None,
         request: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        del previous_text, delta_text
+        del delta_text
+
+        if not self._streaming_engaged:
+            self._streaming_engaged = True
+            if previous_text:
+                # First engagement can happen mid-stream: earlier marker-free
+                # deltas took the postprocessor's fast path and are already on
+                # the wire.  Never re-scan (and re-emit) those bytes.
+                self._content_emitted_len = len(previous_text)
 
         content_parts: list[str] = []
         new_calls: list[dict[str, Any]] = []
@@ -400,7 +409,24 @@ class NorthToolParser(ToolParser):
                 for index, call in enumerate(new_calls)
             ]
             self._emitted_tool_count += len(new_calls)
+            # North's protocol allows prose after a completed action envelope
+            # (e.g. a text block in the same turn), so ask the postprocessor
+            # to keep emitting later content deltas instead of applying the
+            # emit-tool-then-suppress default.
+            result["preserve_post_tool_content"] = True
         return result or None
 
     def flush_held_content(self, full_text: str) -> str:
-        return full_text[self._content_emitted_len :]
+        # Structural, not cursor-based: deltas without markers can bypass this
+        # parser entirely (the postprocessor's fast path), so a cursor replay
+        # here would duplicate content already on the wire.  The only bytes
+        # the streaming branch ever withholds are a trailing unclosed action
+        # envelope or a partial opener suffix.
+        pending_start = self._pending_action_start(full_text)
+        if pending_start is not None:
+            return full_text[pending_start:]
+        max_prefix = min(len(self.START) - 1, len(full_text))
+        for size in range(max_prefix, 0, -1):
+            if full_text.endswith(self.START[:size]):
+                return full_text[-size:]
+        return ""
