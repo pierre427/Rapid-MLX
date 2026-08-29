@@ -1724,13 +1724,19 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
     gb._step()
     assert fake_gen_calls["closed"] == 0
 
-    # Production admission keeps MTP at B=1. Simulate a broken admission
-    # boundary and prove the wrapper terminates before _orig_step can consume
-    # the last-emitted placeholder as a new model input.
+    # Stage the exact not-yet-emitted target token before transitioning to
+    # B=2. The scheduler calls this barrier before BatchGenerator.extend;
+    # accepted drafts would return False and keep the incoming lane queued.
+    prepare = batch_gen._mtp_vendored_prepare_batch_expansion
+    assert prepare() is True
+    staged = int(gb._next_tokens[0].item())
+
+    # Model BatchGenerator.extend retaining uid=7 and appending uid=8.
     orig_step_before = gb.orig_step_calls
-    gb.uids = [1, 2]
-    with pytest.raises(RuntimeError, match="admission invariant violated"):
-        gb._step()
+    gb.uids = [7, 8]
+    gb._next_tokens = mx.array([staged, 800], dtype=mx.uint32)
+    gb._next_logprobs = [mx.array([0.0]), mx.array([0.0])]
+    result = gb._step()
 
     assert gb.orig_step_calls == orig_step_before
     stats = batch_gen._mtp_vendored_stats
