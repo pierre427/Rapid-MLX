@@ -30,6 +30,8 @@ class SpeculativeConfig:
     tree_budget: int | None = None
     disable_auto_k: bool | None = None
     continuous_batching: bool = False
+    allow_dynamic_membership: bool = False
+    speculation_rollback: bool = False
     max_suffix_len: int | None = None
     min_confidence: float | None = None
     min_draft_len: int | None = None
@@ -52,6 +54,8 @@ _METHOD_KEYS = {
             "num_speculative_tokens",
             "disable_auto_k",
             "continuous_batching",
+            "allow_dynamic_membership",
+            "speculation_rollback",
         }
     ),
     "suffix": frozenset(
@@ -150,7 +154,7 @@ def parse_speculative_config(value: str | None) -> SpeculativeConfig | None:
             f"unsupported speculative-config key(s) for {method!r}: {joined}"
         )
 
-    return SpeculativeConfig(
+    config = SpeculativeConfig(
         method=method,
         model=_optional_string(payload.get("model"), "model"),
         num_speculative_tokens=_positive_int(
@@ -162,11 +166,34 @@ def parse_speculative_config(value: str | None) -> SpeculativeConfig | None:
             _optional_bool(payload.get("continuous_batching"), "continuous_batching")
             or False
         ),
+        allow_dynamic_membership=(
+            _optional_bool(
+                payload.get("allow_dynamic_membership"),
+                "allow_dynamic_membership",
+            )
+            or False
+        ),
+        speculation_rollback=(
+            _optional_bool(
+                payload.get("speculation_rollback"),
+                "speculation_rollback",
+            )
+            or False
+        ),
         max_suffix_len=_positive_int(payload.get("max_suffix_len"), "max_suffix_len"),
         min_confidence=_confidence(payload.get("min_confidence"), "min_confidence"),
         min_draft_len=_positive_int(payload.get("min_draft_len"), "min_draft_len"),
         raw=dict(payload),
     )
+    if config.allow_dynamic_membership and not config.continuous_batching:
+        raise SpeculativeConfigError(
+            "allow_dynamic_membership requires continuous_batching=true"
+        )
+    if config.speculation_rollback and not config.continuous_batching:
+        raise SpeculativeConfigError(
+            "speculation_rollback requires continuous_batching=true"
+        )
+    return config
 
 
 def _warn_legacy_config_helper(name: str) -> None:

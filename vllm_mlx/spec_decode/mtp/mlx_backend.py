@@ -126,6 +126,26 @@ def _cache_children(cache: Any) -> tuple[Any, ...]:
     return ()
 
 
+def _set_cache_speculation(group: Sequence[Any], *, on: bool) -> None:
+    """Arm or disarm exact-rollback recording across a cache group's tree.
+
+    mlx-lm's ragged caches only record a per-forward rollback while
+    ``speculating`` is set (``start_speculation``); a merge/extend resets that
+    flag, so a batched merge must re-arm it or the first verify forward records
+    nothing and the propose trim fails.  Caches without the surface (fakes,
+    non-recurrent layers) are skipped.
+    """
+    method_name = "start_speculation" if on else "stop_speculation"
+    for cache in group:
+        children = _cache_children(cache)
+        if children:
+            _set_cache_speculation(children, on=on)
+            continue
+        method = getattr(cache, method_name, None)
+        if callable(method):
+            method()
+
+
 def _prepare_cache(cache: Any, lengths: Sequence[int], right_padding) -> None:
     prepare = getattr(cache, "prepare_self_mtp_step", None)
     if callable(prepare):
@@ -252,6 +272,7 @@ class RapidMLXSelfMTPBackend:
         share_qsa_indices: bool = False,
         prefill_step_size: int = 512,
         draft_depth: int = 2,
+        speculation_rollback: bool = False,
     ) -> None:
         if prefill_step_size < 1:
             raise ValueError("prefill_step_size must be positive")
@@ -259,6 +280,8 @@ class RapidMLXSelfMTPBackend:
             raise ValueError("the first Rapid continuous self-MTP backend is K=2")
         if not isinstance(share_qsa_indices, bool):
             raise ValueError("share_qsa_indices must be boolean")
+        if not isinstance(speculation_rollback, bool):
+            raise ValueError("speculation_rollback must be boolean")
         self.target_cache_factory = target_cache_factory
         self.draft_cache_factory = draft_cache_factory
         self.ops = array_ops or _MLXArrayOps()
@@ -267,6 +290,15 @@ class RapidMLXSelfMTPBackend:
         self.share_qsa_indices = share_qsa_indices
         self.prefill_step_size = int(prefill_step_size)
         self.draft_depth = draft_depth
+        # Rollback protocol for the verify forward.  Default (False) keeps the
+        # model's n_confirmed snapshot path (correct for pure full-attention
+        # caches).  True drives the engine's start_speculation/trim_ragged
+        # rollback by confirming nothing, which is what a GatedDeltaNet hybrid
+        # needs: with n_confirmed=0 the GDN records an exact per-forward
+        # rollback instead of taking its snapshot path, so the ragged trim can
+        # rewind it.  Opt-in because it changes the GDN's confirmed-boundary
+        # numerics for the verify forward.
+        self.speculation_rollback = speculation_rollback
 
     def _cache(self, existing: Any, factory: Callable[[], Any] | None, name: str):
         value = existing
@@ -550,7 +582,7 @@ class RapidMLXSelfMTPBackend:
                 forwards.target(
                     verify_ids,
                     target,
-                    n_confirmed=max(depths),
+                    n_confirmed=0 if self.speculation_rollback else max(depths),
                 ),
                 "target forward",
             )
@@ -773,6 +805,10 @@ class RapidRaggedCacheAdapter:
             draft=self._merge([pair[1] for pair in pairs], "draft"),
         )
         if current is None or not current.target:
+            # Fresh cohort: arm rollback recording so the first verify forward
+            # records the per-row trims the propose transaction will rewind.
+            _set_cache_speculation(incoming.target, on=True)
+            _set_cache_speculation(incoming.draft, on=True)
             return incoming
         target, draft = _validate_pair(current)
         incoming_target, incoming_draft = _validate_pair(incoming)
@@ -783,10 +819,19 @@ class RapidRaggedCacheAdapter:
             not callable(getattr(cache, "extend", None)) for cache in target + draft
         ):
             raise ContinuousSelfMTPUnsupported("cache has no extend surface")
+        # Stop recording on both sides before the merge so stale per-row
+        # rollback records cannot outlive the geometry they described, then
+        # re-arm the merged batch (mirrors the source stop-merge-start order).
+        _set_cache_speculation(target, on=False)
+        _set_cache_speculation(draft, on=False)
+        _set_cache_speculation(incoming_target, on=False)
+        _set_cache_speculation(incoming_draft, on=False)
         for cache, other in zip(target, incoming_target):
             cache.extend(other)
         for cache, other in zip(draft, incoming_draft):
             cache.extend(other)
+        _set_cache_speculation(target, on=True)
+        _set_cache_speculation(draft, on=True)
         return current
 
     def rollback(

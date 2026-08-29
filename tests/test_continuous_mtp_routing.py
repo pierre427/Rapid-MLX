@@ -117,10 +117,23 @@ def test_speculative_config_continuous_batching_is_explicit_and_mtp_only():
     default = parse_speculative_config('{"method":"mtp"}')
     enabled = parse_speculative_config('{"method":"mtp","continuous_batching":true}')
     assert default is not None and default.continuous_batching is False
+    assert default.allow_dynamic_membership is False
     assert enabled is not None and enabled.continuous_batching is True
+
+    dynamic = parse_speculative_config(
+        '{"method":"mtp","continuous_batching":true,'
+        '"allow_dynamic_membership":true}'
+    )
+    assert dynamic is not None and dynamic.allow_dynamic_membership is True
 
     with pytest.raises(SpeculativeConfigError, match="must be a boolean"):
         parse_speculative_config('{"method":"mtp","continuous_batching":1}')
+    with pytest.raises(SpeculativeConfigError, match="must be a boolean"):
+        parse_speculative_config('{"method":"mtp","allow_dynamic_membership":1}')
+    with pytest.raises(SpeculativeConfigError, match="requires continuous_batching"):
+        parse_speculative_config(
+            '{"method":"mtp","allow_dynamic_membership":true}'
+        )
     with pytest.raises(SpeculativeConfigError, match="unsupported speculative-config"):
         parse_speculative_config('{"method":"suffix","continuous_batching":true}')
 
@@ -143,6 +156,34 @@ def test_install_plan_is_default_off_and_fails_closed_without_mutation():
     assert quantized.admitted is False
     assert "quantized cache" in " ".join(quantized.reasons)
     assert vars(model) == before
+
+
+def test_install_plan_threads_dynamic_membership_descriptor_attestation():
+    attested = plan_router_install(
+        _Model(),
+        enabled=True,
+        allow_dynamic_membership=True,
+        hard_reserve_bytes=0,
+    )
+    assert attested.admitted is True
+    assert attested.router is not None
+    assert attested.router.config.allow_dynamic_membership is True
+    assert attested.router.runtime.capabilities.dynamic_membership is True
+
+    qwen4_model = _Model()
+    qwen4_model.batched_mtp_capability = _descriptor("qwen4_exp")
+    qwen4 = plan_router_install(
+        qwen4_model,
+        enabled=True,
+        allow_dynamic_membership=True,
+        hard_reserve_bytes=0,
+    )
+    assert qwen4.admitted is True
+    assert qwen4.router is not None
+    assert qwen4.router.runtime.capabilities.dynamic_membership is False
+    refused = qwen4.router.plan([_request("a", 1), _request("b", 2)], free_bytes=1)
+    assert refused.route is ContinuousMTPIntegrationRoute.LEGACY_MTP
+    assert "dynamic_membership" in " ".join(refused.reasons)
 
 
 def test_supported_requests_build_an_immutable_fixed_cohort_plan():
@@ -230,7 +271,7 @@ def test_unsupported_sampling_falls_back_to_legacy_without_a_cohort():
     assert "transformed_distribution_verify" in " ".join(decision.reasons)
 
 
-def test_scheduler_wiring_is_planning_only_and_refusal_precedes_mutation():
+def test_scheduler_wiring_diverts_next_and_refusal_precedes_mutation():
     tree = ast.parse((ROOT / "vllm_mlx" / "scheduler.py").read_text(encoding="utf-8"))
     installer = next(
         node
@@ -251,6 +292,17 @@ def test_scheduler_wiring_is_planning_only_and_refusal_precedes_mutation():
         )
         for node in assignments
     )
+    assert any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "next"
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "batch_gen"
+            for target in node.targets
+        )
+        for node in assignments
+    )
     source = ast.get_source_segment(
         (ROOT / "vllm_mlx" / "scheduler.py").read_text(encoding="utf-8"),
         installer,
@@ -260,8 +312,36 @@ def test_scheduler_wiring_is_planning_only_and_refusal_precedes_mutation():
     assert source.index("if not decision.admitted") < source.index(
         "batch_gen._continuous_mtp_router"
     )
-    assert "live token delivery " in source
-    assert "is not wired in PR 9" in source
+    assert "ContinuousMTPDriver.create" in source
+    assert "continuous_responses + list(fallback_responses)" in source
+    assert "scheduler_owned_termination" in source
+    assert "bool(params.stop) or bool(request.has_tools)" in source
+    assert source.index("_remove_queued(selected)") < source.index(
+        "raw = original_next()"
+    )
+    assert "prompt_cache=package.target_cache" in (
+        ROOT / "vllm_mlx" / "spec_decode" / "mtp" / "continuous_driver.py"
+    ).read_text(encoding="utf-8")
+
+    scheduler_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Scheduler"
+    )
+    create_generator = next(
+        node
+        for node in scheduler_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_create_batch_generator"
+    )
+    create_source = ast.get_source_segment(
+        (ROOT / "vllm_mlx" / "scheduler.py").read_text(encoding="utf-8"),
+        create_generator,
+    )
+    assert create_source is not None
+    router_call = create_source.index("_install_continuous_mtp_router(")
+    vendored_call = create_source.index("_install_mtp_vendored(", router_call)
+    assert router_call < vendored_call
 
 
 def test_cli_and_scheduler_config_carry_the_default_off_opt_in_by_ast():
@@ -273,7 +353,9 @@ def test_cli_and_scheduler_config_carry_the_default_off_opt_in_by_ast():
         in cli_source
     )
     assert "mtp_continuous_batching: bool = False" in scheduler_source
+    assert "mtp_allow_dynamic_membership: bool = False" in scheduler_source
     assert (
         'if self.mtp_continuous_batching and self.spec_decode != "mtp"'
         in scheduler_source
     )
+    assert 'mtp_allow_dynamic_membership=getattr(' in cli_source

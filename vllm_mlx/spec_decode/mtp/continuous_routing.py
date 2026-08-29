@@ -324,6 +324,8 @@ def plan_router_install(
         atomic_cache_commit=descriptor_core
         and not cache_quantized
         and not cache_windowed,
+        dynamic_membership=descriptor_core
+        and descriptor_map.get("dynamic_join") is True,
     )
     runtime = ContinuousMTPRuntimeFacts(
         model_family=str(family),

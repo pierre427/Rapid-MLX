@@ -17,6 +17,21 @@ from vllm_mlx.spec_decode.config import (
 from vllm_mlx.spec_decode.registry import get_spec_decoder, iter_spec_decoders
 
 
+def test_speculation_rollback_is_opt_in_and_requires_continuous_batching() -> None:
+    default = parse_speculative_config('{"method":"mtp"}')
+    assert default is not None
+    assert default.speculation_rollback is False
+
+    enabled = parse_speculative_config(
+        '{"method":"mtp","continuous_batching":true,"speculation_rollback":true}'
+    )
+    assert enabled is not None
+    assert enabled.speculation_rollback is True
+
+    with pytest.raises(SpeculativeConfigError, match="speculation_rollback requires"):
+        parse_speculative_config('{"method":"mtp","speculation_rollback":true}')
+
+
 def test_parse_speculative_config_accepts_vllm_common_keys() -> None:
     cfg = parse_speculative_config(
         '{"method":"mtp","model":"local/draft","num_speculative_tokens":4,'

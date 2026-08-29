@@ -521,15 +521,39 @@ class SchedulerConfig:
     # can retain the safe MLLM default without taking control from operators.
     vision_prefill_token_budget: int | None = None
 
-    # Default-off PR 9 planning seam. This does not replace GenerationBatch
-    # token delivery; the vendored single-request MTP path remains live.
+    # Default-off continuous self-MTP data-plane selection.
     mtp_continuous_batching: bool = False
+
+    # APPEND-ONLY: explicit policy attestation for live cohort joins and
+    # per-lane detach.  ``mtp_continuous_batching`` selects the feature;
+    # this independent flag permits membership mutation only when the loaded
+    # model descriptor and runtime also attest it.
+    mtp_allow_dynamic_membership: bool = False
+
+    # APPEND-ONLY: opt-in rollback protocol for continuous self-MTP.  Default
+    # off keeps the model's n_confirmed snapshot rollback (correct for pure
+    # full-attention caches).  On drives the engine's start_speculation/
+    # trim_ragged rollback (n_confirmed=0), which a GatedDeltaNet hybrid needs;
+    # opt-in because it changes the GDN verify-forward confirmed-boundary.
+    mtp_speculation_rollback: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.mtp_continuous_batching, bool):
             raise ValueError("mtp_continuous_batching must be a boolean")
+        if not isinstance(self.mtp_allow_dynamic_membership, bool):
+            raise ValueError("mtp_allow_dynamic_membership must be a boolean")
+        if not isinstance(self.mtp_speculation_rollback, bool):
+            raise ValueError("mtp_speculation_rollback must be a boolean")
         if self.mtp_continuous_batching and self.spec_decode != "mtp":
             raise ValueError("mtp_continuous_batching requires spec_decode='mtp'")
+        if self.mtp_allow_dynamic_membership and not self.mtp_continuous_batching:
+            raise ValueError(
+                "mtp_allow_dynamic_membership requires mtp_continuous_batching"
+            )
+        if self.mtp_speculation_rollback and not self.mtp_continuous_batching:
+            raise ValueError(
+                "mtp_speculation_rollback requires mtp_continuous_batching"
+            )
         if (
             self.vision_prefill_token_budget is not None
             and self.vision_prefill_token_budget <= 0
@@ -749,27 +773,78 @@ def _install_continuous_mtp_router(
     batch_gen: "BatchGenerator",
     model: Any,
     config: SchedulerConfig,
+    *,
+    requests: dict[str, Any] | None = None,
+    uid_to_request_id: dict[int, str] | None = None,
+    free_bytes_getter: Any = None,
+    stop_tokens: set[int] | frozenset[int] = frozenset(),
 ) -> bool:
-    """Attach the PR 9 planning seam after static admission succeeds.
+    """Install the live continuous-MTP coordinator after static admission.
 
-    The router is metadata-only. It does not replace ``GenerationBatch._step``
-    and therefore cannot claim live continuous-MTP token delivery. A refusal
-    returns before mutating ``batch_gen``; the caller retains legacy MTP/plain
-    behavior.
+    The integration deliberately diverts ``BatchGenerator.next`` rather than
+    ``GenerationBatch._step``.  One continuous transaction can deliver a
+    variable number of tokens for several uids, which is already legal at the
+    outer response-list boundary but cannot be represented by ``_step``'s
+    one-token-per-row return value.  The vendored single-uid ``_step`` remains
+    installed underneath and therefore serves only queued lanes this router
+    leaves on the legacy/plain path.
+
+    Refusal and runtime assembly both happen before mutation.  The next-level
+    coordinator is the authoritative data plane for admitted uids.
     """
-    from .spec_decode.mtp.continuous_routing import plan_router_install
+    import types
+
+    from .spec_decode.mtp.batched import (
+        LaneAdmission,
+        SamplingContract,
+        assess_lane,
+    )
+    from .spec_decode.mtp.continuous_driver import ContinuousMTPDriver
+    from .spec_decode.mtp.continuous_engine import SelfMTPLaneSpec, SelfMTPSampling
+    from .spec_decode.mtp.continuous_routing import (
+        ContinuousMTPIntegrationRoute,
+        ContinuousMTPRequestMetadata,
+        plan_router_install,
+    )
+    from .spec_decode.mtp.continuous_runtime import (
+        assemble_continuous_self_mtp_runtime,
+    )
+
+    # The next-level diversion depends on mlx-lm 0.31's explicit prompt queue.
+    # Older generators retain the vendored/plain path without partial mutation.
+    if not hasattr(batch_gen, "_unprocessed_sequences") or not callable(
+        getattr(batch_gen, "next", None)
+    ):
+        logger.warning(
+            "[MTP-continuous] BatchGenerator lacks the 0.31 queue/next surface; "
+            "retaining vendored MTP/plain decode"
+        )
+        return False
 
     cache_quantized = bool(
         getattr(config, "kv_cache_quantization", False)
         or getattr(config, "kv_cache_turboquant", False)
         or getattr(config, "kv_cache_dtype", "bf16") != "bf16"
     )
+    max_lanes = min(
+        int(getattr(config, "max_num_seqs", 4)),
+        int(getattr(config, "completion_batch_size", 32)),
+    )
+    if max_lanes < 2:
+        logger.warning(
+            "[MTP-continuous] completion capacity is below the two-lane "
+            "minimum; retaining vendored MTP/plain decode"
+        )
+        return False
     decision = plan_router_install(
         model,
         enabled=getattr(config, "mtp_continuous_batching", False),
         cache_quantized=cache_quantized,
         cache_windowed=bool(getattr(config, "use_paged_cache", False)),
-        max_lanes=max(2, int(getattr(config, "max_num_seqs", 4))),
+        max_lanes=max_lanes,
+        allow_dynamic_membership=bool(
+            getattr(config, "mtp_allow_dynamic_membership", False)
+        ),
     )
     if not decision.admitted or decision.router is None:
         logger.warning(
@@ -778,11 +853,277 @@ def _install_continuous_mtp_router(
             "; ".join(decision.reasons),
         )
         return False
-    batch_gen._continuous_mtp_router = decision.router
-    logger.warning(
-        "[MTP-continuous] fixed-cohort planner installed; live token delivery "
-        "is not wired in PR 9, so the vendored legacy MTP/plain data plane "
-        "remains authoritative."
+
+    try:
+        runtime = assemble_continuous_self_mtp_runtime(
+            model,
+            allow_dynamic_membership=bool(
+                getattr(config, "mtp_allow_dynamic_membership", False)
+            ),
+            speculation_rollback=bool(
+                getattr(config, "mtp_speculation_rollback", False)
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed at optional install
+        logger.warning(
+            "[MTP-continuous] runtime assembly refused; retaining vendored "
+            "MTP/plain decode: %s",
+            exc,
+        )
+        return False
+
+    router = decision.router
+    assert router is not None
+    original_next = batch_gen.next
+    original_close = getattr(batch_gen, "close", None)
+    original_remove = getattr(batch_gen, "remove", None)
+    response_type = getattr(type(batch_gen._generation_batch), "Response", None)
+    if response_type is None:
+        logger.warning(
+            "[MTP-continuous] GenerationBatch.Response is unavailable; "
+            "retaining vendored MTP/plain decode"
+        )
+        return False
+
+    def _response_factory(**kwargs):
+        # mlx-lm's Response grew MTP fields in the unified source.  Preserve
+        # compatibility with 0.31 patch levels that lack constructor kwargs by
+        # attaching the sidecar fields after constructing the common surface.
+        extras = {}
+        for name in ("mtp_state", "lane_rng", "rng_draws"):
+            if name in kwargs:
+                extras[name] = kwargs.pop(name)
+        try:
+            response = response_type(**kwargs, **extras)
+        except TypeError:
+            response = response_type(**kwargs)
+            for name, value in extras.items():
+                setattr(response, name, value)
+        return response
+
+    def _cache_offset(value: Any) -> int:
+        children = getattr(value, "caches", None)
+        if isinstance(children, (list, tuple)):
+            return max((_cache_offset(child) for child in children), default=0)
+        try:
+            return max(0, int(getattr(value, "offset", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _free_bytes() -> int:
+        if not callable(free_bytes_getter):
+            return 0
+        try:
+            return max(0, int(free_bytes_getter()))
+        except Exception:  # noqa: BLE001 - advisory admission telemetry
+            return 0
+
+    def _metadata(sequence: Any):
+        uid, segments, maximum, caches, history, _sampler, processors, _matcher = (
+            sequence
+        )
+        request_id = None if uid_to_request_id is None else uid_to_request_id.get(uid)
+        request = (
+            None
+            if requests is None or request_id is None
+            else requests.get(request_id)
+        )
+        if request is None:
+            return None
+        prompt = tuple(int(token) for segment in segments for token in segment)
+        if not prompt:
+            return None
+        params = request.sampling_params
+        greedy = float(params.temperature) == 0.0
+        # The continuous wrapper commits an accepted burst before the driver
+        # drains it one token per scheduler call.  A scheduler-owned text stop
+        # or tool-loop abort could therefore terminate after only a prefix of
+        # that committed burst, leaving the detached cache ahead of visible
+        # delivery.  Keep those requests on the legacy/plain path until the
+        # driver has an explicit post-commit rewind acknowledgement surface.
+        scheduler_owned_termination = bool(params.stop) or bool(request.has_tools)
+        cache_ready = not history and not any(_cache_offset(cache) for cache in caches)
+        capability = getattr(type(caches[0]), "__name__", "") if caches else ""
+        cache_quantized = "quantized" in capability.lower()
+        cache_windowed = any(
+            marker in capability.lower() for marker in ("rotating", "window", "sink")
+        )
+        return ContinuousMTPRequestMetadata(
+            lane_id=request_id,
+            uid=int(uid),
+            prompt_tokens=prompt,
+            max_tokens=int(maximum),
+            stop_tokens=frozenset(stop_tokens),
+            sampling=SamplingContract(
+                greedy=greedy,
+                has_logits_processors=bool(processors)
+                or scheduler_owned_termination,
+                uses_xtc=False,
+            ),
+            temperature=float(params.temperature),
+            base_bytes=sum(int(getattr(cache, "nbytes", 0)) for cache in caches),
+            bytes_per_draft_token=0,
+            cache_ready=cache_ready,
+            cache_quantized=cache_quantized,
+            cache_windowed=cache_windowed,
+        )
+
+    def _queued_candidates():
+        candidates = []
+        for sequence in tuple(batch_gen._unprocessed_sequences):
+            metadata = _metadata(sequence)
+            if metadata is not None:
+                candidates.append((sequence, metadata))
+        return candidates
+
+    def _remove_queued(uids: set[int]) -> None:
+        if not uids:
+            return
+        batch_gen._unprocessed_sequences = deque(
+            sequence
+            for sequence in batch_gen._unprocessed_sequences
+            if int(sequence[0]) not in uids
+        )
+
+    driver: ContinuousMTPDriver | None = None
+
+    def _stage_initial() -> None:
+        nonlocal driver
+        candidates = _queued_candidates()
+        if not candidates:
+            return
+        metadata = [item[1] for item in candidates]
+        routed = router.plan(metadata, free_bytes=_free_bytes())
+        if routed.route is not ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED:
+            return
+        specs = [lane.spec for lane in routed.cohort]
+        if not specs:
+            return
+        selected = {spec.uid for spec in specs}
+        _remove_queued(selected)
+        driver = ContinuousMTPDriver.create(
+            specs,
+            runtime,
+            stop_tokens={lane.spec.uid: lane.stop_tokens for lane in routed.cohort},
+            response_factory=_response_factory,
+        )
+        batch_gen._continuous_mtp_driver = driver
+
+    def _stage_joins() -> None:
+        if driver is None or not driver.dynamic_membership:
+            return
+        occupied = len(driver.lane_uids) + len(driver.pending_join_uids)
+        room = max(0, int(router.config.max_lanes) - occupied)
+        if room == 0 or _free_bytes() <= int(router.config.hard_reserve_bytes):
+            return
+        joining_specs = []
+        joining_stops = {}
+        for sequence, metadata in _queued_candidates():
+            if len(joining_specs) >= room:
+                break
+            lane = LaneAdmission(
+                lane_id=metadata.lane_id,
+                base_bytes=metadata.base_bytes,
+                bytes_per_draft_token=metadata.bytes_per_draft_token,
+                sampling=metadata.sampling,
+                cache_ready=metadata.cache_ready,
+                terminal=False,
+            )
+            gate = assess_lane(
+                lane,
+                config=router.config,
+                capabilities=router.runtime.capabilities,
+            )
+            if not gate.eligible:
+                continue
+            spec = SelfMTPLaneSpec(
+                uid=metadata.uid,
+                prompt=metadata.prompt_tokens,
+                max_tokens=metadata.max_tokens,
+                num_draft=2,
+                sampling=SelfMTPSampling(temperature=metadata.temperature),
+            )
+            joining_specs.append(spec)
+            joining_stops[spec.uid] = metadata.stop_tokens
+        if not joining_specs:
+            return
+        _remove_queued({spec.uid for spec in joining_specs})
+        driver.queue_lanes(joining_specs, stop_tokens=joining_stops)
+
+    def _continuous_next(self):
+        nonlocal driver
+        continuous_responses = []
+        if driver is not None and driver.has_work:
+            continuous_responses = driver.next()
+            # Completed lanes deliver their KV/MTP caches by value on the
+            # response above; the driver's terminal-detach retention is then
+            # redundant.  Drain it every cycle so finished requests' caches are
+            # released instead of accumulating for the batch's lifetime.
+            driver.take_terminal_detaches()
+
+        # A terminal in a fixed cohort detaches every row.  Its companions'
+        # already committed responses must drain before their cache packages
+        # can be reattached; resume them in place at that exact boundary.
+        if driver is not None and driver.closed and not driver.has_pending_responses:
+            driver.resume_turnover()
+
+        # Membership changes are staged only after the current transaction has
+        # committed.  ``queue_lanes`` applies them at the beginning of the next
+        # driver call, matching mlx-lm-unified's generate-first/admit-afterward
+        # cycle contract.
+        if driver is None or not driver.has_work:
+            driver = None
+            batch_gen._continuous_mtp_driver = None
+            _stage_initial()
+        else:
+            _stage_joins()
+
+        raw = original_next()
+        if isinstance(raw, tuple):
+            prompt_responses, fallback_responses = raw
+        else:
+            prompt_responses, fallback_responses = [], raw
+        return prompt_responses, continuous_responses + list(fallback_responses)
+
+    def _continuous_close(self):
+        if driver is not None:
+            try:
+                driver.discard_all()
+            except Exception as exc:  # noqa: BLE001 - close remains best effort
+                logger.debug("[MTP-continuous] close detach skipped: %s", exc)
+        if callable(original_close):
+            return original_close()
+        return None
+
+    def _continuous_remove(self, uids, *args, **kwargs):
+        removed_packages = ()
+        if driver is not None:
+            removed_packages = driver.remove_uids(uids)
+        base = {}
+        if callable(original_remove):
+            base = original_remove(uids, *args, **kwargs)
+        if kwargs.get("return_prompt_caches", False):
+            base = dict(base or {})
+            for package in removed_packages:
+                if package.uid not in uids:
+                    continue
+                base[package.uid] = (package.target_cache, list(package.token_ids))
+                batch_gen._continuous_mtp_removed_states[package.uid] = (
+                    package.draft_cache,
+                    package.lane.seed_hidden,
+                )
+        return base
+
+    batch_gen.next = types.MethodType(_continuous_next, batch_gen)
+    batch_gen.close = types.MethodType(_continuous_close, batch_gen)
+    batch_gen.remove = types.MethodType(_continuous_remove, batch_gen)
+    batch_gen._continuous_mtp_router = router
+    batch_gen._continuous_mtp_runtime = runtime
+    batch_gen._continuous_mtp_driver = None
+    batch_gen._continuous_mtp_removed_states = {}
+    logger.info(
+        "[MTP-continuous] BatchGenerator.next coordinator installed "
+        "(multi-uid burst delivery; cycle-boundary joins; per-lane detach)."
     )
     return True
 
@@ -4016,10 +4357,19 @@ class Scheduler:
                 )
             else:
                 if getattr(self.config, "mtp_continuous_batching", False):
-                    _install_continuous_mtp_router(bg, self.model, self.config)
-                # The continuous-router commit installs only its planner. The
-                # vendored generator remains the live data plane until the
-                # later scheduler commit wires continuous token delivery.
+                    _install_continuous_mtp_router(
+                        bg,
+                        self.model,
+                        self.config,
+                        requests=self.requests,
+                        uid_to_request_id=self.uid_to_request_id,
+                        free_bytes_getter=self._continuous_mtp_free_bytes,
+                        stop_tokens=frozenset(stop_tokens),
+                    )
+                # The vendored hook remains installed beneath the continuous
+                # BatchGenerator.next diversion. Admitted uids are removed from
+                # mlx-lm's prompt queue before it runs, so this _step owns only
+                # non-admitted/unsupported fallback lanes.
                 mtp_installed = _install_mtp_vendored(
                     bg,
                     model=self.model,
@@ -4756,6 +5106,23 @@ class Scheduler:
             return int(psutil.Process().memory_info().rss)
         except Exception:
             return 0
+
+    def _continuous_mtp_free_bytes(self) -> int:
+        """Best-effort live headroom for continuous-MTP cohort admission.
+
+        The router applies its own hard reserve to this value.  Returning zero
+        when the platform cap is unavailable is intentionally fail-closed: the
+        optional coordinator must not guess that a second target+draft cache
+        fits merely because MLX omitted device telemetry.
+        """
+        cap = self._resolve_metal_cap_bytes()
+        if cap <= 0:
+            return 0
+        resident = max(
+            self._current_metal_active_bytes(),
+            self._current_process_resident_bytes(),
+        )
+        return max(0, cap - resident)
 
     def _active_prefill_token_count(self) -> int:
         """Return the largest final context offset currently prefetched.
@@ -7661,6 +8028,41 @@ class Scheduler:
                     request.output_text = output.output_text
                     self._cleanup_detokenizer(request_id)
 
+                # A scheduler-owned terminal (text stop / repetition abort)
+                # can end a lane before the model-side stop matcher does.  In
+                # that case the response has no cache yet: detach the uid at
+                # this same delivery boundary and promote its target/draft
+                # state onto the response before the normal finalization path
+                # below runs.  Native model terminals already carry a cache
+                # and skip this branch.
+                if (
+                    getattr(response, "prompt_cache", None) is None
+                    and request.batch_uid is not None
+                    and self.batch_generator is not None
+                ):
+                    try:
+                        extracted = self.batch_generator.remove(
+                            [request.batch_uid], return_prompt_caches=True
+                        )
+                        payload = extracted.get(request.batch_uid)
+                        if isinstance(payload, tuple) and len(payload) == 2:
+                            response.prompt_cache = payload[0]
+                            response.all_tokens = payload[1]
+                        sidecars = getattr(
+                            self.batch_generator,
+                            "_continuous_mtp_removed_states",
+                            {},
+                        )
+                        mtp_state = sidecars.pop(request.batch_uid, None)
+                        if mtp_state is not None:
+                            response.mtp_state = mtp_state
+                    except Exception as exc:  # noqa: BLE001 - best-effort cache
+                        logger.debug(
+                            "Failed to detach terminal cache for %s: %s",
+                            request_id,
+                            exc,
+                        )
+
                 # Extract cache for future reuse (critical for agentic multi-turn)
                 if hasattr(response, "prompt_cache"):
                     try:
@@ -7686,6 +8088,14 @@ class Scheduler:
                                 request._extracted_cache = raw_cache
                     except Exception as e:
                         logger.debug(f"Failed to extract cache for {request_id}: {e}")
+
+                # Continuous self-MTP terminal responses carry the detached
+                # draft cache plus exact seed hidden state alongside the target
+                # cache. Keep that opaque sidecar on the request through
+                # finalization so APC/turnover integrations can persist the
+                # pair without reconstructing state from delivered tokens.
+                if getattr(response, "mtp_state", None) is not None:
+                    request._continuous_mtp_state = response.mtp_state
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1

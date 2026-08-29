@@ -99,6 +99,7 @@ class ContinuousMTPDetachPackage:
 
     detached: DetachedSelfMTPLane
     tokens: tuple[MTPToken, ...]
+    stop_tokens: frozenset[int]
     terminal: bool
     finish_reason: str | None
 
@@ -232,6 +233,50 @@ class ContinuousMTPGenerationBatch:
             first_tokens=first_tokens,
             stop_tokens=normalized_stops,
         )
+
+    @classmethod
+    def resume(
+        cls,
+        packages: Sequence[ContinuousMTPDetachPackage],
+    ) -> ContinuousMTPGenerationBatch:
+        """Resume a nonterminal cohort from canonical detach packages.
+
+        The packages already own prepared target/draft caches and their exact
+        delivered-token ledgers, so resumption attaches them directly without
+        re-prefill or replay.  Terminal packages are rejected: their cache
+        ownership belongs to scheduler finalization, not a new live cohort.
+        """
+        packages = tuple(packages)
+        if not packages:
+            raise ValueError("cannot resume an empty continuous MTP cohort")
+        if any(package.terminal for package in packages):
+            raise ValueError("cannot resume terminal continuous MTP packages")
+        uids = tuple(package.uid for package in packages)
+        if len(uids) != len(set(uids)):
+            raise ValueError("resumed continuous MTP lane uid values must be unique")
+        runtime = packages[0].detached._runtime
+        if any(package.detached._runtime is not runtime for package in packages[1:]):
+            raise ValueError("resumed continuous MTP packages use different runtimes")
+
+        batch = attach_self_mtp_lanes(
+            None,
+            [package.detached for package in packages],
+            runtime=runtime,
+        )
+        resumed = cls.__new__(cls)
+        resumed._batch = batch
+        resumed._closed = False
+        resumed._detached = ()
+        resumed._states = {
+            package.uid: _LaneDeliveryState(
+                uid=package.uid,
+                max_tokens=package.lane.max_tokens,
+                stop_tokens=package.stop_tokens,
+                tokens=list(package.tokens),
+            )
+            for package in packages
+        }
+        return resumed
 
     @property
     def dynamic_membership(self) -> bool:
@@ -382,6 +427,34 @@ class ContinuousMTPGenerationBatch:
             return self._detached
         return self._detach_cohort()
 
+    def detach_lanes(
+        self, uids: Sequence[int]
+    ) -> tuple[ContinuousMTPDetachPackage, ...]:
+        """Detach live nonterminal lanes at a closed transaction boundary.
+
+        Dynamic cohorts detach only the requested rows.  Fixed cohorts must
+        turn over as a unit, so requesting any live uid detaches every row and
+        returns the companions as resumable packages too.
+        """
+        self._require_open()
+        uids = tuple(uids)
+        if not uids:
+            return ()
+        if len(uids) != len(set(uids)):
+            raise ValueError("detached continuous MTP lane uid values must be unique")
+        unknown = set(uids).difference(self._states)
+        if unknown:
+            raise KeyError(f"unknown continuous MTP lane uid values: {sorted(unknown)}")
+        requested = set(uids)
+        indices = [
+            index
+            for index, lane in enumerate(self._batch.lanes)
+            if lane.uid in requested
+        ]
+        if self.dynamic_membership and len(indices) < len(self._batch.lanes):
+            return self._detach_indices(indices, terminal=False)
+        return self._detach_cohort()
+
     def _deliver_initial(
         self, pending: Sequence[int]
     ) -> ContinuousMTPGenerationBurst:
@@ -429,13 +502,13 @@ class ContinuousMTPGenerationBatch:
         if not indices:
             return ()
         if self.dynamic_membership and len(indices) < len(self._batch.lanes):
-            return self._detach_indices(indices)
+            return self._detach_indices(indices, terminal=True)
         return self._detach_cohort()
 
     def _detach_indices(
-        self, indices: Sequence[int]
+        self, indices: Sequence[int], *, terminal: bool
     ) -> tuple[ContinuousMTPDetachPackage, ...]:
-        """Detach the given terminal rows; the batch stays open for the rest."""
+        """Detach the given rows; the batch stays open for the rest."""
         self._batch, detached = detach_self_mtp_lanes(self._batch, indices)
         packages = []
         for item in detached:
@@ -444,7 +517,8 @@ class ContinuousMTPGenerationBatch:
                 ContinuousMTPDetachPackage(
                     detached=item,
                     tokens=tuple(state.tokens),
-                    terminal=True,
+                    stop_tokens=state.stop_tokens,
+                    terminal=terminal,
                     finish_reason=state.finish_reason,
                 )
             )
@@ -462,6 +536,7 @@ class ContinuousMTPGenerationBatch:
                 ContinuousMTPDetachPackage(
                     detached=item,
                     tokens=tuple(state.tokens),
+                    stop_tokens=state.stop_tokens,
                     terminal=state.terminal,
                     finish_reason=state.finish_reason,
                 )

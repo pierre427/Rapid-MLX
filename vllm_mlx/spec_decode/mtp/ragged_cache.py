@@ -16,6 +16,7 @@ is called, which keeps its contract testable with pure Python fakes.
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import re
 import threading
 from collections.abc import Iterable
@@ -440,6 +441,20 @@ def _reject_unsupported_shape(cache: Any) -> None:
         )
 
 
+def _call_ragged_method(method: Any, values: list[int], *, verify_size: int, validate: bool):
+    """Call a cache's ragged preflight/trim, forwarding ``verify_size`` only if
+    it is accepted.  mlx-lm's cache classes expose ``(n, *, validate)``; some
+    Rapid/test caches also take a ``verify_size`` hint.  Introspecting keeps one
+    adapter working across both without assuming an ABI the real cache lacks."""
+    try:
+        accepts_verify = "verify_size" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        accepts_verify = False
+    if accepts_verify:
+        return method(values, verify_size=verify_size, validate=validate)
+    return method(values, validate=validate)
+
+
 def preflight_ragged_cache(
     cache: Any,
     drops: Iterable[int],
@@ -463,7 +478,9 @@ def preflight_ragged_cache(
         raise RaggedCacheUnsupportedError(
             f"cache {type(cache).__name__} has no ragged rollback adapter"
         )
-    result = preflight(values, verify_size=verify_size, validate=validate)
+    result = _call_ragged_method(
+        preflight, values, verify_size=verify_size, validate=validate
+    )
     return result[0] if isinstance(result, tuple) and len(result) == 5 else result
 
 
@@ -485,7 +502,9 @@ def trim_ragged_cache(
             for child in children:
                 apply(child)
             return
-        node.trim_ragged(values, verify_size=verify_size, validate=False)
+        _call_ragged_method(
+            node.trim_ragged, values, verify_size=verify_size, validate=False
+        )
 
     apply(cache)
     return values
