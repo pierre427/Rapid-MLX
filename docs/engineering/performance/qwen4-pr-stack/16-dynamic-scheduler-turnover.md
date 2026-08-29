@@ -3,7 +3,7 @@
 Source integration commit: `d7cf5bbb11656f0ed90ce9b1749454dc9eaf3657`
 (publication split required).
 
-Depends on: PR 15A / native Qwen3.5 head and continuous-B1 correction.
+Depends on: PR 15B / continuous-engine observability.
 
 Publication branch: `feat/mtp-dynamic-scheduler-turnover`
 
@@ -12,10 +12,10 @@ submitted upstream. The combined source commit is mirrored on private Forgejo.
 
 ## Why
 
-Once fixed-cohort delivery owns the live response path and native Qwen3.5 MTP
-heads enter that path correctly, Qwen3.5 can reuse the wrapper's
-closed-boundary attach/detach transaction to replace finished lanes without
-restarting survivor requests.
+Once fixed-cohort delivery owns the live response path, native Qwen3.5 MTP
+heads enter that path correctly, and transaction failures are observable,
+Qwen3.5 can reuse the wrapper's closed-boundary attach/detach transaction to
+replace finished lanes without restarting survivor requests.
 
 ## Scope
 
