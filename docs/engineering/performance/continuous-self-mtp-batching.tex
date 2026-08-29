@@ -1,0 +1,345 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=0.78in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,hyperref,microtype}
+\usepackage[T1]{fontenc}
+
+\title{Continuous Self-MTP Batching for Bandwidth-Bound\\
+       Large-Language-Model Inference on Apple Silicon}
+\author{Pierre Lamy}
+\date{29 August 2026 --- working paper, not yet submitted}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autoregressive decode on unified-memory systems is commonly limited by the
+cost of streaming model weights for one token at a time.  Native multi-token
+prediction (MTP) reduces the number of target-model rounds for a single
+request, while continuous batching amortizes a target round across requests;
+existing serving paths generally implement only one of these dimensions at a
+time.  We describe \emph{continuous self-MTP batching}, a transactional
+decode engine that batches each request's current token and its MTP-proposed
+continuation in one target forward.  For $N$ homogeneous lanes and draft depth
+$k$, a cycle presents $M=(k+1)N$ verification positions while streaming the
+target weights once.  The design adds per-lane residual verification,
+per-row ragged rollback, persistent MTP-head state, dynamic lane admission,
+and prefix-cache composition.  In a local MLX prototype, aggregate decode on
+Qwen3.8-Flash-Next rose from 63.4 to 120.3 token/s between $N=1$ and $N=4$;
+Qwen3.8-27B rose from 49.0 to 82.0 token/s.  These are session-trace
+measurements from the source prototype, not measurements of the Rapid-MLX
+port staged with this paper.  In the source prototype, fixed cohorts and
+mid-flight joins for both model families pass their available hierarchical
+hardware gates.  The staged Rapid port remains fixed-cohort-only pending live
+scheduler integration and Rapid-native dynamic-membership qualification.
+\end{abstract}
+
+\section{Motivation}
+Plain decode authorizes one token after each target-model forward.  On Apple
+Silicon, the parameters and KV state share one memory system, and large-model
+decode is frequently bandwidth-bound.  A longer verification sequence can
+therefore use otherwise under-filled compute while amortizing the dominant
+weight stream.  Speculative decoding formalizes this exchange: a cheaper
+proposal mechanism drafts tokens and the target verifies them without changing
+the target distribution~\cite{leviathan2023}.  Trained prediction heads avoid
+loading a separate draft model, as explored by Medusa and MTP-trained
+models~\cite{cai2024,deepseek2024}.  Independently, iteration-level scheduling
+changes batch membership between target rounds~\cite{yu2022}.
+
+The systems problem is their composition.  A single-request self-MTP loop owns
+target KV, recurrent state, an MTP-head cache, hidden-state handoff, random
+draws, and pending tokens.  A continuous batch additionally permits requests
+to arrive, finish, abort, hit a prefix cache, or become ineligible between
+cycles.  Treating the MTP loop as an opaque per-request generator loses the
+main opportunity: the target still streams once per lane.
+
+\section{Continuous self-MTP}
+Let lane $i$ propose $k_i$ tokens $d_{i,1:k_i}$.  Its target verification row
+is
+\begin{equation}
+  v_i=[c_i,d_{i,1},\ldots,d_{i,k_i}],
+\end{equation}
+where $c_i$ is the committed token not yet represented in the target cache.
+Rows are right padded to $W=1+\max_i k_i$ and evaluated together.  With fixed
+depth $k$, the target sees
+\begin{equation}
+  M=(k+1)N
+\end{equation}
+logical verification positions per weight stream.  This is not a claim that
+$M$ tokens are committed: lane $i$ commits $a_i$ accepted drafts plus one
+target correction or bonus token.  Cycle yield is
+\begin{equation}
+  Y=\sum_{i=1}^{N}(a_i+1), \qquad
+  \mathrm{TPS}=Y/t_{\mathrm{cycle}}.
+\end{equation}
+
+Draft generation is also batched.  Each native MTP-head step consumes the
+per-lane hidden state and most recent token.  Lanes with a shorter remaining
+budget contribute an invalid padded row rather than consuming RNG or cache
+position.  Consequently, batch composition cannot change a lane's random
+sequence.
+
+For Flash-Next, the two recursive draft steps may share the QSA block
+selection computed from each row's last valid first-step query.  The selection
+is cycle-local: prepare/finalize padding inside the same proposal preserves it,
+while commit, abort, state restore, trim, filter, extend, or membership change
+clears it.  This is the Rapid adaptation of source commit
+\texttt{393eddf}; it avoids both redundant indexer work and accidental reuse
+across a geometry-changing boundary.  It does not by itself qualify dynamic
+Flash joins.
+
+\subsection{Verification and sampling}
+Greedy verification accepts the longest prefix on which draft and target
+argmax agree.  Sampled verification applies the same temperature, top-$p$,
+top-$k$, and min-$p$ transform to both distributions, then uses the standard
+acceptance probability
+\begin{equation}
+  \alpha(x)=\min\{1,p(x)/q(x)\}.
+\end{equation}
+On rejection it samples from the normalized residual
+$[p-q]_+$.  Acceptance uniforms for lane $i$ have native shape $(k_i,)$ and
+come from a lane-owned key.  They are never drawn as a padded $(N,W)$ tensor.
+This preserves the lane's draw order across joins and leaves.  XTC remains
+fail-closed until its stochastic transform can be shared exactly between
+draft and target.  Block verification~\cite{sun2024} is compatible with the
+transaction but is not required for the headline result.
+
+Greedy digest qualification uses a separate hierarchy.  Level 1 compares the
+batched engine at $B=1$ with incumbent single-lane self-MTP and requires exact
+tokens and digest; no batch-shape tolerance is permitted.  Level 2 compares
+each $B>1$ lane with its own batched-$B1$ execution and permits only the
+declared BF16 batch-shape band.  The older single-lane-versus-$B>1$ comparison
+is retained as an informative compatibility diagnostic.  Cache equality,
+rollback, commit, and detach remain bit-exact gates, so distributional token
+tolerance cannot mask transaction corruption.  This hierarchy follows source
+commit \texttt{0995cbc}.
+
+\subsection{Propose--commit transaction}
+Every cycle is a two-phase transaction:
+\begin{enumerate}
+  \item \textbf{Propose.} Snapshot membership epoch and lane order, advance
+        the MTP head, verify the padded rows, and trim each target-cache row by
+        $k_i-a_i$.
+  \item \textbf{Commit.} After stop/EOS/length handling determines how many
+        authorized tokens were actually delivered, trim any undelivered
+        suffix, advance the canonical current token and hidden state, and
+        publish the new lane state.
+\end{enumerate}
+Membership changes are forbidden while a proposal is open.  A nonterminal
+lane must consume its complete authorized result.  A terminal lane may consume
+only a prefix, but the target cache, recurrent slots, MTP cache, processor
+history, and current-token boundary must all land on that same prefix.
+
+This contract is essential for Qwen hybrid models.  Their logical cache is not
+only transformer KV: it includes Gated DeltaNet convolution and recurrence,
+PLE n-gram history, QSA raw/compressed index keys, and the MTP-head cache.  A
+scalar rollback applied to only the transformer KV silently corrupts later
+decode.
+
+\subsection{Join, leave, and admission}
+At a closed transaction boundary, leaving lanes are extracted before the old
+batch is filtered.  Joining lanes arrive as canonical one-row packages and
+are merged only after their capability and memory gates pass.  Each mutation
+increments a membership epoch.  Model-family capability controls are
+independent.  In the source prototype, 27B joins are token-exact and Flash-Next
+joins pass the real-BF16 hierarchical gate distributionally: batched-B1 remains
+exact, B$>$1 lanes---including the joined lane---stay inside the declared
+batch-shape band, and cache/rollback contracts remain exact.  The staged Rapid
+capability remains fixed-cohort-only because dynamic membership is not yet
+wired or qualified in Rapid.
+
+Admission is memory-aware and degrades monotonically:
+\begin{equation}
+  N \rightarrow k=2 \rightarrow k=1 \rightarrow
+  \text{plain decode} \rightarrow \text{queue}.
+\end{equation}
+The Rapid-MLX planning layer reuses the server's existing allocator cap and
+KV-footprint accounting instead of introducing a second memory model.
+Decisions occur only between transactions, before widening a cache batch.  At
+this staging revision the planner is opt-in and non-mutating; it does not yet
+replace Rapid's live single-lane MTP generation step.
+
+\section{Prefix-cache composition}
+An exact prefix-cache record for self-MTP must represent one token boundary
+across three objects: target cache $C_T$, persistent MTP cache $C_D$, and the
+hidden state $h$ that predicts the current token.  A hit that restores only
+$C_T$ either discards useful MTP work or resumes the draft head from an
+inconsistent position.  The staged Rapid work therefore extends its existing
+Flash-Next prefix-hit preservation; it does not replace Rapid's adaptive
+prefix cache or radix index.
+
+Prefix state is admitted only when offsets satisfy
+\begin{equation}
+  \mathrm{offset}(C_D)=\mathrm{offset}(C_T)-1,
+\end{equation}
+with a nonempty current token and a compatible model/configuration identity.
+Trivial hits fail open to ordinary MTP initialization rather than disabling
+MTP for the whole request.
+
+\section{Implementation lineage}
+The source implementation is preserved in four local commits:
+\texttt{92576ced} (batched engine and Flash-Next gates),
+\texttt{93d7aa9a} (27B/Qwen3.5 qualification and join tests),
+\texttt{393eddf} (cycle-local QSA selection preservation), and
+\texttt{0995cbc} (batched-B1 digest-oracle reframing).  Together they contain
+an $N$-lane propose--commit core, a batch wrapper, server routing, per-lane RNG,
+ragged cache lifecycle, admission, QSA draft reuse, and the final qualification
+hierarchy.
+The Rapid-MLX port targets \texttt{74652283} (release 0.13.1).  Its staged
+series separates handoff correctness, pure transaction contracts, ragged
+rollback, APC prepared state, the fixed-cohort core, family capabilities,
+generation ownership, the MLX data plane, QSA selection sharing, transformed
+residual sampling, planner routing, bounded qualification telemetry, and digest
+oracle policy into reviewable commits.
+
+Rapid already contains the Qwen4 architecture, vectorized QSA mask
+construction, native one-layer MTP, batched compressed-key prefill, atomic
+Qwen recurrent rollback, and MTP prefix-hit preservation.  Those features are
+treated as prerequisites, not copied into the new stack.  The port focuses on
+the mid-stream handoff invariant, batched prepared-state lifecycle, continuous
+self-MTP coordinator, the prefix-state delta, and qualification/telemetry.
+
+QSA kernel work remains outside the continuous self-MTP dependency chain.  The
+Rapid-target side branch, historically named \texttt{qwen4-nax-side-stack},
+actually rebases Rapid PR~\#2547's opt-in non-NAX Metal block-sparse prefill
+kernel.  Its upstream M3 Ultra evidence reports a 10.7\% prefill gain at 32K
+with unchanged decode; this local rebase did not independently rerun that
+measurement.  Separately, the lab's MPP/NAX QSA prototype measured median
+prefill gains of 16.0\%, 31.6\%, and 37.9\% at 16K, 32K, and 64K with flat
+decode, preserved in committed per-arm JSON artifacts.  A later default-on
+production restart served one request and then exited without a fresh Python
+traceback.  The incident is not root-caused---first-use compilation or memory
+pressure is only a hypothesis---so NAX remains default-off pending isolated,
+memory-observed service qualification.  Neither kernel is part of the headline
+self-MTP series.  NVMe PLE offload, shared-in-gather MoE, GDN normalization
+fusion, and an untracked fused-expert kernel are also excluded because they
+failed a gate or lack real-model validation.
+
+\section{Evaluation}
+Table~\ref{tab:throughput} reports aggregate decode rates recovered from the
+source-development session trace.  $N=1$ is the optimized persistent self-MTP
+loop, not plain autoregressive decode.  Four-lane values are aggregate service
+throughput; approximate per-lane rates are 30.1 and 20.5 token/s.
+
+\begin{table}[h]
+\centering
+\caption{Source-prototype aggregate decode throughput (token/s).}
+\label{tab:throughput}
+\begin{tabular}{lrrrr}
+\toprule
+Model & $N=1$ & $N=2$ & $N=4$ & $N=4/N=1$ \\
+\midrule
+Flash-Next & 63.4 & 88.4 & 120.3 & 1.90$\times$ \\
+Qwen3.8-27B & 49.0 & 64.7 & 82.0 & 1.67$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For 27B, a separate trace gate measured plain decode at 26.9 token/s and
+single-lane self-MTP at 46.9 token/s (1.75$\times$), with 45 of 80 drafts
+accepted and token-exact output.  Flash fixed-membership hardware validation
+reported 9/9 bit-exact forced-cache comparisons and a 49-test suite.  The
+available Rapid-MLX single-lane MTP benchmark at fixed $k=1$ reported
+28.82--34.85 token/s across 92--32,732 prompt tokens and 76.41\% aggregate
+acceptance; it was measured on an earlier Rapid commit and is background, not
+a result for this port.
+
+The table comes from Claude session
+\texttt{1c3a4880-ce64-415d-9bb0-b06f7a29f73c}.  Flash-Next is preserved both
+in transcript stdout and in the local raw log
+\texttt{results/timing-batched-mtp.log} (SHA-256 prefix
+\texttt{dc54cab994ec}); 27B is preserved in transcript stdout only because its
+command piped through \texttt{grep}/\texttt{tail} without redirection.  A
+tracked recovery manifest records the commands, trace lines, UUIDs, hashes,
+and recovered rows.  Neither record is an artifact-complete benchmark package:
+the final battery lacks a repository-tracked original JSON/JSONL/CSV containing
+immutable revisions, per-sample timings, thermal/interleave order, digests,
+memory, and acceptance.  We therefore label Flash raw-log-attested and 27B
+transcript-attested, pending a machine-readable rerun.
+
+The Rapid staging effort did not run a model or inference benchmark.  One
+legacy CLI regression file accidentally constructed tiny
+\texttt{mlx.core} arrays during a broader test sweep, so this paper does not
+claim that Metal was never initialized; all subsequent checks were restricted
+to pure-Python, NumPy, AST, lint, and compilation.  Therefore the Rapid stack
+is not claimed merge-ready or performance-qualified.  Its later acceptance
+matrix must use
+immutable checkpoints, process isolation, interleaved thermal controls,
+prompt/seed manifests, per-lane and aggregate rates, acceptance, active and
+peak memory, cache equality, abort/EOS behavior, APC hits, and join/leave
+discriminators.
+
+\section{Excluded work}
+The staged series deliberately excludes the following paths:
+\begin{itemize}
+  \item Rapid-native incremental joins: the initial upstream stack ships fixed
+        cohorts; scheduler admission/turnover and Rapid-native real-BF16
+        dynamic-membership qualification remain follow-up work;
+  \item NVMe PLE offload, whose swap abort gate failed;
+  \item \texttt{moe\_shared\_in\_gather}, which diverged in logprobs and
+        output digest;
+  \item GDN q/k normalization fusion, which regressed decode;
+  \item the untracked fused-expert kernel, a default-off candidate without
+        real-model validation;
+  \item the old thread-crossing RNG wiring---per-lane keys remain owned by the
+        generation thread; and
+  \item quantized or windowed batched-MTP caches until their ragged rollback
+        contracts have independent tests.
+\end{itemize}
+
+\section{Limitations and open work}
+First, live scheduler token delivery is not wired in this Rapid staging tip:
+the opt-in reaches an APC-aware fixed-cohort planner, while Rapid's incumbent
+vendored single-lane MTP step remains authoritative.  The source implementation
+demonstrates the end-to-end coordinator, but the Rapid ownership boundary needs
+a dedicated follow-up PR and hardware acceptance.  Second, aggregate
+throughput trades against per-lane inter-token latency and must be evaluated
+under arrival processes, not only fixed cohorts.  Third, heterogeneous depth
+complicates shapes and is excluded from the first Rapid coordinator.  Fourth,
+quantized and windowed caches need independent rollback proofs.  Fifth, the
+source prototype's distributional Flash join pass does not qualify the unwired
+Rapid membership path; fixed membership is the safe Rapid boundary.  Finally,
+results on one unified-memory operating point do not establish portability
+across model sizes, quantization, context lengths, or Apple SoCs.
+
+\section{Conclusion}
+Continuous self-MTP batching treats speculative decode as an iteration-level
+transaction rather than a private per-request generator.  It composes the two
+available batching axes---tokens within a speculative block and requests
+within a service cohort---while preserving per-lane distribution, rollback,
+and cache ownership.  The source results show substantial aggregate-throughput
+headroom.  The staged Rapid integration deliberately separates proven
+fixed-membership mechanics from unported Rapid dynamic-membership and
+candidate-kernel work, so later hardware qualification can promote each
+capability without weakening the fail-closed boundary.
+
+\begin{thebibliography}{9}
+\bibitem{leviathan2023}
+Y. Leviathan, M. Kalman, and Y. Matias.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock \emph{ICML}, 2023. \url{https://arxiv.org/abs/2211.17192}.
+
+\bibitem{cai2024}
+T. Cai et al.
+\newblock Medusa: Simple LLM inference acceleration framework with multiple
+decoding heads.
+\newblock \emph{ICML}, 2024. \url{https://arxiv.org/abs/2401.10774}.
+
+\bibitem{deepseek2024}
+DeepSeek-AI et al.
+\newblock DeepSeek-V3 technical report.
+\newblock 2024. \url{https://arxiv.org/abs/2412.19437}.
+
+\bibitem{sun2024}
+Z. Sun et al.
+\newblock Block verification accelerates speculative decoding.
+\newblock 2024. \url{https://arxiv.org/abs/2403.10444}.
+
+\bibitem{yu2022}
+G.-I. Yu et al.
+\newblock Orca: A distributed serving system for transformer-based generative
+models.
+\newblock \emph{OSDI}, 2022.
+\url{https://www.usenix.org/conference/osdi22/presentation/yu}.
+\end{thebibliography}
+
+\end{document}
