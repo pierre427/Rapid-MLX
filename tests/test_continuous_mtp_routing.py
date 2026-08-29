@@ -355,3 +355,34 @@ def test_cli_and_scheduler_config_carry_the_default_off_opt_in_by_ast():
         in scheduler_source
     )
     assert "mtp_allow_dynamic_membership=getattr(" in cli_source
+    assert '"--self-mtp-max-lanes"' in cli_source
+    assert '"--self-mtp-lane-transient-gib"' in cli_source
+    assert "mtp_max_lanes: int = 16" in scheduler_source
+    assert "mtp_lane_transient_gib: float = 1.76" in scheduler_source
+
+
+def test_scheduler_config_validates_continuous_mtp_admission_controls():
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    config = SchedulerConfig(
+        spec_decode="mtp",
+        mtp_continuous_batching=True,
+        mtp_max_lanes=16,
+        mtp_lane_transient_gib=3.1,
+    )
+    assert config.mtp_max_lanes == 16
+    assert config.mtp_lane_transient_gib == 3.1
+
+    with pytest.raises(ValueError, match="mtp_max_lanes"):
+        SchedulerConfig(mtp_max_lanes=0)
+    with pytest.raises(ValueError, match="mtp_lane_transient_gib"):
+        SchedulerConfig(mtp_lane_transient_gib=0)
+    with pytest.raises(ValueError, match="mtp_lane_transient_gib"):
+        SchedulerConfig(mtp_lane_transient_gib=float("inf"))
+
+
+def test_live_router_charges_k2_transient_and_compute_cap_by_source():
+    scheduler_source = (ROOT / "vllm_mlx" / "scheduler.py").read_text(encoding="utf-8")
+    assert 'getattr(config, "mtp_max_lanes", 16)' in scheduler_source
+    assert 'getattr(config, "mtp_lane_transient_gib", 1.76)' in scheduler_source
+    assert "bytes_per_draft_token=int(" in scheduler_source

@@ -537,6 +537,17 @@ class SchedulerConfig:
     # opt-in because it changes the GDN verify-forward confirmed-boundary.
     mtp_speculation_rollback: bool = False
 
+    # APPEND-ONLY: continuous self-MTP has a compute-saturation ceiling that
+    # is independent of ordinary request capacity.  Dense Qwen3.8-27B peaks
+    # around N=16 even when free memory would admit materially more lanes.
+    mtp_max_lanes: int = 16
+
+    # APPEND-ONLY: total k=2 verify transient charged per admitted lane.  The
+    # default is the measured Flash-Next operating point; dense deployments
+    # can raise it (about 3.1 GiB for Qwen3.8-27B) without changing global KV
+    # or request-admission accounting.
+    mtp_lane_transient_gib: float = 1.76
+
     def __post_init__(self) -> None:
         if not isinstance(self.mtp_continuous_batching, bool):
             raise ValueError("mtp_continuous_batching must be a boolean")
@@ -544,6 +555,18 @@ class SchedulerConfig:
             raise ValueError("mtp_allow_dynamic_membership must be a boolean")
         if not isinstance(self.mtp_speculation_rollback, bool):
             raise ValueError("mtp_speculation_rollback must be a boolean")
+        if (
+            isinstance(self.mtp_max_lanes, bool)
+            or not isinstance(self.mtp_max_lanes, int)
+            or self.mtp_max_lanes < 1
+        ):
+            raise ValueError("mtp_max_lanes must be a positive integer")
+        if (
+            isinstance(self.mtp_lane_transient_gib, bool)
+            or not math.isfinite(float(self.mtp_lane_transient_gib))
+            or self.mtp_lane_transient_gib <= 0
+        ):
+            raise ValueError("mtp_lane_transient_gib must be positive")
         if self.mtp_continuous_batching and self.spec_decode != "mtp":
             raise ValueError("mtp_continuous_batching requires spec_decode='mtp'")
         if self.mtp_allow_dynamic_membership and not self.mtp_continuous_batching:
@@ -829,6 +852,7 @@ def _install_continuous_mtp_router(
     max_lanes = min(
         int(getattr(config, "max_num_seqs", 4)),
         int(getattr(config, "completion_batch_size", 32)),
+        int(getattr(config, "mtp_max_lanes", 16)),
     )
     if max_lanes < 2:
         logger.warning(
@@ -959,7 +983,13 @@ def _install_continuous_mtp_router(
             ),
             temperature=float(params.temperature),
             base_bytes=sum(int(getattr(cache, "nbytes", 0)) for cache in caches),
-            bytes_per_draft_token=0,
+            # ``mtp_lane_transient_gib`` is the complete k=2 verify
+            # transient, while the pure planner charges per draft token.
+            # Divide by two so K=2 reconstructs the configured envelope and
+            # K=1 naturally receives half of it.
+            bytes_per_draft_token=int(
+                float(getattr(config, "mtp_lane_transient_gib", 1.76)) * 1024**3 / 2
+            ),
             cache_ready=cache_ready,
             cache_quantized=cache_quantized,
             cache_windowed=cache_windowed,

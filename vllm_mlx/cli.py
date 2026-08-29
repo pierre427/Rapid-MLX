@@ -4219,6 +4219,8 @@ def serve_command(args):
             args, "mtp_allow_dynamic_membership", False
         ),
         mtp_speculation_rollback=getattr(args, "mtp_speculation_rollback", False),
+        mtp_max_lanes=getattr(args, "self_mtp_max_lanes", 16),
+        mtp_lane_transient_gib=getattr(args, "self_mtp_lane_transient_gib", 1.76),
         # SuffixDecoding
         enable_suffix_decoding=args.suffix_decoding,
         suffix_max_draft=args.suffix_max_draft,
@@ -10499,6 +10501,26 @@ Examples:
             "workload-specific flag for high prompt/output-overlap traffic "
             "and is available with "
             '\'{"method":"suffix","num_speculative_tokens":8}\'.'
+        ),
+    )
+    serve_parser.add_argument(
+        "--self-mtp-max-lanes",
+        type=positive_int,
+        default=16,
+        metavar="N",
+        help=(
+            "Compute-saturation ceiling for continuous self-MTP lanes "
+            "(default: 16). This is independent of --max-num-seqs."
+        ),
+    )
+    serve_parser.add_argument(
+        "--self-mtp-lane-transient-gib",
+        type=positive_finite_float,
+        default=1.76,
+        metavar="GIB",
+        help=(
+            "Total k=2 verify transient charged per continuous self-MTP lane "
+            "(default: 1.76 GiB; dense Qwen3.8-27B measures about 3.1 GiB)."
         ),
     )
     # Hidden deprecated aliases. They are intentionally absent from help;
