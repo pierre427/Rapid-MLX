@@ -121,8 +121,7 @@ def test_speculative_config_continuous_batching_is_explicit_and_mtp_only():
     assert enabled is not None and enabled.continuous_batching is True
 
     dynamic = parse_speculative_config(
-        '{"method":"mtp","continuous_batching":true,'
-        '"allow_dynamic_membership":true}'
+        '{"method":"mtp","continuous_batching":true,"allow_dynamic_membership":true}'
     )
     assert dynamic is not None and dynamic.allow_dynamic_membership is True
 
@@ -131,9 +130,7 @@ def test_speculative_config_continuous_batching_is_explicit_and_mtp_only():
     with pytest.raises(SpeculativeConfigError, match="must be a boolean"):
         parse_speculative_config('{"method":"mtp","allow_dynamic_membership":1}')
     with pytest.raises(SpeculativeConfigError, match="requires continuous_batching"):
-        parse_speculative_config(
-            '{"method":"mtp","allow_dynamic_membership":true}'
-        )
+        parse_speculative_config('{"method":"mtp","allow_dynamic_membership":true}')
     with pytest.raises(SpeculativeConfigError, match="unsupported speculative-config"):
         parse_speculative_config('{"method":"suffix","continuous_batching":true}')
 
@@ -331,8 +328,7 @@ def test_scheduler_wiring_diverts_next_and_refusal_precedes_mutation():
     create_generator = next(
         node
         for node in scheduler_node.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_create_batch_generator"
+        if isinstance(node, ast.FunctionDef) and node.name == "_create_batch_generator"
     )
     create_source = ast.get_source_segment(
         (ROOT / "vllm_mlx" / "scheduler.py").read_text(encoding="utf-8"),
@@ -358,4 +354,4 @@ def test_cli_and_scheduler_config_carry_the_default_off_opt_in_by_ast():
         'if self.mtp_continuous_batching and self.spec_decode != "mtp"'
         in scheduler_source
     )
-    assert 'mtp_allow_dynamic_membership=getattr(' in cli_source
+    assert "mtp_allow_dynamic_membership=getattr(" in cli_source

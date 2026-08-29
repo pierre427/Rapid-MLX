@@ -924,9 +924,7 @@ def _install_continuous_mtp_router(
         )
         request_id = None if uid_to_request_id is None else uid_to_request_id.get(uid)
         request = (
-            None
-            if requests is None or request_id is None
-            else requests.get(request_id)
+            None if requests is None or request_id is None else requests.get(request_id)
         )
         if request is None:
             return None
@@ -956,8 +954,7 @@ def _install_continuous_mtp_router(
             stop_tokens=frozenset(stop_tokens),
             sampling=SamplingContract(
                 greedy=greedy,
-                has_logits_processors=bool(processors)
-                or scheduler_owned_termination,
+                has_logits_processors=bool(processors) or scheduler_owned_termination,
                 uses_xtc=False,
             ),
             temperature=float(params.temperature),

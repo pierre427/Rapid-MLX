@@ -343,9 +343,7 @@ class ContinuousMTPGenerationBatch:
             raise ValueError("joining lane uid values must be unique")
         overlap = set(joining_uids).intersection(self._states)
         if overlap:
-            raise ValueError(
-                f"joining lanes reuse live uid values: {sorted(overlap)}"
-            )
+            raise ValueError(f"joining lanes reuse live uid values: {sorted(overlap)}")
         normalized_stops = _normalize_stop_tokens(joining_uids, stop_tokens)
 
         runtime = self._batch._runtime
@@ -455,9 +453,7 @@ class ContinuousMTPGenerationBatch:
             return self._detach_indices(indices, terminal=False)
         return self._detach_cohort()
 
-    def _deliver_initial(
-        self, pending: Sequence[int]
-    ) -> ContinuousMTPGenerationBurst:
+    def _deliver_initial(self, pending: Sequence[int]) -> ContinuousMTPGenerationBurst:
         emissions: list[ContinuousMTPLaneEmission] = []
         terminal_by_row = [False] * len(self._batch.lanes)
         row_of = {lane.uid: index for index, lane in enumerate(self._batch.lanes)}

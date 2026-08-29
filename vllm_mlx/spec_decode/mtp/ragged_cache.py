@@ -441,7 +441,9 @@ def _reject_unsupported_shape(cache: Any) -> None:
         )
 
 
-def _call_ragged_method(method: Any, values: list[int], *, verify_size: int, validate: bool):
+def _call_ragged_method(
+    method: Any, values: list[int], *, verify_size: int, validate: bool
+):
     """Call a cache's ragged preflight/trim, forwarding ``verify_size`` only if
     it is accepted.  mlx-lm's cache classes expose ``(n, *, validate)``; some
     Rapid/test caches also take a ``verify_size`` hint.  Introspecting keeps one

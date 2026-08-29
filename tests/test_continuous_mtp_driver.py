@@ -162,8 +162,7 @@ def _target(token):
 
 def _triples(responses):
     return [
-        (response.uid, response.token, response.finish_reason)
-        for response in responses
+        (response.uid, response.token, response.finish_reason) for response in responses
     ]
 
 
@@ -233,9 +232,7 @@ def test_terminal_detach_is_published_on_final_response_and_survivor_continues()
         [_spec(1), _spec(2)], runtime, stop_tokens={1: {112}}
     )
     batch_driver.next()
-    compute.queued_outputs.append(
-        [(_draft(111), _target(112)), (_target(211),)]
-    )
+    compute.queued_outputs.append([(_draft(111), _target(112)), (_target(211),)])
 
     first = batch_driver.next()
     assert _triples(first) == [(1, 111, None), (2, 211, None)]

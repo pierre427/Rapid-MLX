@@ -4218,9 +4218,7 @@ def serve_command(args):
         mtp_allow_dynamic_membership=getattr(
             args, "mtp_allow_dynamic_membership", False
         ),
-        mtp_speculation_rollback=getattr(
-            args, "mtp_speculation_rollback", False
-        ),
+        mtp_speculation_rollback=getattr(args, "mtp_speculation_rollback", False),
         # SuffixDecoding
         enable_suffix_decoding=args.suffix_decoding,
         suffix_max_draft=args.suffix_max_draft,

@@ -24,7 +24,6 @@ from .continuous_engine import (
 from .mlx_backend import RapidMLXSelfMTPBackend, RapidRaggedCacheAdapter
 from .ragged_cache import preflight_ragged_cache, trim_ragged_cache
 
-
 _SUPPORTED_FAMILIES = frozenset({"qwen3_5", "qwen4_exp"})
 
 

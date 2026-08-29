@@ -1734,6 +1734,7 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
     # Model BatchGenerator.extend retaining uid=7 and appending uid=8.
     orig_step_before = gb.orig_step_calls
     gb.uids = [7, 8]
+    gb.tokens.append([])
     gb._next_tokens = mx.array([staged, 800], dtype=mx.uint32)
     gb._next_logprobs = [mx.array([0.0]), mx.array([0.0])]
     result = gb._step()

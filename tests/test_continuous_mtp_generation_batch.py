@@ -299,7 +299,9 @@ def test_fixed_cohort_wrapper_refuses_incremental_join():
 def test_flash_join_refused_without_flash_attestation():
     # Dynamic + core attested, but a Flash architecture still needs its own
     # attestation; the wrapper reports non-dynamic and the engine fails closed.
-    runtime, _compute, _caches = _runtime(dynamic=True, flash=True, flash_attested=False)
+    runtime, _compute, _caches = _runtime(
+        dynamic=True, flash=True, flash_attested=False
+    )
     batch = generation.ContinuousMTPGenerationBatch.create([_spec(1)], runtime)
     assert batch.dynamic_membership is False
 

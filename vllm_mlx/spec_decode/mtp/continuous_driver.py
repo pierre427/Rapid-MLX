@@ -170,9 +170,7 @@ class ContinuousMTPDriver:
     def has_work(self) -> bool:
         """Whether another :meth:`next` call can produce or advance work."""
         return bool(
-            self.has_pending_responses
-            or self._pending_joins
-            or not self.closed
+            self.has_pending_responses or self._pending_joins or not self.closed
         )
 
     @property
@@ -381,10 +379,7 @@ class ContinuousMTPDriver:
         for pending in self._pending_joins:
             specs = tuple(spec for spec in pending.specs if spec.uid not in requested)
             if specs:
-                stops = {
-                    spec.uid: pending.stop_tokens[spec.uid]
-                    for spec in specs
-                }
+                stops = {spec.uid: pending.stop_tokens[spec.uid] for spec in specs}
                 retained_joins.append(_PendingJoin(specs, stops))
         self._pending_joins = retained_joins
 
@@ -441,9 +436,7 @@ class ContinuousMTPDriver:
         self._batch = ContinuousMTPGenerationBatch.resume(packages)
         return self.lane_uids
 
-    def _forget_recorded(
-        self, packages: Sequence[ContinuousMTPDetachPackage]
-    ) -> None:
+    def _forget_recorded(self, packages: Sequence[ContinuousMTPDetachPackage]) -> None:
         # Drop drained packages from the dedup set so it stays bounded and a
         # future package cannot be skipped because CPython reused a freed id.
         for package in packages:
@@ -466,9 +459,7 @@ class ContinuousMTPDriver:
     def _apply_pending_joins(self) -> tuple[int, ...]:
         if not self._pending_joins:
             return ()
-        specs = tuple(
-            spec for pending in self._pending_joins for spec in pending.specs
-        )
+        specs = tuple(spec for pending in self._pending_joins for spec in pending.specs)
         stops = {
             uid: values
             for pending in self._pending_joins
@@ -478,9 +469,7 @@ class ContinuousMTPDriver:
         self._pending_joins.clear()
         return attached
 
-    def _record_detaches(
-        self, packages: Sequence[ContinuousMTPDetachPackage]
-    ) -> None:
+    def _record_detaches(self, packages: Sequence[ContinuousMTPDetachPackage]) -> None:
         for package in packages:
             identity = id(package)
             if identity in self._recorded_package_ids:
