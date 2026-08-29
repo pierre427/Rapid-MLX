@@ -926,6 +926,16 @@ def _install_mtp_vendored(
             reason,
         )
 
+    def _stage_handoff_input(tok_int: int, lp_arr: Any) -> None:
+        """Publish an un-emitted, cache-safe target token for plain decode.
+
+        Baseline ``GenerationBatch._step`` returns its current
+        ``_next_tokens`` while forwarding it.  It must therefore receive a
+        not-yet-emitted token, never MTP's last-emitted shape placeholder.
+        """
+        gb._next_tokens = mx.array([int(tok_int)], dtype=mx.uint32)
+        gb._next_logprobs = [lp_arr]
+
     def _cleanup_uid(uid: int) -> None:
         # Codex round-G BLOCKING #1: DO NOT clear _disabled_uids here.
         # This helper runs on every fallthrough branch (B>1, non-greedy,
@@ -969,6 +979,45 @@ def _install_mtp_vendored(
         _initial_skip_logged.difference_update(
             key for key in _initial_skip_logged if key[0] == uid
         )
+
+    def _prepare_batch_expansion() -> bool:
+        """Prepare an exact B=1 -> B>1 handoff before scheduler admission."""
+        active_uids = [uid for uid in gb.uids if uid in _state]
+        if not active_uids:
+            return True
+        if len(active_uids) != 1 or len(gb.uids) != 1:
+            return False
+
+        uid = active_uids[0]
+        state = _state[uid]
+        if state.get("handoff_ready"):
+            return True
+        queue = state["queue"]
+        if queue:
+            # Accepted drafts are request-visible work and must drain at B=1.
+            return False
+
+        try:
+            tok_int, lp_arr, from_draft = next(state["gen"])
+        except Exception as e:  # noqa: BLE001
+            _stats["gen_raised"] += 1
+            req_id = uid_to_request_id.get(uid) if uid_to_request_id else None
+            _disabled_uids[uid] = req_id
+            _cleanup_uid(uid)
+            raise RuntimeError(
+                f"[MTP-vendored] uid={uid} could not prepare a state-exact "
+                "B=1 -> B>1 handoff"
+            ) from e
+
+        queue.append((int(tok_int), lp_arr, bool(from_draft)))
+        if from_draft:
+            return False
+
+        # Non-draft yields are not yet emitted and target cache is behind them:
+        # exactly the input/return invariant baseline _step requires.
+        state["handoff_ready"] = True
+        _stage_handoff_input(int(tok_int), lp_arr)
+        return True
 
     def _sampling_options_for_uid(uid: int) -> tuple[dict[str, Any] | None, str]:
         """Resolve the request-local MTP sampling contract, fail closed.
@@ -1181,17 +1230,50 @@ def _install_mtp_vendored(
         if not gb.uids or len(gb.uids) != 1:
             _stats["fallthrough_steps"] += 1
             _stats["ft_batch_size"] += 1
+            # Scheduler admission must stage a cache-safe, not-yet-emitted
+            # token before extending an active MTP batch.  Fail closed if a
+            # caller bypasses that barrier: the placeholder is the last
+            # emitted token and baseline _step would return it again.
             if _state:
                 terminal_uids = list(_state)
-                _stats["invariant_violations"] += 1
+                unprepared = [
+                    stale_uid
+                    for stale_uid in terminal_uids
+                    if not _state[stale_uid].get("handoff_ready")
+                ]
+                if unprepared:
+                    raise RuntimeError(
+                        "[MTP-vendored] batch expanded before exact MTP "
+                        "handoff preparation; refusing stale _next_tokens for "
+                        f"uid(s)={unprepared}"
+                    )
+
                 for stale_uid in terminal_uids:
+                    state = _state[stale_uid]
+                    queue = state["queue"]
+                    if not queue or queue[0][2]:
+                        raise RuntimeError(
+                            "[MTP-vendored] prepared handoff lost its "
+                            f"cache-safe token for uid={stale_uid}"
+                        )
+                    row = list(gb.uids).index(stale_uid)
+                    staged_tok = int(gb._next_tokens[row].item())
+                    if staged_tok != queue[0][0]:
+                        raise RuntimeError(
+                            "[MTP-vendored] BatchGenerator.extend replaced "
+                            f"the prepared token for uid={stale_uid}: "
+                            f"expected={queue[0][0]} actual={staged_tok}"
+                        )
+
+                _stats["ft_mid_stream_handoff"] += len(terminal_uids)
+                for stale_uid in terminal_uids:
+                    logger.info(
+                        "[MTP-vendored] uid=%s completed state-exact handoff "
+                        "as batch grew to size %d",
+                        stale_uid,
+                        len(gb.uids),
+                    )
                     _record_terminal_disable(stale_uid)
-                raise RuntimeError(
-                    "[MTP-vendored] single-request admission invariant violated: "
-                    f"batch grew to {len(gb.uids)} after MTP emitted for "
-                    f"uids={terminal_uids}. Failing closed because plain-decode "
-                    "handoff would corrupt the output stream."
-                )
             return _orig_step()
 
         uid = gb.uids[0]
@@ -1458,6 +1540,7 @@ def _install_mtp_vendored(
                 "primed": True,
                 "request_id": _first_call_req_id,
                 "sampling_fingerprint": sampling_options["fingerprint"],
+                "handoff_ready": False,
             }
             _stats["vendored_steps"] += 1
             # Codex round-I BLOCKING #2 / round-J BLOCKING #2+#3:
@@ -1481,8 +1564,8 @@ def _install_mtp_vendored(
         if not queue:
             gen = state["gen"]
             try:
-                tok_int, lp_arr, _from_draft = next(gen)
-                queue.append((int(tok_int), lp_arr))
+                tok_int, lp_arr, from_draft = next(gen)
+                queue.append((int(tok_int), lp_arr, bool(from_draft)))
             except StopIteration:
                 _stats["gen_exhausted"] += 1
                 # Codex round-G BLOCKING #2: preserve the terminal
@@ -1568,7 +1651,10 @@ def _install_mtp_vendored(
                     "output stream. Original exception logged above."
                 ) from e
 
-        tok_int, lp_arr = queue.pop(0)
+        tok_int, lp_arr, _from_draft = queue.pop(0)
+        # Admission may have prepared a safe token but then failed before
+        # extending the batch.  Publishing it here keeps the B=1 stream exact.
+        state["handoff_ready"] = False
         gb.tokens[0].append(tok_int)
         _stats["vendored_steps"] += 1
         # Codex round-I BLOCKING #2 / round-J BLOCKING #2+#3:
@@ -1650,6 +1736,7 @@ def _install_mtp_vendored(
     gb._mtp_vendored_state = _state
     gb._mtp_vendored_disabled_uids = _disabled_uids
     gb._mtp_vendored_terminal_uids = _terminal_uids
+    batch_gen._mtp_vendored_prepare_batch_expansion = _prepare_batch_expansion
 
     logger.info(
         "[MTP-vendored] installed on GenerationBatch._step "
@@ -6900,6 +6987,22 @@ class Scheduler:
 
             if self.batch_generator is None:
                 # Put back and try again later
+                self.waiting.appendleft(request)
+                break
+
+            # Before continuous batching extends a live B=1 MTP stream, stage
+            # a not-yet-emitted target token at the exact baseline cache
+            # boundary. Accepted drafts return False and drain at B=1 first.
+            prepare_mtp_expansion = getattr(
+                self.batch_generator,
+                "_mtp_vendored_prepare_batch_expansion",
+                None,
+            )
+            if (
+                self.running
+                and callable(prepare_mtp_expansion)
+                and not prepare_mtp_expansion()
+            ):
                 self.waiting.appendleft(request)
                 break
 
