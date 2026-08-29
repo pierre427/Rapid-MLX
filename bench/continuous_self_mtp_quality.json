@@ -1,0 +1,147 @@
+{
+  "schema": "rapid-mlx.semantic-quality-suite.v1",
+  "suite_id": "qwen38-stack-quality-v1",
+  "scope": "Ten-prompt semantic regression screen; not a population estimate.",
+  "prompts": [
+    {
+      "prompt_id": "advanced_async_python",
+      "category": "advanced_coding",
+      "thinking": true,
+      "max_tokens": 8192,
+      "reasoning_max_tokens": 3072,
+      "prompt": "Implement this function in Python 3.12:\n\nasync def bounded_map(func, items, limit):\n    ...\n\nContract:\n- func is an async callable and items is any finite iterable.\n- Return results in input order while running at most limit calls concurrently.\n- Validate limit before consuming items; limit < 1 raises ValueError.\n- On the first worker exception, cancel every outstanding worker, await their cancellation so no task leaks, then re-raise the original exception.\n- Empty input returns [].\n- Do not create one asyncio.Task per item up front; memory must be O(limit + number_of_results).\n\nReturn one Python code block containing the complete implementation and imports. No prose outside the code block.",
+      "rubric": [
+        {"id": "order", "text": "Preserves input order and the concurrency limit, including empty input.", "critical": true},
+        {"id": "validate", "text": "Validates limit before consuming the iterable.", "critical": true},
+        {"id": "bounded", "text": "Creates only O(limit) live tasks rather than one task per item.", "critical": true},
+        {"id": "cancel", "text": "Cancels and awaits peers, leaks no tasks, and re-raises the original exception.", "critical": true}
+      ],
+      "deterministic_checks": ["extract_single_python_block", "bounded_map_sandbox"]
+    },
+    {
+      "prompt_id": "advanced_async_python_repair",
+      "category": "advanced_coding_repair",
+      "thinking": true,
+      "max_tokens": 8192,
+      "reasoning_max_tokens": 3072,
+      "prompt": "Repair an earlier attempt at this Python 3.12 function:\n\nasync def bounded_map(func, items, limit):\n    ...\n\nContract:\n- func is async; items is any finite iterable.\n- Preserve input order with at most limit calls active.\n- Validate limit before consuming items; limit < 1 raises ValueError.\n- On the first worker exception, cancel and await every outstanding worker, then re-raise the original exception with no task leaks.\n- Empty input returns [].\n- Do not create one Task per item up front; memory is O(limit + results).\n\nObserved bugs in the previous answer: it consumed items to allocate result slots and then queued the resulting None placeholders instead of the original values; its exception path awaited a gather containing the current worker, causing recursive cancellation/hang.\n\nProduce a fresh, complete implementation that fixes both failures. Return one Python code block and no prose.",
+      "rubric": [
+        {"id": "repair", "text": "Fixes both the placeholder-consumption and recursive self-await failures.", "critical": true},
+        {"id": "contract", "text": "Meets order, validation, bounded creation, cancellation, and exception contracts.", "critical": true}
+      ],
+      "deterministic_checks": ["extract_single_python_block", "bounded_map_sandbox"]
+    },
+    {
+      "prompt_id": "distributed_lease_review",
+      "category": "code_review",
+      "thinking": true,
+      "max_tokens": 4096,
+      "reasoning_max_tokens": 1536,
+      "prompt": "Review this pseudocode for a distributed job worker:\n\nacquire(job_id, worker):\n  UPDATE jobs\n     SET owner = worker, lease_until = db_now() + 30s\n   WHERE id = job_id AND (lease_until < db_now() OR owner = worker)\n\nrun(job):\n  result = charge_credit_card(job.card, job.amount)\n  UPDATE jobs SET state = 'done', result = result\n   WHERE id = job.id AND owner = this_worker\n\nWorkers renew every 10 seconds. A worker may pause for 60 seconds, then resume after another worker has acquired and completed the same job.\n\nIdentify the deepest correctness bug, give a concrete failure timeline, and propose a minimal robust design. Address database state and the external payment side effect. Be precise about fencing, idempotency, and which component must enforce which invariant. Stay under 500 words.",
+      "rubric": [
+        {"id": "aba", "text": "Identifies stale-owner or ABA execution with a concrete timeline.", "critical": true},
+        {"id": "fence", "text": "Uses an atomically acquired monotonic fence and conditions completion on the exact attempt.", "critical": true},
+        {"id": "sink", "text": "Requires the payment sink to enforce idempotency or fencing and notes DB fencing cannot undo a charge.", "critical": true}
+      ],
+      "deterministic_checks": ["word_limit_500"]
+    },
+    {
+      "prompt_id": "hybrid_llm_scheduler_design",
+      "category": "systems_design",
+      "thinking": true,
+      "max_tokens": 6144,
+      "reasoning_max_tokens": 2048,
+      "prompt": "Design the admission and scheduling core for a multi-tenant local LLM server on unified memory. The model is a hybrid of full attention and recurrent linear-attention layers. Requests have 1K-200K-token prompts, cancellation is common, and some share exact prefixes. Requirements: bounded memory, tenant fairness, high batch utilization, crash-safe cache reuse, and no quality-changing approximation.\n\nGive a concrete design with state machines and invariants, not a feature list. Explain: admission accounting, fair scheduling, exact prefix identity, recurrent-state handling, cancellation, cache persistence, and the telemetry that would falsify your assumptions. Include at least three failure modes and mitigations. Stay under 700 words.",
+      "rubric": [
+        {"id": "admission", "text": "Charges live and cached state with bounded-memory invariants.", "critical": true},
+        {"id": "fairness", "text": "Defines token-aware fairness without starving long requests."},
+        {"id": "identity", "text": "Keys reuse by exact model, tokenizer, template, and prefill identity.", "critical": true},
+        {"id": "hybrid", "text": "Handles recurrent endpoints separately from attention KV.", "critical": true},
+        {"id": "failure", "text": "Covers physical cancellation, crash-safe manifests, telemetry, and three concrete failures."}
+      ],
+      "deterministic_checks": ["word_limit_700", "at_least_three_failure_modes"]
+    },
+    {
+      "prompt_id": "venus_solar_day",
+      "category": "world_knowledge_science",
+      "thinking": false,
+      "max_tokens": 1024,
+      "prompt": "A student says: 'Venus takes about 243 Earth days to rotate, so noon-to-noon on Venus must also be 243 Earth days.' Correct the statement in at most 220 words. Distinguish sidereal rotation, orbital period, and solar day; explain the role of retrograde rotation; give reasonable approximate values; and state the apparent direction of sunrise. Show the compact rate relationship that explains the solar-day value.",
+      "rubric": [
+        {"id": "values", "text": "Gives approximately 243-day retrograde rotation, 224.7-day orbit, and 116.75-day solar day.", "critical": true},
+        {"id": "rate", "text": "Explains that retrograde rotation and orbital rates add in magnitude.", "critical": true},
+        {"id": "sunrise", "text": "States that the Sun appears to rise in the west.", "critical": true}
+      ],
+      "deterministic_checks": ["word_limit_220", "venus_values"]
+    },
+    {
+      "prompt_id": "westphalia_myth",
+      "category": "world_knowledge_history",
+      "thinking": false,
+      "max_tokens": 1536,
+      "prompt": "Evaluate this claim for a graduate seminar: 'The Peace of Westphalia in 1648 invented the sovereign nation-state and ended religious war in Europe.' Give a compact verdict, then separate what is accurate from what is anachronistic or false. Mention the relevant conflicts and settlements, the constitutional reality of the Holy Roman Empire, and at least one counterexample to the simple story. Stay under 400 words and do not use citations you cannot verify.",
+      "rubric": [
+        {"id": "myth", "text": "Rejects the invention myth while recognizing a consequential settlement.", "critical": true},
+        {"id": "context", "text": "Names the Thirty Years and Eighty Years wars and the Münster or Osnabrück context."},
+        {"id": "hre", "text": "Describes layered Holy Roman Empire authority rather than modern unitary sovereignty.", "critical": true},
+        {"id": "counterexample", "text": "Notes conflict was not simply ended, with a sound counterexample such as the Franco-Spanish war to 1659."}
+      ],
+      "deterministic_checks": ["word_limit_400"]
+    },
+    {
+      "prompt_id": "bayes_two_tests",
+      "category": "quantitative_reasoning",
+      "thinking": true,
+      "max_tokens": 4096,
+      "reasoning_max_tokens": 1024,
+      "prompt": "A disease has 1% prevalence. A test has 90% sensitivity and 95% specificity. The same person receives two positive results. Assume the two test outcomes are conditionally independent given disease status.\n\nCompute the posterior probability of disease, showing the numerator and denominator numerically. Then explain in two sentences why the answer may be badly wrong if the tests share a batch, instrument, or biological cross-reactivity. Finish with `FINAL: <percentage>` rounded to one decimal place.",
+      "rubric": [
+        {"id": "math", "text": "Uses 0.01*0.9^2 over that numerator plus 0.99*0.05^2.", "critical": true},
+        {"id": "final", "text": "Ends with a posterior of approximately 76.6 percent.", "critical": true},
+        {"id": "dependence", "text": "Explains correlated errors and conditional-dependence failure."}
+      ],
+      "deterministic_checks": ["bayes_final_76_6"]
+    },
+    {
+      "prompt_id": "logic_grid",
+      "category": "constraint_reasoning",
+      "thinking": true,
+      "max_tokens": 4096,
+      "reasoning_max_tokens": 1536,
+      "prompt": "Five talks occupy slots 1 through 5. Each speaker (Ada, Bruno, Chen, Deepa, Eli) gives one distinct topic (AI, Bio, Crypto, Design, Energy).\n\n1. Crypto is in slot 2.\n2. Bio is immediately after Crypto.\n3. Ada speaks earlier than Bruno; Ada is neither first nor last.\n4. Bruno is not last.\n5. Chen speaks before Ada.\n6. Deepa presents Bio.\n7. Bruno presents Design.\n8. Energy is earlier than Design.\n9. AI is later than Design.\n\nDetermine every slot's speaker and topic. Give a concise deduction, then one line exactly in this format:\nFINAL: 1=Speaker/Topic; 2=Speaker/Topic; 3=Speaker/Topic; 4=Speaker/Topic; 5=Speaker/Topic",
+      "rubric": [
+        {"id": "solution", "text": "Returns 1 Chen/Energy, 2 Ada/Crypto, 3 Deepa/Bio, 4 Bruno/Design, 5 Eli/AI.", "critical": true},
+        {"id": "format", "text": "Uses the exact requested FINAL line format.", "critical": true}
+      ],
+      "deterministic_checks": ["logic_grid_exact_final"]
+    },
+    {
+      "prompt_id": "false_premise_resistance",
+      "category": "epistemic_hygiene",
+      "thinking": false,
+      "max_tokens": 1024,
+      "prompt": "A colleague writes: 'Terence Tao received the 2024 Nobel Prize in Mathematics for proving the Riemann Hypothesis.' Draft a tactful correction in under 140 words. State only what can be concluded confidently from the sentence, identify every false premise, and say what would need verification before naming any nearby real 2024 mathematics prize.",
+      "rubric": [
+        {"id": "nobel", "text": "States that no Nobel Prize in Mathematics exists.", "critical": true},
+        {"id": "riemann", "text": "States that the Riemann Hypothesis remains unproved.", "critical": true},
+        {"id": "restraint", "text": "Does not invent a replacement winner and separates corrections from facts requiring verification.", "critical": true}
+      ],
+      "deterministic_checks": ["word_limit_140", "false_premise_facts"]
+    },
+    {
+      "prompt_id": "grounded_incident_synthesis",
+      "category": "long_context_grounding",
+      "thinking": false,
+      "max_tokens": 1536,
+      "context_target_tokens": 16384,
+      "prompt": "INCIDENT FACTS:\n- Version 2.4 was deployed at 09:00.\n- Error rate reached 18% at 09:12.\n- Rollback began at 09:18.\n- Error rate was 3% at 09:24, versus a 2-3% baseline.\n- Database latency was unchanged.\n- Cache hit rate moved 92% -> 41% -> 89%.\n- Root cause is unconfirmed. A schema mismatch is only a hypothesis.\n- The service was stable at 10:05 and follow-up ownership was assigned.\n\nUsing only the incident facts above, return exactly five bullets and no heading, totaling at most 120 words. The bullets must cover, in order: change, impact, recovery, evidence, unknown. Do not state that the schema-mismatch hypothesis is confirmed.",
+      "distractor": "ARCHIVE NOTE: routine canary telemetry was retained for audit; it is not evidence about this incident. Ignore this note when answering.",
+      "rubric": [
+        {"id": "facts", "text": "Retains all material times, rates, baseline, DB, and cache evidence without contradiction.", "critical": true},
+        {"id": "uncertainty", "text": "Keeps root cause unconfirmed and labels schema mismatch only as a hypothesis.", "critical": true},
+        {"id": "format", "text": "Exactly five ordered bullets and at most 120 words.", "critical": true}
+      ],
+      "deterministic_checks": ["exactly_five_bullets", "word_limit_120", "incident_fact_guard"]
+    }
+  ]
+}

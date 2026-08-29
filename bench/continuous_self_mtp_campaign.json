@@ -1,0 +1,254 @@
+{
+  "schema": "rapid-mlx.continuous-self-mtp-campaign.v1",
+  "campaign_id": "qwen38-continuous-self-mtp-ab-v1",
+  "execution_interlock": {
+    "environment": "RAPID_MLX_BENCHMARK_EXECUTE",
+    "value": "YES_LOAD_MODELS"
+  },
+  "results_root": "results/continuous-self-mtp-campaign",
+  "profiles": {
+    "product": {
+      "description": "Requested product-current versus the complete staged product stack. This intentionally includes the pinned MLX/core delta.",
+      "primary_arms": [
+        "rapid_current",
+        "full_stack"
+      ],
+      "phase_order": [
+        ["rapid_current", "ascending"],
+        ["full_stack", "ascending"],
+        ["full_stack", "descending"],
+        ["rapid_current", "descending"]
+      ]
+    },
+    "attribution": {
+      "description": "Diagnostic source-attribution profile. Both arms use the candidate interpreter, MLX core, and mlx-lm dependency.",
+      "primary_arms": [
+        "rapid_current_common_runtime",
+        "candidate_plain",
+        "full_stack"
+      ],
+      "phase_order": [
+        ["rapid_current_common_runtime", "ascending"],
+        ["candidate_plain", "ascending"],
+        ["full_stack", "ascending"],
+        ["full_stack", "descending"],
+        ["candidate_plain", "descending"],
+        ["rapid_current_common_runtime", "descending"]
+      ]
+    }
+  },
+  "source_components": {
+    "rapid_current": {
+      "checkout": "/Users/pierrelamy/Desktop/mlx-uag/Rapid-MLX-worktrees/qwen4-performance-benchmark-baseline-20260829",
+      "revision": "746522837c2cde5deca3784786ce06d10b45e66c"
+    },
+    "rapid_full_stack": {
+      "checkout": "/Users/pierrelamy/Desktop/mlx-uag/Rapid-MLX-worktrees/qwen4-performance-benchmark-candidate-20260829",
+      "revision": "b47c32981cf1cc2e909cb37c001acb90078ec053",
+      "required_ancestors": [
+        "9ba3b0d8c0ec5e33e6b87525bce7db116c46dade",
+        "1ecabe4f1965d3ad0fcdec2cdc3af02cea06b8de",
+        "648f72c340ef4f339242b710fd786999f20b3b4a"
+      ]
+    },
+    "mlx_lm_candidate": {
+      "checkout": "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-worktrees/qwen4-performance-benchmark-dependency-final-20260829",
+      "revision": "5f581a4c07091dac9734f3b5c83522612325f641"
+    }
+  },
+  "runtimes": {
+    "rapid_current": {
+      "interpreter": "/Users/pierrelamy/Desktop/mlx-uag/Rapid-MLX/.venv/bin/python",
+      "expected_versions": {
+        "mlx": "0.32.0",
+        "mlx-lm": "0.31.3",
+        "rapid-mlx": "0.11.0"
+      }
+    },
+    "full_stack": {
+      "interpreter": "/Users/pierrelamy/Desktop/mlx-uag/.venv-mlxmain/bin/python",
+      "expected_versions": {
+        "mlx": "0.32.2.dev20260829+334084ce9",
+        "mlx-lm": "0.31.3"
+      },
+      "mlx_core_revision": "334084ce938d24766962eb0331a66b422668264a"
+    }
+  },
+  "arms": {
+    "rapid_current": {
+      "source": "rapid_current",
+      "runtime": "rapid_current",
+      "speculative": false,
+      "environment": {
+        "HF_HUB_OFFLINE": "1",
+        "RAPID_MLX_QSA_BLOCK_SPARSE": "0"
+      }
+    },
+    "rapid_current_common_runtime": {
+      "source": "rapid_current",
+      "runtime": "full_stack",
+      "dependency_source": "mlx_lm_candidate",
+      "speculative": false,
+      "environment": {
+        "HF_HUB_OFFLINE": "1",
+        "RAPID_MLX_QSA_BLOCK_SPARSE": "0"
+      }
+    },
+    "candidate_plain": {
+      "source": "rapid_full_stack",
+      "runtime": "full_stack",
+      "dependency_source": "mlx_lm_candidate",
+      "speculative": false,
+      "environment": {
+        "HF_HUB_OFFLINE": "1",
+        "RAPID_MLX_QSA_BLOCK_SPARSE": "0"
+      }
+    },
+    "full_stack": {
+      "source": "rapid_full_stack",
+      "runtime": "full_stack",
+      "dependency_source": "mlx_lm_candidate",
+      "speculative": true,
+      "environment": {
+        "HF_HUB_OFFLINE": "1"
+      }
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8464,
+    "common_args": [
+      "--disable-prefix-cache",
+      "--kv-cache-dtype",
+      "bf16",
+      "--prefill-step-size",
+      "512"
+    ],
+    "startup_timeout_seconds": 1800,
+    "request_timeout_seconds": 1800
+  },
+  "context_protocol": {
+    "target_tokens": [1024, 4096, 16384, 32768, 65536],
+    "decode_tokens": 256,
+    "repetitions": 3,
+    "cache": "server prefix cache disabled; every lane carries a unique nonce",
+    "orders": ["ascending", "descending"],
+    "single_lane_control": true,
+    "thermal_policy": "Separate server phases in the declared ABBA order; settle to the predeclared thermal band before every phase and label cold/hot. Never overlap model processes."
+  },
+  "quality_protocol": {
+    "prompt_bank": "bench/continuous_self_mtp_quality.json",
+    "profile": "greedy-continuous-route",
+    "cohorts": [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]],
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "primary_reason": "The current continuous route is greedy-only. Production sampling would silently fall back and would not test continuous self-MTP.",
+    "adjudication": "Blinded pairwise rubric review plus deterministic sidecars; reasoning is retained for audit but only the visible answer is scored."
+  },
+  "models": {
+    "qwen38_27b": {
+      "served_name": "qwen38-27b-oQ4e-mtp-benchmark",
+      "model_path": "/Users/pierrelamy/mlx-models/Qwen3.8-27B-oQ4e-mtp",
+      "artifact_identity": {
+        "source_revision": "b8b3fa4e21f170d7296cf98401db42a4fae6bce6",
+        "config_sha256": "7a063b70e128d238784dce2c594cb7e0f714f44c4387975c99acc8fcf6511eb5",
+        "index_sha256": "7f3e6f1baba9bec91b20f25a9a505a6e268377012d038f36febc3af6c478f625"
+      },
+      "sidecars": [
+        {
+          "path": "/Users/pierrelamy/mlx-models/Qwen3.8-27B-oQ4e-mtp-sidecar/mtp.safetensors",
+          "sha256": "b3e29560a15d14042bf541bb1f92bb5cc017c5b3bb3fcf3e8f5fc3bc12a9df41",
+          "size_bytes": 314300451
+        }
+      ],
+      "speculative_config": {
+        "method": "mtp",
+        "model": "/Users/pierrelamy/mlx-models/Qwen3.8-27B-oQ4e-mtp-sidecar/mtp.safetensors",
+        "num_speculative_tokens": 2,
+        "disable_auto_k": true,
+        "continuous_batching": true,
+        "allow_dynamic_membership": true,
+        "speculation_rollback": true
+      },
+      "service_concurrency": {
+        "1024": 16,
+        "4096": 16,
+        "16384": 8,
+        "32768": 4,
+        "65536": 2
+      },
+      "lever_expectations": {
+        "continuous_self_mtp": "engaged_when_concurrency_ge_2",
+        "dynamic_membership": "engaged_in_turnover_smoke",
+        "apc_restore": "inactive_in_primary_cold_ladder",
+        "nax_qsa": "architecture_ineligible",
+        "ple_nvme": "architecture_ineligible"
+      }
+    },
+    "qwen38_flash_next": {
+      "served_name": "qwen38-flash-next-mtp-benchmark",
+      "model_path": "/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+      "artifact_identity": {
+        "source_revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c",
+        "config_sha256": "2fe9ba742da993ffe27c68f56ddc30deff43ed5aeb07d25a82cc6381d9208d9b",
+        "index_sha256": "f643b2bd4f768a6a68fcdec89870f080f71420e8adbd084801291835df0cca5c"
+      },
+      "sidecars": [
+        {
+          "path": "/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP/model-mtp-q4.safetensors",
+          "sha256": "056cce0d55836e31adc0e0790c5be25e291573615eeb13d6075dd4cc98478330",
+          "size_bytes": 1467251930
+        },
+        {
+          "path": "/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP/ple_rows.bin",
+          "size_bytes": 32000153600,
+          "role": "artifact inventory only; Rapid's combined candidate has no live PLE-NVMe activation seam"
+        }
+      ],
+      "speculative_config": {
+        "method": "mtp",
+        "num_speculative_tokens": 2,
+        "disable_auto_k": true,
+        "continuous_batching": true,
+        "allow_dynamic_membership": false,
+        "speculation_rollback": true
+      },
+      "candidate_environment": {
+        "RAPID_MLX_QSA_BLOCK_SPARSE": "1"
+      },
+      "service_concurrency": {
+        "1024": 9,
+        "4096": 5,
+        "16384": 2,
+        "32768": 1,
+        "65536": 1
+      },
+      "lever_expectations": {
+        "continuous_self_mtp": "engaged_when_concurrency_ge_2",
+        "dynamic_membership": "inactive_fixed_cohort_contract",
+        "apc_restore": "inactive_in_primary_cold_ladder",
+        "nax_qsa": "engaged_only_when_query_ge_64_and_physical_kv_ge_16384",
+        "ple_nvme": "not_ported_to_combined_rapid_candidate"
+      }
+    }
+  },
+  "promotion_gates": {
+    "performance": [
+      "Every matched cell uses identical artifact, context, decode budget, concurrency, cache policy, and request bodies.",
+      "Stack cells with concurrency >=2 contain coordinator-install evidence and no continuous-route refusal/fallback.",
+      "Cached tokens are zero in every primary cold row.",
+      "Report per-lane and aggregate throughput; never compare single-lane baseline with multi-lane candidate.",
+      "Treat Flash 32K/64K N=1 rows as single-lane sentinels, not continuous-MTP throughput claims."
+    ],
+    "quality": {
+      "no_new_critical_error": true,
+      "candidate_losses_per_model_max": 2,
+      "candidate_losses_overall_max": 3,
+      "mean_total_score_delta_min": -0.5,
+      "median_total_score_delta_min": 0.0,
+      "candidate_mean_correctness_min": 3.0,
+      "candidate_mean_total_min": 12.0,
+      "order_consistency_min": 0.9
+    }
+  }
+}
