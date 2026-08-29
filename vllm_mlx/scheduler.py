@@ -521,7 +521,15 @@ class SchedulerConfig:
     # can retain the safe MLLM default without taking control from operators.
     vision_prefill_token_budget: int | None = None
 
+    # Default-off PR 9 planning seam. This does not replace GenerationBatch
+    # token delivery; the vendored single-request MTP path remains live.
+    mtp_continuous_batching: bool = False
+
     def __post_init__(self) -> None:
+        if not isinstance(self.mtp_continuous_batching, bool):
+            raise ValueError("mtp_continuous_batching must be a boolean")
+        if self.mtp_continuous_batching and self.spec_decode != "mtp":
+            raise ValueError("mtp_continuous_batching requires spec_decode='mtp'")
         if (
             self.vision_prefill_token_budget is not None
             and self.vision_prefill_token_budget <= 0
@@ -735,6 +743,48 @@ def _mtp_controller_key(model_name: str | None, sidecar: str | None) -> str | No
     if not sidecar:
         return f"{len(model_name)}:{model_name}"
     return f"{len(model_name)}:{model_name}+mtp:{sidecar}"
+
+
+def _install_continuous_mtp_router(
+    batch_gen: "BatchGenerator",
+    model: Any,
+    config: SchedulerConfig,
+) -> bool:
+    """Attach the PR 9 planning seam after static admission succeeds.
+
+    The router is metadata-only. It does not replace ``GenerationBatch._step``
+    and therefore cannot claim live continuous-MTP token delivery. A refusal
+    returns before mutating ``batch_gen``; the caller retains legacy MTP/plain
+    behavior.
+    """
+    from .spec_decode.mtp.continuous_routing import plan_router_install
+
+    cache_quantized = bool(
+        getattr(config, "kv_cache_quantization", False)
+        or getattr(config, "kv_cache_turboquant", False)
+        or getattr(config, "kv_cache_dtype", "bf16") != "bf16"
+    )
+    decision = plan_router_install(
+        model,
+        enabled=getattr(config, "mtp_continuous_batching", False),
+        cache_quantized=cache_quantized,
+        cache_windowed=bool(getattr(config, "use_paged_cache", False)),
+        max_lanes=max(2, int(getattr(config, "max_num_seqs", 4))),
+    )
+    if not decision.admitted or decision.router is None:
+        logger.warning(
+            "[MTP-continuous] planning router refused; retaining %s: %s",
+            decision.fallback.value,
+            "; ".join(decision.reasons),
+        )
+        return False
+    batch_gen._continuous_mtp_router = decision.router
+    logger.warning(
+        "[MTP-continuous] fixed-cohort planner installed; live token delivery "
+        "is not wired in PR 9, so the vendored legacy MTP/plain data plane "
+        "remains authoritative."
+    )
+    return True
 
 
 def _install_mtp_vendored(
@@ -3965,6 +4015,11 @@ class Scheduler:
                     mtp_model_type,
                 )
             else:
+                if getattr(self.config, "mtp_continuous_batching", False):
+                    _install_continuous_mtp_router(bg, self.model, self.config)
+                # The continuous-router commit installs only its planner. The
+                # vendored generator remains the live data plane until the
+                # later scheduler commit wires continuous token delivery.
                 mtp_installed = _install_mtp_vendored(
                     bg,
                     model=self.model,
