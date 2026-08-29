@@ -278,6 +278,7 @@ def plan_router_install(
     cache_quantized: bool = False,
     cache_windowed: bool = False,
     max_lanes: int = 4,
+    min_batch_lanes: int = 2,
     hard_reserve_bytes: int = 8 * 1024**3,
     allow_dynamic_membership: bool = False,
 ) -> ContinuousMTPRouterInstallDecision:
@@ -339,6 +340,7 @@ def plan_router_install(
         config=BatchedMTPConfig(
             enabled=enabled,
             max_lanes=max_lanes,
+            min_batch_lanes=min_batch_lanes,
             hard_reserve_bytes=hard_reserve_bytes,
             allow_dynamic_membership=allow_dynamic_membership,
         ),

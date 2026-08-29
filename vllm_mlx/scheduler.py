@@ -854,10 +854,10 @@ def _install_continuous_mtp_router(
         int(getattr(config, "completion_batch_size", 32)),
         int(getattr(config, "mtp_max_lanes", 16)),
     )
-    if max_lanes < 2:
+    if max_lanes < 1:
         logger.warning(
-            "[MTP-continuous] completion capacity is below the two-lane "
-            "minimum; retaining vendored MTP/plain decode"
+            "[MTP-continuous] completion capacity has no lanes; retaining "
+            "vendored MTP/plain decode"
         )
         return False
     decision = plan_router_install(
@@ -866,6 +866,12 @@ def _install_continuous_mtp_router(
         cache_quantized=cache_quantized,
         cache_windowed=bool(getattr(config, "use_paged_cache", False)),
         max_lanes=max_lanes,
+        # The generic planner remains batch-first (default minimum two).  An
+        # operator who explicitly enables the continuous integration is also
+        # asking for its batched execution contract at serial N=1, so this
+        # reached path admits batched-B1 instead of falling through to the
+        # legacy single-request generator.
+        min_batch_lanes=1,
         allow_dynamic_membership=bool(
             getattr(config, "mtp_allow_dynamic_membership", False)
         ),
@@ -1035,6 +1041,12 @@ def _install_continuous_mtp_router(
             response_factory=_response_factory,
         )
         batch_gen._continuous_mtp_driver = driver
+        logger.info(
+            "[MTP-continuous] admitted continuous cohort "
+            "route=continuous_planned lanes=%d draft_depth=%d",
+            len(specs),
+            int(routed.admission.draft_tokens) if routed.admission else 0,
+        )
 
     def _stage_joins() -> None:
         if driver is None or not driver.dynamic_membership:

@@ -54,6 +54,13 @@ def test_feature_is_default_off_and_capabilities_fail_closed():
     assert "missing capability: target_batch_forward" in gate.reasons
 
 
+def test_explicit_b1_policy_is_valid_without_changing_batch_first_default():
+    assert BatchedMTPConfig().min_batch_lanes == 2
+    assert BatchedMTPConfig(min_batch_lanes=1).min_batch_lanes == 1
+    with pytest.raises(ValueError, match="min_batch_lanes must be positive"):
+        BatchedMTPConfig(min_batch_lanes=0)
+
+
 def test_truthy_non_boolean_capability_does_not_open_gate():
     caps = replace(_capabilities(), target_batch_forward="yes")
     gate = assess_lane(LaneAdmission("a"), config=_config(), capabilities=caps)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import logging
+from collections import deque
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -194,6 +196,152 @@ def test_supported_requests_build_an_immutable_fixed_cohort_plan():
     assert [lane.spec.uid for lane in decision.cohort] == [1, 2]
     assert [lane.spec.num_draft for lane in decision.cohort] == [2, 2]
     assert all(lane.prepared_state is None for lane in decision.cohort)
+
+
+def test_b1_is_explicit_to_continuous_integration_and_default_stays_batch_first():
+    default_router = _router()
+    default = default_router.plan([_request("a", 1)], free_bytes=1)
+    assert default.route is ContinuousMTPIntegrationRoute.LEGACY_MTP
+
+    b1_router = _router(max_lanes=1, min_batch_lanes=1)
+    b1 = b1_router.plan([_request("a", 1)], free_bytes=1)
+    assert b1.route is ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED
+    assert [lane.spec.uid for lane in b1.cohort] == [1]
+    assert b1.admission is not None
+    assert b1.admission.batched_lane_ids == ("a",)
+
+    refused = b1_router.plan(
+        [_request("bad", 2, cache_ready=False)],
+        free_bytes=1,
+    )
+    assert refused.route is ContinuousMTPIntegrationRoute.LEGACY_MTP
+    assert refused.cohort == ()
+    assert refused.legacy_lane_ids == ("bad",)
+    assert "cache is not ready" in " ".join(refused.reasons)
+
+
+def test_live_integration_executes_b1_continuous_driver(monkeypatch, caplog):
+    import vllm_mlx.scheduler as scheduler
+    from vllm_mlx.spec_decode.mtp import continuous_driver, continuous_runtime
+
+    created = []
+
+    class _Driver:
+        has_work = True
+        closed = False
+        has_pending_responses = False
+        dynamic_membership = False
+        lane_uids = (1,)
+        pending_join_uids = ()
+
+        def __init__(self):
+            self.next_calls = 0
+
+        def next(self):
+            self.next_calls += 1
+            return ["continuous-b1"]
+
+        def take_terminal_detaches(self):
+            return ()
+
+        def resume_turnover(self):
+            raise AssertionError("B1 driver unexpectedly entered turnover")
+
+        def discard_all(self):
+            return ()
+
+        def remove_uids(self, _uids):
+            return ()
+
+    driver = _Driver()
+
+    def _create(specs, runtime, **kwargs):
+        created.append((tuple(specs), runtime, kwargs))
+        return driver
+
+    monkeypatch.setattr(
+        continuous_driver.ContinuousMTPDriver,
+        "create",
+        staticmethod(_create),
+    )
+    runtime = object()
+    monkeypatch.setattr(
+        continuous_runtime,
+        "assemble_continuous_self_mtp_runtime",
+        lambda *_args, **_kwargs: runtime,
+    )
+
+    class _Response:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _GenerationBatch:
+        Response = _Response
+
+    class _Cache:
+        nbytes = 0
+        offset = 0
+
+    class _BatchGenerator:
+        def __init__(self):
+            self._generation_batch = _GenerationBatch()
+            self._unprocessed_sequences = deque(
+                [(1, ((11, 12),), 8, [_Cache()], [], None, [], None)]
+            )
+            self.fallback_calls = 0
+
+        def next(self):
+            self.fallback_calls += 1
+            return [], []
+
+        def close(self):
+            return None
+
+        def remove(self, _uids, *args, **kwargs):
+            del args, kwargs
+            return {}
+
+    batch_gen = _BatchGenerator()
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(temperature=0.0, stop=None),
+        has_tools=False,
+    )
+    config = SimpleNamespace(
+        kv_cache_quantization=False,
+        kv_cache_turboquant=False,
+        kv_cache_dtype="bf16",
+        max_num_seqs=1,
+        completion_batch_size=1,
+        mtp_max_lanes=1,
+        mtp_continuous_batching=True,
+        use_paged_cache=False,
+        mtp_allow_dynamic_membership=False,
+        mtp_speculation_rollback=True,
+        mtp_lane_transient_gib=1.76,
+    )
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.scheduler"):
+        installed = scheduler._install_continuous_mtp_router(
+            batch_gen,
+            _Model(),
+            config,
+            requests={"req-1": request},
+            uid_to_request_id={1: "req-1"},
+            free_bytes_getter=lambda: 64 * 1024**3,
+        )
+        assert installed is True
+        assert batch_gen.next() == ([], [])
+        assert batch_gen.next() == ([], ["continuous-b1"])
+
+    assert len(created) == 1
+    assert [spec.uid for spec in created[0][0]] == [1]
+    assert created[0][1] is runtime
+    assert driver.next_calls == 1
+    assert not batch_gen._unprocessed_sequences
+    assert (
+        "[MTP-continuous] admitted continuous cohort "
+        "route=continuous_planned lanes=1 draft_depth=2"
+    ) in caplog.text
 
 
 def test_exact_apc_sidecar_is_validated_and_carried_as_a_resume_plan():

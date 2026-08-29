@@ -94,8 +94,8 @@ class BatchedMTPConfig:
             self.min_batch_lanes, int
         ):
             raise ValueError("min_batch_lanes must be an integer")
-        if self.min_batch_lanes < 2:
-            raise ValueError("min_batch_lanes must be at least 2")
+        if self.min_batch_lanes < 1:
+            raise ValueError("min_batch_lanes must be positive")
         if self.min_batch_lanes > self.max_lanes:
             raise ValueError("min_batch_lanes cannot exceed max_lanes")
         if self.hard_reserve_bytes < 0:
