@@ -16,6 +16,7 @@ from vllm_mlx.spec_decode.mtp.continuous_telemetry import (
     ContinuousMTPCounters,
     DigestClassification,
     EvidenceKind,
+    FailurePhase,
     FinishReason,
     LaneQualification,
     QualificationIdentity,
@@ -23,6 +24,8 @@ from vllm_mlx.spec_decode.mtp.continuous_telemetry import (
     TransactionTicket,
     evaluate_cohort_qualification,
     evaluate_qualification_suite,
+    get_global_continuous_counter,
+    reset_global_continuous_counter_for_tests,
 )
 
 
@@ -99,6 +102,8 @@ def test_metric_dimensions_are_fixed_enums_without_identity_labels() -> None:
         "transaction_outcome",
         "commit_kind",
         "abort_reason",
+        "rollback_phase",
+        "failure_phase",
     }
     flattened = {
         value for dimension in BOUNDED_METRIC_DIMENSIONS.values() for value in dimension
@@ -232,6 +237,70 @@ def test_failed_transaction_is_distinct_from_benign_abort() -> None:
     snapshot = counters.snapshot()
     assert dict(snapshot.transactions)["failed"] == 1
     assert dict(snapshot.transactions)["aborted"] == 0
+
+
+def test_production_cycle_reconciles_tokens_rollbacks_timings_and_ratio() -> None:
+    counters = ContinuousMTPCounters()
+
+    counters.record_cycle(
+        proposed_draft_tokens=8,
+        accepted_draft_tokens=5,
+        committed_tokens=9,
+        verify_rollbacks=1,
+        delivery_rollbacks=1,
+        draft_seconds=0.125,
+        target_verify_seconds=0.25,
+        kind=CommitKind.TERMINAL_PARTIAL,
+    )
+    counters.record_failure(FailurePhase.COMMIT)
+
+    snapshot = counters.snapshot()
+    assert dict(snapshot.transactions) == {
+        "proposed": 1,
+        "committed": 1,
+        "aborted": 0,
+        "failed": 1,
+    }
+    assert dict(snapshot.rollbacks) == {"verify": 1, "delivery": 1}
+    assert dict(snapshot.failures) == {"proposal": 0, "commit": 1}
+    assert snapshot.proposed_draft_tokens == 8
+    assert snapshot.accepted_draft_tokens == 5
+    assert snapshot.committed_tokens == 9
+    assert snapshot.accept_ratio == pytest.approx(0.625)
+    assert snapshot.draft_seconds == pytest.approx(0.125)
+    assert snapshot.target_verify_seconds == pytest.approx(0.25)
+
+
+def test_continuous_metrics_render_separately_from_legacy_mtp_counters() -> None:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from vllm_mlx.routes.metrics import _render_continuous_mtp_counters
+
+    reset_global_continuous_counter_for_tests()
+    try:
+        get_global_continuous_counter().record_cycle(
+            proposed_draft_tokens=4,
+            accepted_draft_tokens=3,
+            committed_tokens=5,
+            verify_rollbacks=1,
+            delivery_rollbacks=0,
+            draft_seconds=0.01,
+            target_verify_seconds=0.02,
+        )
+        body = "\n".join(_render_continuous_mtp_counters()) + "\n"
+
+        assert "rapid_mlx_continuous_mtp_proposals_total 1" in body
+        assert "rapid_mlx_continuous_mtp_draft_tokens_proposed_total 4" in body
+        assert "rapid_mlx_continuous_mtp_draft_tokens_accepted_total 3" in body
+        assert "rapid_mlx_continuous_mtp_accept_ratio 0.75" in body
+        assert "rapid_mlx_continuous_mtp_output_tokens_committed_total 5" in body
+        assert 'rapid_mlx_continuous_mtp_rollbacks_total{phase="verify"} 1' in body
+        assert "rapid_mlx_continuous_mtp_draft_seconds_total 0.01" in body
+        assert "rapid_mlx_continuous_mtp_target_verify_seconds_total 0.02" in body
+        assert "rapid_mlx_spec_decode_attempts_total" not in body
+        assert list(text_string_to_metric_families(body))
+    finally:
+        reset_global_continuous_counter_for_tests()
 
 
 @pytest.mark.parametrize(

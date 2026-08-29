@@ -48,6 +48,7 @@ from .continuous_engine import (
     propose_batched_self_mtp,
     supports_dynamic_membership,
 )
+from .continuous_telemetry import CommitKind, FailurePhase
 
 
 class ContinuousMTPGenerationBatchError(ContinuousSelfMTPError):
@@ -374,7 +375,20 @@ class ContinuousMTPGenerationBatch:
         if pending:
             return self._deliver_initial(pending)
 
-        proposal = propose_batched_self_mtp(self._batch)
+        telemetry = self._batch._runtime.telemetry
+        try:
+            proposal = propose_batched_self_mtp(self._batch)
+        except Exception:
+            if telemetry is not None:
+                telemetry.record_failure(FailurePhase.PROPOSAL)
+            raise
+        if telemetry is not None:
+            telemetry.record_proposal(
+                proposed_draft_tokens=sum(proposal.draft_depths),
+                verify_rollbacks=1,
+                draft_seconds=proposal.draft_seconds,
+                target_verify_seconds=proposal.target_verify_seconds,
+            )
         planned: list[tuple[int, tuple[MTPToken, ...], str | None]] = []
         emitted_counts: list[int] = []
         terminal: list[bool] = []
@@ -385,12 +399,35 @@ class ContinuousMTPGenerationBatch:
             emitted_counts.append(len(delivered))
             terminal.append(finish_reason is not None)
 
-        commit_batched_self_mtp(
-            self._batch,
-            proposal,
-            emitted_counts=emitted_counts,
-            terminal=terminal,
-        )
+        try:
+            commit_batched_self_mtp(
+                self._batch,
+                proposal,
+                emitted_counts=emitted_counts,
+                terminal=terminal,
+            )
+        except Exception:
+            if telemetry is not None:
+                telemetry.record_failure(FailurePhase.COMMIT)
+            raise
+        if telemetry is not None:
+            accepted_verified = sum(proposal.accepted_lengths)
+            delivery_rollback = any(
+                is_terminal and count <= accepted
+                for count, is_terminal, accepted in zip(
+                    emitted_counts,
+                    terminal,
+                    proposal.accepted_lengths,
+                )
+            )
+            telemetry.record_commit(
+                accepted_draft_tokens=accepted_verified,
+                committed_tokens=sum(emitted_counts),
+                delivery_rollbacks=int(delivery_rollback),
+                kind=(
+                    CommitKind.TERMINAL_PARTIAL if any(terminal) else CommitKind.FULL
+                ),
+            )
         emissions: list[ContinuousMTPLaneEmission] = []
         for uid, delivered, finish_reason in planned:
             state = self._states[uid]

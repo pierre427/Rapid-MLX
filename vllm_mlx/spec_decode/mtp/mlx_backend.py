@@ -9,6 +9,7 @@ No scheduler or model class knowledge lives here: target and MTP forwards use
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -504,6 +505,7 @@ class RapidMLXSelfMTPBackend:
             )
 
         second_lengths = [1 if depth > 1 else 0 for depth in depths]
+        draft_started = time.perf_counter()
         shared_qsa = (
             _begin_qsa_share_cycle(draft_cache)
             if self.share_qsa_indices and any(second_lengths)
@@ -568,6 +570,7 @@ class RapidMLXSelfMTPBackend:
                     draft_logprobs[row].append(logprobs)
         finally:
             _end_qsa_share_cycle(shared_qsa)
+        draft_seconds = time.perf_counter() - draft_started
 
         verify_width = max(depth + 1 for depth in depths)
         verify_rows = [
@@ -576,6 +579,7 @@ class RapidMLXSelfMTPBackend:
         ]
         verify_ids = self.ops.uint32(verify_rows)
         verify_lengths = [depth + 1 for depth in depths]
+        target_verify_started = time.perf_counter()
         _prepare_group(target, verify_lengths)
         try:
             target_logits, target_hidden = self._forward_pair(
@@ -650,6 +654,7 @@ class RapidMLXSelfMTPBackend:
                 )
             )
             hidden_rows.append(target_hidden[row : row + 1, :valid])
+        target_verify_seconds = time.perf_counter() - target_verify_started
 
         accepted_tuple = tuple(accepted)
         return CycleComputation(
@@ -668,6 +673,8 @@ class RapidMLXSelfMTPBackend:
                 verify_hidden=tuple(hidden_rows),
                 bonuses=tuple(bonuses),
             ),
+            draft_seconds=draft_seconds,
+            target_verify_seconds=target_verify_seconds,
         )
 
     def commit(

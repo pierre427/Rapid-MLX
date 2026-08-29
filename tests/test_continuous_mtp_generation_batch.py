@@ -28,6 +28,7 @@ def _load(name):
 
 
 engine = _load("continuous_engine")
+telemetry_module = _load("continuous_telemetry")
 generation = _load("continuous_batch")
 
 
@@ -113,7 +114,7 @@ class _Caches:
         return remaining, detached
 
 
-def _runtime(*, dynamic=False, flash=False, flash_attested=None):
+def _runtime(*, dynamic=False, flash=False, flash_attested=None, telemetry=None):
     """Build a fake runtime.
 
     ``dynamic`` attests incremental membership (``allow_dynamic_membership`` and
@@ -147,6 +148,7 @@ def _runtime(*, dynamic=False, flash=False, flash_attested=None):
         ),
         compute=compute,
         caches=caches,
+        telemetry=telemetry,
     )
     return runtime, compute, caches
 
@@ -215,6 +217,51 @@ def test_one_proposal_burst_commits_exact_stop_prefix_then_extracts_caches():
     assert companion.terminal is False
 
 
+def test_committed_proposal_publishes_reconciled_continuous_metrics() -> None:
+    counters = telemetry_module.ContinuousMTPCounters()
+    runtime, compute, _caches = _runtime(telemetry=counters)
+    compute.queued_outputs.append([(_draft(111), _target(112)), (_target(212),)])
+    batch = generation.ContinuousMTPGenerationBatch.create(
+        [_spec(1), _spec(2)], runtime, stop_tokens={1: {111}}
+    )
+    batch.next_burst()
+
+    batch.next_burst()
+
+    snapshot = counters.snapshot()
+    assert dict(snapshot.transactions) == {
+        "proposed": 1,
+        "committed": 1,
+        "aborted": 0,
+        "failed": 0,
+    }
+    assert snapshot.proposed_draft_tokens == 1
+    assert snapshot.accepted_draft_tokens == 1
+    assert snapshot.committed_tokens == 2
+    assert snapshot.accept_ratio == 1.0
+    assert dict(snapshot.rollbacks) == {"verify": 1, "delivery": 1}
+    assert dict(snapshot.failures) == {"proposal": 0, "commit": 0}
+
+
+def test_acceptance_metric_counts_verified_drafts_clipped_by_terminal_stop() -> None:
+    counters = telemetry_module.ContinuousMTPCounters()
+    runtime, compute, _caches = _runtime(telemetry=counters)
+    compute.queued_outputs.append([(_draft(111), _draft(112), _target(113))])
+    batch = generation.ContinuousMTPGenerationBatch.create(
+        [_spec(1)], runtime, stop_tokens={1: {111}}
+    )
+    batch.next_burst()
+
+    batch.next_burst()
+
+    snapshot = counters.snapshot()
+    assert snapshot.proposed_draft_tokens == 2
+    assert snapshot.accepted_draft_tokens == 2
+    assert snapshot.accept_ratio == 1.0
+    assert snapshot.committed_tokens == 1
+    assert dict(snapshot.rollbacks) == {"verify": 1, "delivery": 1}
+
+
 def test_max_token_boundary_marks_the_full_final_proposal_as_length():
     runtime, compute, _caches = _runtime()
     compute.queued_outputs.append([(_draft(111), _target(112)), (_target(212),)])
@@ -266,7 +313,8 @@ def test_one_proposal_per_call_and_manual_detach_is_idempotent():
 
 
 def test_failed_commit_does_not_publish_delivery_ledger():
-    runtime, compute, _caches = _runtime()
+    counters = telemetry_module.ContinuousMTPCounters()
+    runtime, compute, _caches = _runtime(telemetry=counters)
     compute.queued_outputs.append([(_draft(111), _target(112))])
     batch = generation.ContinuousMTPGenerationBatch.create([_spec(1)], runtime)
     batch.next_burst()
@@ -281,6 +329,12 @@ def test_failed_commit_does_not_publish_delivery_ledger():
 
     assert batch.lane_states[0].emitted_tokens == 1
     assert batch.closed is False
+    snapshot = counters.snapshot()
+    assert snapshot.proposed_draft_tokens == 1
+    assert snapshot.committed_tokens == 0
+    assert dict(snapshot.transactions)["proposed"] == 1
+    assert dict(snapshot.transactions)["committed"] == 0
+    assert dict(snapshot.failures) == {"proposal": 0, "commit": 1}
 
 
 def test_fixed_cohort_wrapper_refuses_incremental_join():

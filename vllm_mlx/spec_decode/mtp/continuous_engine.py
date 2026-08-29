@@ -215,6 +215,8 @@ class CycleComputation:
     draft_drops: tuple[int, ...]
     outputs: tuple[tuple[MTPToken, ...], ...]
     payload: Any = None
+    draft_seconds: float = 0.0
+    target_verify_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -227,6 +229,14 @@ class SelfMTPCycleResult:
     draft_drops: tuple[int, ...]
     outputs: tuple[tuple[MTPToken, ...], ...]
     _computation: CycleComputation = field(repr=False, compare=False)
+
+    @property
+    def draft_seconds(self) -> float:
+        return self._computation.draft_seconds
+
+    @property
+    def target_verify_seconds(self) -> float:
+        return self._computation.target_verify_seconds
 
 
 class SelfMTPComputeBackend(Protocol):
@@ -288,6 +298,7 @@ class ContinuousSelfMTPRuntime:
     forwards: RapidForwardSeams
     compute: SelfMTPComputeBackend
     caches: SelfMTPCacheAdapter
+    telemetry: Any = None
 
 
 @dataclass

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded telemetry and offline qualification for continuous self-MTP.
 
-This module is deliberately pure Python and is not imported by any production
-path.  It defines the fixed-cardinality counters a later integration may wire
-around the continuous transaction core, plus an artifact-oriented qualification
-record.  Metric dimensions accept enums only: request IDs, model IDs, arbitrary
-exception text, and other unbounded labels cannot enter a snapshot.
+This module is deliberately pure Python.  The production continuous engine
+writes its process-global, fixed-cardinality counters here, while the offline
+qualification helpers use independently constructed counter instances.  Metric
+dimensions accept enums only: request IDs, model IDs, arbitrary exception text,
+and other unbounded labels cannot enter a snapshot.
 
 Synthetic/model-free evidence can prove schema and reconciliation behavior but
 can never set ``performance_qualified``.  That property additionally requires a
@@ -64,6 +64,16 @@ class AbortReason(str, Enum):
     INVARIANT = "invariant"
 
 
+class RollbackPhase(str, Enum):
+    VERIFY = "verify"
+    DELIVERY = "delivery"
+
+
+class FailurePhase(str, Enum):
+    PROPOSAL = "proposal"
+    COMMIT = "commit"
+
+
 class EvidenceKind(str, Enum):
     SYNTHETIC = "synthetic"
     APPLE_SILICON_HARDWARE = "apple_silicon_hardware"
@@ -101,13 +111,23 @@ class ContinuousMTPSnapshot:
     transactions: tuple[tuple[str, int], ...]
     commits: tuple[tuple[str, int], ...]
     aborts: tuple[tuple[str, int], ...]
+    rollbacks: tuple[tuple[str, int], ...]
+    failures: tuple[tuple[str, int], ...]
     admitted_lanes: int
     proposed_draft_tokens: int
     accepted_draft_tokens: int
     committed_tokens: int
     terminal_lanes: int
     cleaned_lanes: int
+    draft_seconds: float
+    target_verify_seconds: float
     open_transaction: bool
+
+    @property
+    def accept_ratio(self) -> float:
+        if self.proposed_draft_tokens == 0:
+            return 0.0
+        return self.accepted_draft_tokens / self.proposed_draft_tokens
 
     def to_dict(self) -> dict[str, Any]:
         """Return JSON-ready data with a statically bounded key space."""
@@ -118,6 +138,8 @@ class ContinuousMTPSnapshot:
             "transactions": dict(self.transactions),
             "commits": dict(self.commits),
             "aborts": dict(self.aborts),
+            "rollbacks": dict(self.rollbacks),
+            "failures": dict(self.failures),
             "totals": {
                 "admitted_lanes": self.admitted_lanes,
                 "proposed_draft_tokens": self.proposed_draft_tokens,
@@ -125,6 +147,9 @@ class ContinuousMTPSnapshot:
                 "committed_tokens": self.committed_tokens,
                 "terminal_lanes": self.terminal_lanes,
                 "cleaned_lanes": self.cleaned_lanes,
+                "draft_seconds": self.draft_seconds,
+                "target_verify_seconds": self.target_verify_seconds,
+                "accept_ratio": self.accept_ratio,
                 "open_transaction": self.open_transaction,
             },
         }
@@ -140,12 +165,16 @@ class ContinuousMTPCounters:
         self._transactions = {value: 0 for value in TransactionOutcome}
         self._commits = {value: 0 for value in CommitKind}
         self._aborts = {value: 0 for value in AbortReason}
+        self._rollbacks = {value: 0 for value in RollbackPhase}
+        self._failures = {value: 0 for value in FailurePhase}
         self._admitted_lanes = 0
         self._proposed_draft_tokens = 0
         self._accepted_draft_tokens = 0
         self._committed_tokens = 0
         self._terminal_lanes = 0
         self._cleaned_lanes = 0
+        self._draft_seconds = 0.0
+        self._target_verify_seconds = 0.0
         self._next_sequence = 1
         self._open: TransactionTicket | None = None
 
@@ -263,6 +292,104 @@ class ContinuousMTPCounters:
         with self._lock:
             self._cleaned_lanes += lanes
 
+    def record_cycle(
+        self,
+        *,
+        proposed_draft_tokens: int,
+        accepted_draft_tokens: int,
+        committed_tokens: int,
+        verify_rollbacks: int,
+        delivery_rollbacks: int,
+        draft_seconds: float,
+        target_verify_seconds: float,
+        kind: CommitKind = CommitKind.FULL,
+    ) -> None:
+        """Atomically publish one successfully committed synthetic cycle.
+
+        Production uses the split proposal/commit methods so a failed commit
+        does not erase completed draft/verify work.  This convenience API keeps
+        synthetic reconciliation records atomic and never evaluates an MLX
+        array.
+        """
+
+        proposed = _positive_int(proposed_draft_tokens, "proposed_draft_tokens")
+        accepted = _non_negative_int(accepted_draft_tokens, "accepted_draft_tokens")
+        committed = _positive_int(committed_tokens, "committed_tokens")
+        verify = _non_negative_int(verify_rollbacks, "verify_rollbacks")
+        delivery = _non_negative_int(delivery_rollbacks, "delivery_rollbacks")
+        draft_elapsed = _non_negative_float(draft_seconds, "draft_seconds")
+        verify_elapsed = _non_negative_float(
+            target_verify_seconds, "target_verify_seconds"
+        )
+        _require_enum(kind, CommitKind, "kind")
+        if accepted > proposed:
+            raise ValueError("accepted drafts cannot exceed proposed drafts")
+        with self._lock:
+            self._transactions[TransactionOutcome.PROPOSED] += 1
+            self._transactions[TransactionOutcome.COMMITTED] += 1
+            self._commits[kind] += 1
+            self._proposed_draft_tokens += proposed
+            self._accepted_draft_tokens += accepted
+            self._committed_tokens += committed
+            self._rollbacks[RollbackPhase.VERIFY] += verify
+            self._rollbacks[RollbackPhase.DELIVERY] += delivery
+            self._draft_seconds += draft_elapsed
+            self._target_verify_seconds += verify_elapsed
+
+    def record_proposal(
+        self,
+        *,
+        proposed_draft_tokens: int,
+        verify_rollbacks: int,
+        draft_seconds: float,
+        target_verify_seconds: float,
+    ) -> None:
+        """Publish a validated production proposal before its commit attempt."""
+
+        proposed = _positive_int(proposed_draft_tokens, "proposed_draft_tokens")
+        verify = _non_negative_int(verify_rollbacks, "verify_rollbacks")
+        draft_elapsed = _non_negative_float(draft_seconds, "draft_seconds")
+        target_elapsed = _non_negative_float(
+            target_verify_seconds, "target_verify_seconds"
+        )
+        with self._lock:
+            self._transactions[TransactionOutcome.PROPOSED] += 1
+            self._proposed_draft_tokens += proposed
+            self._rollbacks[RollbackPhase.VERIFY] += verify
+            self._draft_seconds += draft_elapsed
+            self._target_verify_seconds += target_elapsed
+
+    def record_commit(
+        self,
+        *,
+        accepted_draft_tokens: int,
+        committed_tokens: int,
+        delivery_rollbacks: int,
+        kind: CommitKind = CommitKind.FULL,
+    ) -> None:
+        """Publish the delivery side of a successfully committed proposal."""
+
+        accepted = _non_negative_int(accepted_draft_tokens, "accepted_draft_tokens")
+        committed = _positive_int(committed_tokens, "committed_tokens")
+        delivery = _non_negative_int(delivery_rollbacks, "delivery_rollbacks")
+        _require_enum(kind, CommitKind, "kind")
+        with self._lock:
+            if self._accepted_draft_tokens + accepted > self._proposed_draft_tokens:
+                raise ValueError("cumulative accepted drafts exceed proposals")
+            self._transactions[TransactionOutcome.COMMITTED] += 1
+            self._commits[kind] += 1
+            self._accepted_draft_tokens += accepted
+            self._committed_tokens += committed
+            self._rollbacks[RollbackPhase.DELIVERY] += delivery
+
+    def record_failure(self, phase: FailurePhase) -> None:
+        """Record one failed production proposal or commit boundary."""
+
+        _require_enum(phase, FailurePhase, "phase")
+        with self._lock:
+            self._transactions[TransactionOutcome.FAILED] += 1
+            self._failures[phase] += 1
+
     def snapshot(self) -> ContinuousMTPSnapshot:
         with self._lock:
             return ContinuousMTPSnapshot(
@@ -271,14 +398,44 @@ class ContinuousMTPCounters:
                 transactions=_enum_counts(self._transactions),
                 commits=_enum_counts(self._commits),
                 aborts=_enum_counts(self._aborts),
+                rollbacks=_enum_counts(self._rollbacks),
+                failures=_enum_counts(self._failures),
                 admitted_lanes=self._admitted_lanes,
                 proposed_draft_tokens=self._proposed_draft_tokens,
                 accepted_draft_tokens=self._accepted_draft_tokens,
                 committed_tokens=self._committed_tokens,
                 terminal_lanes=self._terminal_lanes,
                 cleaned_lanes=self._cleaned_lanes,
+                draft_seconds=self._draft_seconds,
+                target_verify_seconds=self._target_verify_seconds,
                 open_transaction=self._open is not None,
             )
+
+    def reset(self) -> None:
+        """Reset this counter instance for tests only."""
+
+        with self._lock:
+            for counts in (
+                self._admissions,
+                self._admission_reasons,
+                self._transactions,
+                self._commits,
+                self._aborts,
+                self._rollbacks,
+                self._failures,
+            ):
+                for key in counts:
+                    counts[key] = 0
+            self._admitted_lanes = 0
+            self._proposed_draft_tokens = 0
+            self._accepted_draft_tokens = 0
+            self._committed_tokens = 0
+            self._terminal_lanes = 0
+            self._cleaned_lanes = 0
+            self._draft_seconds = 0.0
+            self._target_verify_seconds = 0.0
+            self._next_sequence = 1
+            self._open = None
 
     def _require_ticket(self, ticket: TransactionTicket) -> None:
         if not isinstance(ticket, TransactionTicket) or ticket != self._open:
@@ -534,6 +691,15 @@ def _positive_float(value: Any, name: str) -> float:
     return numeric
 
 
+def _non_negative_float(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a non-negative finite number")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError(f"{name} must be a non-negative finite number")
+    return numeric
+
+
 def _is_hex(value: Any, length: int) -> bool:
     return (
         isinstance(value, str)
@@ -554,8 +720,25 @@ BOUNDED_METRIC_DIMENSIONS = MappingProxyType(
         "transaction_outcome": tuple(value.value for value in TransactionOutcome),
         "commit_kind": tuple(value.value for value in CommitKind),
         "abort_reason": tuple(value.value for value in AbortReason),
+        "rollback_phase": tuple(value.value for value in RollbackPhase),
+        "failure_phase": tuple(value.value for value in FailurePhase),
     }
 )
+
+
+_global_counter = ContinuousMTPCounters()
+
+
+def get_global_continuous_counter() -> ContinuousMTPCounters:
+    """Return the process-global continuous-engine counter registry."""
+
+    return _global_counter
+
+
+def reset_global_continuous_counter_for_tests() -> None:
+    """Reset the process-global registry for isolated tests only."""
+
+    _global_counter.reset()
 
 
 __all__ = [
@@ -569,13 +752,17 @@ __all__ = [
     "ContinuousMTPSnapshot",
     "DigestClassification",
     "EvidenceKind",
+    "FailurePhase",
     "FinishReason",
     "LaneQualification",
     "QualificationIdentity",
     "QualificationResult",
     "QualificationSuiteResult",
+    "RollbackPhase",
     "TransactionOutcome",
     "TransactionTicket",
     "evaluate_cohort_qualification",
     "evaluate_qualification_suite",
+    "get_global_continuous_counter",
+    "reset_global_continuous_counter_for_tests",
 ]

@@ -29,17 +29,22 @@ def metrics_client():
     """
     from vllm_mlx.config import reset_config
     from vllm_mlx.routes.metrics import _reset_accumulator_for_tests, router
+    from vllm_mlx.spec_decode.mtp.continuous_telemetry import (
+        reset_global_continuous_counter_for_tests,
+    )
 
     cfg = reset_config()
     cfg.model_name = "qwen3.5-4b"
     cfg.api_key = "test-secret"  # auth IS set, but /metrics must ignore it.
     _reset_accumulator_for_tests()
+    reset_global_continuous_counter_for_tests()
 
     app = FastAPI()
     app.include_router(router)
     yield SimpleNamespace(client=TestClient(app), cfg=cfg)
     reset_config()
     _reset_accumulator_for_tests()
+    reset_global_continuous_counter_for_tests()
 
 
 def _fake_engine(stats: dict[str, Any]):
@@ -100,6 +105,42 @@ def test_metrics_unauthenticated_even_when_api_key_set(metrics_client):
     assert metrics_client.cfg.api_key == "test-secret"
     resp = metrics_client.client.get("/metrics")  # no Authorization header
     assert resp.status_code == 200
+
+
+def test_metrics_endpoint_exposes_continuous_mtp_reconciliation(metrics_client):
+    from vllm_mlx.spec_decode.mtp.continuous_telemetry import (
+        get_global_continuous_counter,
+    )
+
+    get_global_continuous_counter().record_cycle(
+        proposed_draft_tokens=8,
+        accepted_draft_tokens=5,
+        committed_tokens=9,
+        verify_rollbacks=1,
+        delivery_rollbacks=1,
+        draft_seconds=0.125,
+        target_verify_seconds=0.25,
+    )
+
+    body = metrics_client.client.get("/metrics").text
+
+    assert "rapid_mlx_continuous_mtp_proposals_total 1" in body
+    assert "rapid_mlx_continuous_mtp_draft_tokens_proposed_total 8" in body
+    assert "rapid_mlx_continuous_mtp_draft_tokens_accepted_total 5" in body
+    assert "rapid_mlx_continuous_mtp_accept_ratio 0.625" in body
+    assert "rapid_mlx_continuous_mtp_output_tokens_committed_total 9" in body
+    assert 'rapid_mlx_continuous_mtp_rollbacks_total{phase="verify"} 1' in body
+    assert 'rapid_mlx_continuous_mtp_rollbacks_total{phase="delivery"} 1' in body
+    assert "rapid_mlx_continuous_mtp_draft_seconds_total 0.125" in body
+    assert "rapid_mlx_continuous_mtp_target_verify_seconds_total 0.25" in body
+    # The continuous series are distinct; the legacy single-request generator
+    # remains untouched and therefore stays at its own zero-valued counter.
+    legacy_attempt = next(
+        line
+        for line in body.splitlines()
+        if line.startswith("rapid_mlx_spec_decode_attempts_total{")
+    )
+    assert legacy_attempt.endswith(" 0")
 
 
 # ---------------------------------------------------------------------------

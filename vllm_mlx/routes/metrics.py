@@ -853,6 +853,123 @@ def _render_spec_decode_mtp_counters(cfg: Any) -> list[str]:
     return out
 
 
+def _render_continuous_mtp_counters() -> list[str]:
+    """Render process-global counters for the continuous self-MTP engine.
+
+    These names deliberately do not reuse ``rapid_mlx_spec_decode_*``: that
+    legacy family is written by the single-request generator, while these
+    counters describe multi-lane and explicitly admitted batched-B1
+    transactions.  The snapshot is one lock acquisition and rendering never
+    touches MLX arrays.
+    """
+
+    from ..spec_decode.mtp.continuous_telemetry import (
+        FailurePhase,
+        RollbackPhase,
+        TransactionOutcome,
+        get_global_continuous_counter,
+    )
+
+    snapshot = get_global_continuous_counter().snapshot()
+    transactions = dict(snapshot.transactions)
+    rollbacks = dict(snapshot.rollbacks)
+    failures = dict(snapshot.failures)
+    out: list[str] = []
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_proposals_total",
+            "counter",
+            "Validated continuous self-MTP proposal transactions.",
+            transactions[TransactionOutcome.PROPOSED.value],
+        )
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_draft_tokens_proposed_total",
+            "counter",
+            "Draft tokens proposed by continuous self-MTP transactions.",
+            snapshot.proposed_draft_tokens,
+        )
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_draft_tokens_accepted_total",
+            "counter",
+            "Draft tokens accepted by continuous self-MTP target verification.",
+            snapshot.accepted_draft_tokens,
+        )
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_accept_ratio",
+            "gauge",
+            "Target-accepted draft tokens divided by proposed draft tokens.",
+            round(snapshot.accept_ratio, 6),
+        )
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_output_tokens_committed_total",
+            "counter",
+            "Output tokens atomically committed by continuous self-MTP transactions.",
+            snapshot.committed_tokens,
+        )
+    )
+    out.extend(
+        [
+            "# HELP rapid_mlx_continuous_mtp_transactions_total Continuous "
+            "self-MTP transaction lifecycle outcomes.",
+            "# TYPE rapid_mlx_continuous_mtp_transactions_total counter",
+        ]
+    )
+    out.extend(
+        "rapid_mlx_continuous_mtp_transactions_total"
+        f'{{outcome="{outcome.value}"}} {transactions[outcome.value]}'
+        for outcome in TransactionOutcome
+    )
+    out.extend(
+        [
+            "# HELP rapid_mlx_continuous_mtp_rollbacks_total Successful cache "
+            "rollback operations by transaction phase.",
+            "# TYPE rapid_mlx_continuous_mtp_rollbacks_total counter",
+        ]
+    )
+    out.extend(
+        "rapid_mlx_continuous_mtp_rollbacks_total"
+        f'{{phase="{phase.value}"}} {rollbacks[phase.value]}'
+        for phase in RollbackPhase
+    )
+    out.extend(
+        [
+            "# HELP rapid_mlx_continuous_mtp_failures_total Continuous self-MTP "
+            "failures by bounded lifecycle phase.",
+            "# TYPE rapid_mlx_continuous_mtp_failures_total counter",
+        ]
+    )
+    out.extend(
+        "rapid_mlx_continuous_mtp_failures_total"
+        f'{{phase="{phase.value}"}} {failures[phase.value]}'
+        for phase in FailurePhase
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_draft_seconds_total",
+            "counter",
+            "Wall-clock seconds inside required continuous MTP draft work.",
+            round(snapshot.draft_seconds, 9),
+        )
+    )
+    out.extend(
+        _fmt_metric(
+            "rapid_mlx_continuous_mtp_target_verify_seconds_total",
+            "counter",
+            "Wall-clock seconds inside required target verification work.",
+            round(snapshot.target_verify_seconds, 9),
+        )
+    )
+    return out
+
+
 def _render_ubc_evict_counters() -> list[str]:
     """Render the Defect 4 UBC eviction counter.
 
@@ -1133,6 +1250,7 @@ def _render_prometheus(cfg: Any) -> str:
     # zero-valued series so dashboards see the metric names even at
     # cold start. Pre-engine the counter is naturally zero anyway.
     lines.extend(_render_spec_decode_mtp_counters(cfg))
+    lines.extend(_render_continuous_mtp_counters())
     lines.extend(_render_suffix_decode_counters(cfg))
 
     # R15 Phase 4 TurboQuant series — mode gauge, skip-list counter

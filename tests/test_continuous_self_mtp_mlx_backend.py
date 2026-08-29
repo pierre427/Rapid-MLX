@@ -244,6 +244,8 @@ def test_k2_recursive_draft_target_verify_and_delivery_commit():
     proposal = propose_batched_self_mtp(batch)
     assert proposal.draft_depths == (2, 2)
     assert proposal.accepted_lengths == (1, 2)
+    assert proposal.draft_seconds > 0
+    assert proposal.target_verify_seconds > 0
     assert [[token.token for token in row] for row in proposal.outputs] == [
         [4, 19],
         [8, 9, 10],

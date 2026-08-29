@@ -186,6 +186,8 @@ def assemble_continuous_self_mtp_runtime(
     if missing:  # Defensive: future capability additions remain fail-closed.
         raise _unsupported("missing fixed-core capability: " + ", ".join(missing))
 
+    from .continuous_telemetry import get_global_continuous_counter
+
     return ContinuousSelfMTPRuntime(
         config=ContinuousSelfMTPConfig(
             enabled=True,
@@ -208,6 +210,7 @@ def assemble_continuous_self_mtp_runtime(
             preflight=preflight_ragged_cache,
             trim=trim_ragged_cache,
         ),
+        telemetry=get_global_continuous_counter(),
     )
 
 
