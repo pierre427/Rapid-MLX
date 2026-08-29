@@ -62,6 +62,7 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
         "model_family": "qwen3_5",
         "batch_forward": "mtp_batch_forward",
         "recursive_draft_depth": 2,
+        "share_qsa_indices": False,
         "fixed_membership": True,
         "dynamic_join": True,
         "quantized_cache": False,

@@ -115,6 +115,8 @@ class QSAIndexCache(ArraysCache):
         self._valid_until: list[int] | None = None
         self._right_padding: list[int] | None = None
         self._pending_left_padding = [int(item) for item in (left_padding or [0])]
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
 
     def _ensure_batch(self, batch: int):
         """Adopt mlx-lm's fresh-batch size before state is committed."""
@@ -157,7 +159,20 @@ class QSAIndexCache(ArraysCache):
             raise AttributeError("batched QSA cache has per-row compressed counts")
         return self._compressed_counts[0]
 
-    def prepare(self, lengths=None, right_padding=None, **_kwargs):
+    def begin_self_mtp_cycle(self):
+        """Arm one recursive draft cycle without crossing membership boundaries."""
+        if self._mtp_share_topk or self._mtp_shared_topk is not None:
+            raise RuntimeError("QSA self-MTP selection cycle is already armed")
+        self._mtp_share_topk = True
+
+    def end_self_mtp_cycle(self):
+        """Disarm the cycle-local selection at every transaction boundary."""
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
+
+    def _prepare(self, lengths=None, right_padding=None, *, keep_shared=False):
+        if not keep_shared:
+            self.end_self_mtp_cycle()
         batch = (
             int(self.left_padding.size)
             if self.left_padding is not None
@@ -172,7 +187,13 @@ class QSAIndexCache(ArraysCache):
             None if right_padding is None else [int(item) for item in right_padding]
         )
 
-    def finalize(self):
+    def prepare(self, lengths=None, right_padding=None, **_kwargs):
+        self._prepare(lengths, right_padding)
+
+    def prepare_self_mtp_step(self, lengths=None, right_padding=None, **_kwargs):
+        self._prepare(lengths, right_padding, keep_shared=True)
+
+    def _finalize(self, *, keep_shared=False):
         if self._right_padding is not None and self.left_padding is not None:
             self.left_padding += mx.array(self._right_padding, dtype=mx.int32)
         self._valid_until = None
@@ -180,6 +201,14 @@ class QSAIndexCache(ArraysCache):
         self.lengths = None
         # QSA state contains only logical tokens, so unlike the main KV cache
         # it needs no physical roll after a right-padded prefill.
+        if not keep_shared:
+            self.end_self_mtp_cycle()
+
+    def finalize(self):
+        self._finalize()
+
+    def finalize_self_mtp_step(self):
+        self._finalize(keep_shared=True)
 
     def valid_lengths(self, input_length: int) -> list[int]:
         return [count for _, count in self.valid_spans(input_length)]
@@ -356,6 +385,7 @@ class QSAIndexCache(ArraysCache):
 
     @meta_state.setter
     def meta_state(self, value):
+        self.end_self_mtp_cycle()
         decoded = json.loads(value)
         self.compress_ratio = int(decoded["compress_ratio"])
         self._offsets = [int(item) for item in decoded["offsets"]]
@@ -405,6 +435,7 @@ class QSAIndexCache(ArraysCache):
         # recently completed group at a boundary. Rewind only within that
         # recoverable window; the next update overwrites discarded rows and
         # deterministically recomputes a removed compressed block.
+        self.end_self_mtp_cycle()
         if not all(self._can_trim_row(offset, n) for offset in self._offsets):
             return 0
         self._offsets = [offset - n for offset in self._offsets]
@@ -424,6 +455,7 @@ class QSAIndexCache(ArraysCache):
         return sum(item.nbytes for item in self.cache if item is not None)
 
     def filter(self, batch_indices):
+        self.end_self_mtp_cycle()
         indices = (
             batch_indices.tolist()
             if isinstance(batch_indices, mx.array)
@@ -444,6 +476,7 @@ class QSAIndexCache(ArraysCache):
         # retained shorter row's padding into zero.
 
     def extend(self, other):
+        self.end_self_mtp_cycle()
         rows = [self.extract(index) for index in range(len(self._offsets))]
         rows.extend(other.extract(index) for index in range(len(other._offsets)))
         merged = self.merge(rows)

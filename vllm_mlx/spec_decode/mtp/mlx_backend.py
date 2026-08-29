@@ -119,46 +119,115 @@ def _validate_pair(pair: SelfMTPCachePair) -> tuple[list[Any], list[Any]]:
     return target, draft
 
 
+def _cache_children(cache: Any) -> tuple[Any, ...]:
+    children = getattr(cache, "caches", None)
+    if isinstance(children, (list, tuple)):
+        return tuple(children)
+    return ()
+
+
+def _prepare_cache(cache: Any, lengths: Sequence[int], right_padding) -> None:
+    prepare = getattr(cache, "prepare_self_mtp_step", None)
+    if callable(prepare):
+        prepare(lengths=list(lengths), right_padding=right_padding)
+        return
+    children = _cache_children(cache)
+    if children:
+        prepared = []
+        try:
+            for child in children:
+                _prepare_cache(child, lengths, right_padding)
+                prepared.append(child)
+        except Exception:
+            for child in reversed(prepared):
+                _finalize_cache(child)
+            raise
+        return
+    prepare = getattr(cache, "prepare", None)
+    if not callable(prepare):
+        raise ContinuousSelfMTPUnsupported(
+            f"cache {type(cache).__name__} has no prepare surface"
+        )
+    prepare(lengths=list(lengths), right_padding=right_padding)
+
+
 def _prepare_group(group: Sequence[Any], lengths: Sequence[int]) -> None:
     width = max(lengths)
     right_padding = [width - length for length in lengths]
     prepared: list[Any] = []
     try:
         for cache in group:
-            prepare = getattr(cache, "prepare_self_mtp_step", None)
-            if not callable(prepare):
-                prepare = getattr(cache, "prepare", None)
-            if not callable(prepare):
-                raise ContinuousSelfMTPUnsupported(
-                    f"cache {type(cache).__name__} has no prepare surface"
-                )
-            prepare(lengths=list(lengths), right_padding=right_padding)
+            _prepare_cache(cache, lengths, right_padding)
             prepared.append(cache)
     except Exception:
         for cache in reversed(prepared):
-            finalize = getattr(cache, "finalize_self_mtp_step", None)
-            if not callable(finalize):
-                finalize = getattr(cache, "finalize", None)
-            if callable(finalize):
-                finalize()
+            _finalize_cache(cache)
         raise
+
+
+def _finalize_cache(cache: Any) -> None:
+    finalize = getattr(cache, "finalize_self_mtp_step", None)
+    if callable(finalize):
+        finalize()
+        return
+    children = _cache_children(cache)
+    if children:
+        first_error: BaseException | None = None
+        for child in children:
+            try:
+                _finalize_cache(child)
+            except BaseException as exc:  # noqa: BLE001 - finalize every child
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+        return
+    finalize = getattr(cache, "finalize", None)
+    if not callable(finalize):
+        raise ContinuousSelfMTPUnsupported(
+            f"cache {type(cache).__name__} has no finalize surface"
+        )
+    finalize()
 
 
 def _finalize_group(group: Sequence[Any]) -> None:
     first_error: BaseException | None = None
     for cache in group:
-        finalize = getattr(cache, "finalize_self_mtp_step", None)
-        if not callable(finalize):
-            finalize = getattr(cache, "finalize", None)
-        if not callable(finalize):
+        try:
+            _finalize_cache(cache)
+        except BaseException as exc:  # noqa: BLE001 - finalize every layer
             if first_error is None:
-                first_error = ContinuousSelfMTPUnsupported(
-                    f"cache {type(cache).__name__} has no finalize surface"
-                )
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _begin_qsa_share_cycle(group: Sequence[Any]) -> tuple[Any, ...]:
+    armed = []
+    try:
+        pending = list(group)
+        while pending:
+            cache = pending.pop(0)
+            begin = getattr(cache, "begin_self_mtp_cycle", None)
+            if callable(begin):
+                begin()
+                armed.append(cache)
+            pending[0:0] = list(_cache_children(cache))
+    except Exception:
+        _end_qsa_share_cycle(armed)
+        raise
+    return tuple(armed)
+
+
+def _end_qsa_share_cycle(group: Sequence[Any]) -> None:
+    first_error: BaseException | None = None
+    for cache in reversed(group):
+        end = getattr(cache, "end_self_mtp_cycle", None)
+        if not callable(end):
             continue
         try:
-            finalize()
-        except BaseException as exc:  # noqa: BLE001 - finalize every layer
+            end()
+        except BaseException as exc:  # noqa: BLE001 - disarm every cache
             if first_error is None:
                 first_error = exc
     if first_error is not None:
@@ -180,6 +249,7 @@ class RapidMLXSelfMTPBackend:
         array_ops: ArrayOps | None = None,
         residual_sampling: ResidualSamplingHooks | None = None,
         logits_processor: Callable[[SelfMTPLane, Any, Any], Any] | None = None,
+        share_qsa_indices: bool = False,
         prefill_step_size: int = 512,
         draft_depth: int = 2,
     ) -> None:
@@ -187,11 +257,14 @@ class RapidMLXSelfMTPBackend:
             raise ValueError("prefill_step_size must be positive")
         if draft_depth != 2:
             raise ValueError("the first Rapid continuous self-MTP backend is K=2")
+        if not isinstance(share_qsa_indices, bool):
+            raise ValueError("share_qsa_indices must be boolean")
         self.target_cache_factory = target_cache_factory
         self.draft_cache_factory = draft_cache_factory
         self.ops = array_ops or _MLXArrayOps()
         self.residual_sampling = residual_sampling
         self.logits_processor = logits_processor
+        self.share_qsa_indices = share_qsa_indices
         self.prefill_step_size = int(prefill_step_size)
         self.draft_depth = draft_depth
 
@@ -389,60 +462,71 @@ class RapidMLXSelfMTPBackend:
                 self.ops.pad(tokens, [(0, 0), (0, first_width - max(valid, 1))])
             )
 
-        _prepare_group(draft_cache, first_lengths)
-        try:
-            first_logits, first_hidden = self._forward_pair(
-                forwards.draft(
-                    self.ops.concatenate(hidden_rows, axis=0),
-                    self.ops.concatenate(token_rows, axis=0),
-                    draft_cache,
-                ),
-                "MTP forward",
-            )
-        finally:
-            _finalize_group(draft_cache)
-        for row, (lane, depth, valid) in enumerate(zip(lanes, depths, first_lengths)):
-            if depth == 0:
-                continue
-            position = valid - 1
-            token, logprobs = self._distribution(
-                lane,
-                self._prefix(lane, [lane.cur]),
-                first_logits[row, position],
-            )
-            drafts[row].append(token)
-            draft_logprobs[row].append(logprobs)
-            draft_hidden[row] = first_hidden[row : row + 1, position : position + 1]
-            lane.pending_hidden = None
-            lane.pending_tokens = []
-
         second_lengths = [1 if depth > 1 else 0 for depth in depths]
-        if any(second_lengths):
-            hidden_batch = self.ops.concatenate(draft_hidden, axis=0)
-            token_batch = self.ops.uint32(
-                [
-                    [drafts[row][-1] if active else 0]
-                    for row, active in enumerate(second_lengths)
-                ]
-            )
-            _prepare_group(draft_cache, second_lengths)
+        shared_qsa = (
+            _begin_qsa_share_cycle(draft_cache)
+            if self.share_qsa_indices and any(second_lengths)
+            else ()
+        )
+        try:
+            _prepare_group(draft_cache, first_lengths)
             try:
-                second_logits, _ = self._forward_pair(
-                    forwards.draft(hidden_batch, token_batch, draft_cache),
+                first_logits, first_hidden = self._forward_pair(
+                    forwards.draft(
+                        self.ops.concatenate(hidden_rows, axis=0),
+                        self.ops.concatenate(token_rows, axis=0),
+                        draft_cache,
+                    ),
                     "MTP forward",
                 )
             finally:
                 _finalize_group(draft_cache)
-            for row, (lane, active) in enumerate(zip(lanes, second_lengths)):
-                if not active:
+
+            for row, (lane, depth, valid) in enumerate(
+                zip(lanes, depths, first_lengths)
+            ):
+                if depth == 0:
                     continue
+                position = valid - 1
                 token, logprobs = self._distribution(
                     lane,
-                    self._prefix(lane, [lane.cur] + drafts[row]),
-                    second_logits[row, -1],
+                    self._prefix(lane, [lane.cur]),
+                    first_logits[row, position],
                 )
                 drafts[row].append(token)
                 draft_logprobs[row].append(logprobs)
+                draft_hidden[row] = first_hidden[row : row + 1, position : position + 1]
+                lane.pending_hidden = None
+                lane.pending_tokens = []
+
+            if any(second_lengths):
+                hidden_batch = self.ops.concatenate(draft_hidden, axis=0)
+                token_batch = self.ops.uint32(
+                    [
+                        [drafts[row][-1] if active else 0]
+                        for row, active in enumerate(second_lengths)
+                    ]
+                )
+                _prepare_group(draft_cache, second_lengths)
+                try:
+                    second_logits, _ = self._forward_pair(
+                        forwards.draft(hidden_batch, token_batch, draft_cache),
+                        "MTP forward",
+                    )
+                finally:
+                    _finalize_group(draft_cache)
+                for row, (lane, active) in enumerate(zip(lanes, second_lengths)):
+                    if not active:
+                        continue
+                    token, logprobs = self._distribution(
+                        lane,
+                        self._prefix(lane, [lane.cur] + drafts[row]),
+                        second_logits[row, -1],
+                    )
+                    drafts[row].append(token)
+                    draft_logprobs[row].append(logprobs)
+        finally:
+            _end_qsa_share_cycle(shared_qsa)
 
         verify_width = max(depth + 1 for depth in depths)
         verify_rows = [

@@ -30,6 +30,8 @@ from vllm_mlx.spec_decode.mtp.mlx_backend import (
     RapidRaggedCacheAdapter,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 class _NumpyOps:
     @staticmethod
@@ -91,6 +93,56 @@ class _LayerCache:
         self.rows = [self.rows[index] for index in indices]
 
 
+class _SharedQSAFake(_LayerCache):
+    def __init__(self, label, rows=None):
+        super().__init__(label, rows)
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
+
+    def begin_self_mtp_cycle(self):
+        assert self._mtp_share_topk is False
+        assert self._mtp_shared_topk is None
+        self._mtp_share_topk = True
+        self.events.append(("share_begin",))
+
+    def end_self_mtp_cycle(self):
+        self.events.append(("share_end", self._mtp_shared_topk))
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
+
+    def prepare_self_mtp_step(self, *, lengths, right_padding):
+        assert self._mtp_share_topk is True
+        mode = "capture" if self._mtp_shared_topk is None else "reuse"
+        self.events.append(
+            ("share_prepare", mode, tuple(lengths), tuple(right_padding))
+        )
+        if self._mtp_shared_topk is None:
+            self._mtp_shared_topk = tuple(
+                f"row-{index}" for index in range(len(lengths))
+            )
+
+    def finalize_self_mtp_step(self):
+        assert self._mtp_share_topk is True
+        assert self._mtp_shared_topk is not None
+        self.events.append(("share_finalize", self._mtp_shared_topk))
+
+
+class _CacheListFake:
+    """Production-shaped composite: one ordinary KV plus one QSA sidecar."""
+
+    def __init__(self, *caches):
+        self.caches = list(caches)
+
+    @classmethod
+    def merge(cls, cache_lists):
+        return cls(
+            *(
+                type(rows[0]).merge(list(rows))
+                for rows in zip(*(cache_list.caches for cache_list in cache_lists))
+            )
+        )
+
+
 class _FakeForwards:
     def __init__(self):
         self.calls = []
@@ -136,12 +188,13 @@ class _FakeForwards:
         return logits, post
 
 
-def _runtime():
+def _runtime(*, share_qsa_indices=False, draft_cache_factory=None):
     forward = _FakeForwards()
     backend = RapidMLXSelfMTPBackend(
         target_cache_factory=lambda: [_LayerCache("target")],
-        draft_cache_factory=lambda: [_LayerCache("draft")],
+        draft_cache_factory=draft_cache_factory or (lambda: [_LayerCache("draft")]),
         array_ops=_NumpyOps(),
+        share_qsa_indices=share_qsa_indices,
         prefill_step_size=8,
     )
     cache_events = []
@@ -231,6 +284,45 @@ def test_next_cycle_flushes_persistent_pending_pairs_before_new_drafts():
     assert first_cycle_call[2].shape == (2, 4)
     assert first_cycle_call[2][0].tolist() == [3, 4, 19, 0]
     assert first_cycle_call[2][1].tolist() == [7, 8, 9, 10]
+
+
+def test_recursive_drafts_preserve_qsa_selection_then_disarm_cycle():
+    runtime, _forward, _events = _runtime(
+        share_qsa_indices=True,
+        draft_cache_factory=lambda: [
+            _CacheListFake(_LayerCache("kv"), _SharedQSAFake("qsa"))
+        ],
+    )
+    lane0, _ = _prepare(runtime, 0, [1, 2])
+    lane1, _ = _prepare(runtime, 1, [5, 6])
+    batch = attach_self_mtp_lanes(None, [lane0, lane1])
+    merged_cache_list = batch.caches.draft[0]
+    merged_kv, merged_qsa = merged_cache_list.caches
+
+    propose_batched_self_mtp(batch)
+
+    share_events = [
+        event for event in merged_qsa.events if event[0].startswith("share_")
+    ]
+    assert [event[0] for event in share_events] == [
+        "share_begin",
+        "share_prepare",
+        "share_finalize",
+        "share_prepare",
+        "share_finalize",
+        "share_end",
+    ]
+    assert share_events[1][1] == "capture"
+    assert share_events[3][1] == "reuse"
+    assert share_events[-1][1] == ("row-0", "row-1")
+    assert merged_qsa._mtp_share_topk is False
+    assert merged_qsa._mtp_shared_topk is None
+    assert [event[0] for event in merged_kv.events] == [
+        "prepare",
+        "finalize",
+        "prepare",
+        "finalize",
+    ]
 
 
 def test_terminal_delivery_prefix_updates_cur_seed_and_detach_flushes_debt():
@@ -355,3 +447,16 @@ def test_backend_has_no_eager_mlx_import_and_uses_only_rapid_forward_seams():
     assert eager_mlx == []
     assert "forwards.target(" in source
     assert "forwards.draft(" in source
+
+
+def test_qwen4_qsa_source_has_cycle_local_capture_reuse_and_cleanup():
+    cache_source = (ROOT / "vllm_mlx/models/qwen4_exp_cache.py").read_text()
+    model_source = (ROOT / "vllm_mlx/models/qwen4_exp.py").read_text()
+
+    assert "def begin_self_mtp_cycle" in cache_source
+    assert "def prepare_self_mtp_step" in cache_source
+    assert "def finalize_self_mtp_step" in cache_source
+    assert "def end_self_mtp_cycle" in cache_source
+    assert "capture_shared = cache._mtp_share_topk" in model_source
+    assert "cache._mtp_shared_topk = mx.stack(shared_rows)" in model_source
+    assert "shared_topk[batch_index : batch_index + 1]" in model_source

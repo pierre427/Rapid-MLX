@@ -30,6 +30,7 @@ def test_capability_descriptor_is_explicit_immutable_and_conservative(
         "model_family": family,
         "batch_forward": "mtp_batch_forward",
         "recursive_draft_depth": 2,
+        "share_qsa_indices": family == "qwen4_exp",
         "fixed_membership": True,
         "dynamic_join": dynamic_join,
         "quantized_cache": False,
@@ -92,3 +93,8 @@ def test_injected_class_exposes_descriptor_seam_and_separate_recursive_depth(
 def test_flash_and_qwen35_join_claims_remain_intentionally_asymmetric():
     assert qwen4_exp_inject.BATCHED_MTP_CAPABILITY["dynamic_join"] is False
     assert qwen3_5_inject.BATCHED_MTP_CAPABILITY["dynamic_join"] is True
+
+
+def test_qsa_selection_sharing_is_attested_only_for_qwen4():
+    assert qwen4_exp_inject.BATCHED_MTP_CAPABILITY["share_qsa_indices"] is True
+    assert qwen3_5_inject.BATCHED_MTP_CAPABILITY["share_qsa_indices"] is False

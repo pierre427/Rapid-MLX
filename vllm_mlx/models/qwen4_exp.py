@@ -743,13 +743,27 @@ class QSAIndexer(nn.Module):
             if cache.left_padding is None
             else [int(value) for value in cache.left_padding.tolist()]
         )
+        shared_topk = cache._mtp_shared_topk
+        if shared_topk is not None and (
+            shared_topk.ndim != 2
+            or shared_topk.shape[0] != batch
+            or shared_topk.shape[1] != self.block_topk
+        ):
+            raise RuntimeError("QSA shared self-MTP selection shape changed")
+        capture_shared = cache._mtp_share_topk and shared_topk is None
+        shared_rows = []
         compact_indices = []
         compact_valid = []
         for batch_index in range(batch):
             input_start, valid_length = valid_spans[batch_index]
             available_blocks = cache._compressed_counts[batch_index]
             selected_blocks = None
-            if available_blocks > self.block_topk:
+            if shared_topk is not None:
+                selected_blocks = mx.broadcast_to(
+                    shared_topk[batch_index : batch_index + 1],
+                    (length, self.block_topk),
+                )
+            elif available_blocks > self.block_topk:
                 keys = cache.keys_for_blocks(batch_index, available_blocks)
                 # Preserve the reference's single batched matmul and FP32
                 # reduction. Per-token matmuls choose a different Metal
@@ -785,6 +799,13 @@ class QSAIndexer(nn.Module):
                     mx.arange(self.block_topk, dtype=mx.int32)[None, :],
                     (length, self.block_topk),
                 )
+            if capture_shared:
+                if valid_length:
+                    shared_rows.append(
+                        mx.contiguous(selected_blocks[input_start + valid_length - 1])
+                    )
+                else:
+                    shared_rows.append(mx.zeros((self.block_topk,), dtype=mx.int32))
 
             dense_blocks = mx.broadcast_to(
                 mx.arange(self.block_topk, dtype=mx.int32)[None, :],
@@ -824,6 +845,9 @@ class QSAIndexer(nn.Module):
             )
             compact_indices.append(indices)
             compact_valid.append(valid)
+
+        if capture_shared:
+            cache._mtp_shared_topk = mx.stack(shared_rows)
 
         selection = _QSASelection(
             token_indices=mx.stack(compact_indices),
