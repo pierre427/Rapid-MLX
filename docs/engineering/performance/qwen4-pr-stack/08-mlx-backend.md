@@ -6,7 +6,8 @@ Depends on: PR 7 / `e7a20e733389cb66aba13e45030db17e7788015b`
 
 Publication branch: `feat/mtp-continuous-mlx-backend`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -54,7 +55,7 @@ Files:
 - Commit contains CPU/mock tests for recursive draft/verify, pending-state
   flushing, terminal detach, cache operations, refusal gates, and import
   isolation.
-- The focused file passed within the 163-test stack-tip model-free battery; all
+- The focused file passed within the 261-test current-tip model-free battery; all
   changed Python files pass `ruff check` and `ruff format --check`.
 - No GPU, MLX model, service, stress, or Rapid performance qualification was
   performed for this packet.
@@ -77,7 +78,7 @@ disclosure before submission.
 
 ## Checklist
 
-- Targeted tests: **passed within the 163-test stack-tip battery**.
+- Targeted tests: **passed within the 261-test current-tip battery**.
 - Lint/format: **passed on the stack tip**; rerun on the final PR head.
 - PR-number self-validation: **pending until the PR exists**.
 - Critical-path mutation spot-check: **pending**.

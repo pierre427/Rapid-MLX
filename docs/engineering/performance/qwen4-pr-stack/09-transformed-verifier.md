@@ -6,7 +6,8 @@ Depends on: PR 8A / `f4d8aef9528287706007637b622cf6bc3b49f319`
 
 Publication branch: `feat/mtp-transformed-verifier`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -52,7 +53,7 @@ Files:
 
 - Commit contains NumPy-only normalization, boundary, residual, marginal,
   fallback, refusal, backend-integration, and import-isolation tests.
-- The focused file passed within the 163-test stack-tip model-free battery; all
+- The focused file passed within the 261-test current-tip model-free battery; all
   changed Python files pass `ruff check` and `ruff format --check`.
 - No GPU, MLX model, service, stress, or Rapid performance qualification was
   performed for this packet.
@@ -76,7 +77,7 @@ verification remain pending; update this disclosure before submission.
 
 ## Checklist
 
-- Targeted tests: **passed within the 163-test stack-tip battery**.
+- Targeted tests: **passed within the 261-test current-tip battery**.
 - Lint/format: **passed on the stack tip**; rerun on the final PR head.
 - PR-number self-validation: **pending until the PR exists**.
 - Critical-path mutation spot-check: **pending**.

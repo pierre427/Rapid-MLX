@@ -1,0 +1,6 @@
+context_tokens,modeled_lane_gib_k2,pre_fix_admitted_n,post_fix_admitted_n,stage,estimated_total_gib,usable_gib,source
+256,1.87,40,16,fewer_lanes,74.8,75.1,results/window-dense27b-lane-ladder/dynamic_only_27b.log
+1024,2.20,34,16,fewer_lanes,74.8,75.1,results/window-dense27b-lane-ladder/dynamic_only_27b.log
+4096,3.52,21,16,fewer_lanes,73.9,75.1,results/window-dense27b-lane-ladder/dynamic_only_27b.log
+16384,8.80,8,8,fewer_lanes,70.4,75.1,results/window-dense27b-lane-ladder/dynamic_only_27b.log
+32768,15.84,4,4,fewer_lanes,63.4,75.1,results/window-dense27b-lane-ladder/dynamic_only_27b.log

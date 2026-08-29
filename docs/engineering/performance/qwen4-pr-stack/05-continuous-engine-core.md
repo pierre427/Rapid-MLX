@@ -6,7 +6,8 @@ Depends on: PR 4 / `07f8beea1750ef51d2451c9c0045082fa926a693`
 
 Publication branch: `feat/mtp-continuous-transaction-core`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -62,7 +63,7 @@ Files:
 - Current stacked checkout:
   `python3 -m pytest -q tests/test_continuous_self_mtp_engine.py` — 12 test
   cases pass.
-- Stack-tip qualification battery: 163 model-free tests pass; all changed
+- Current-tip qualification battery: 261 model-free tests pass; all changed
   Python files pass `ruff check` and `ruff format --check`.
 - Model-free protocol/fake-adapter evidence only. No MLX model, GPU, service,
   stress, or performance run.

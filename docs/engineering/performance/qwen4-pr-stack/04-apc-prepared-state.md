@@ -6,7 +6,8 @@ Depends on: PR 3 / `f061e090e30f8379829e32f705c5cb625f1cd172`
 
 Publication branch: `feat/mtp-apc-prepared-state`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -61,7 +62,7 @@ Files:
   `python3 -m pytest -q tests/test_mtp_prepared_state.py` — 25 test cases pass.
 - Isolated import assertion confirms `mlx` and `mlx.core` remain unloaded.
 - Combined focused stack: 70 tests pass in 0.29 seconds.
-- Stack-tip qualification battery: 163 model-free tests pass; all changed
+- Current-tip qualification battery: 261 model-free tests pass; all changed
   Python files pass `ruff check` and `ruff format --check`.
 - No GPU, model, service, stress, APC integration, or performance run.
 - Pending before submission: per-PR full unit suite, contract mutation

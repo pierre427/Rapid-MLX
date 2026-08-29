@@ -1,31 +1,31 @@
 # Qwen4 continuous self-MTP PR submission packet
 
-Status: **local drafts only — nothing pushed or submitted**.
+Status: **private Forgejo integration branch pushed; publication branches are
+not pushed and nothing is submitted upstream**.
 
 Base: Rapid-MLX `origin/main` at
 `746522837c2cde5deca3784786ce06d10b45e66c`.
 
 This directory contains one proposed PR body per focused layer in the local
-Qwen4 continuous self-MTP stack. The original thirteen exist as local
-commits/branch tips; two final source-lineage corrections are staged for
-insertion as PR 8A and PR 12A. PR 13 must not be submitted as a performance
-claim until exact Rapid qualification artifacts exist.
+Qwen4 continuous self-MTP stack. PRs 1--12A map to existing focused commits.
+PR 13 maps to `be0b3e8c`. PRs 14--16 are the required publication split of the
+combined 2,075-line integration commit `d7cf5bbb`; PR 17 keeps documentation
+last. No body is submission-ready while a blocking or pending line remains.
 
-No model, service, or inference benchmark was run while preparing this packet.
-One broader legacy CLI test accidentally constructed tiny `mlx.core` arrays;
-Metal initialization therefore cannot be ruled out, although no model was
-loaded. All subsequent checks were pure-Python, NumPy/mock, AST, lint, or
-compile checks. The stack has **no Rapid-MLX performance qualification**.
-Source-prototype throughput is motivation only and must not be presented as a
-Rapid result.
+The original PRs 1--13 staging pass was model-free. A later real
+Qwen3.8-27B target smoke used an explicitly test-only randomly initialized MTP
+head and observed zero acceptance. Its 18.4 to 87.3 aggregate token/s ladder
+is a diagnostic batching floor, not trained-head self-MTP uplift or production
+throughput, and it has no checked-in raw artifact. This assertion sweep ran
+only model-free tests and static checks and did not use a model or GPU.
 
 ## Rapid contribution format
 
 Each body follows Rapid's required ordering: Why, Scope, Non-goals,
 Acceptance, Verification, optional Behaviour delta, AI assistance disclosure,
-Checklist, and optional Author. Behaviour delta is present only for PRs 1, 6,
-11, and 12A, where a runtime object, policy seam, live transition, or
-qualification policy has a concrete before-to-after description.
+Checklist, and optional Author. Behaviour delta is included where a runtime
+object, policy seam, live transition, or qualification policy has a concrete
+before-to-after description.
 
 The checklists are deliberately expressed as evidence/status lines while the
 drafts remain incomplete. Rapid's validator rejects every unchecked Markdown
@@ -51,7 +51,11 @@ status line says `pending`.
 | 11 | [Routing and APC planner](11-routing-apc-planner.md) | `feat/mtp-continuous-routing-planner` | `7ed6326c` | PR 10 / `6f9d4d70` | Local commit; **planning only, no live continuous token delivery** |
 | 12 | [Bounded qualification telemetry](12-telemetry-qualification.md) | `feat/mtp-qualification-telemetry` | `32904806` | PR 11 / `7ed6326c` | Local commit; model-free checks recorded, hardware qualification pending |
 | 12A | [Digest-gate reframing](12a-digest-gate-reframing.md) | `fix/mtp-digest-gate-oracles` | `9393de76` | PR 12 / `32904806` | Source `0995cbc` port; B1 exact hierarchy staged, hardware evidence pending |
-| 13 | [Documentation and paper](13-docs-paper.md) | `docs/continuous-self-mtp-batching` | `codex/rapid-mtp-13-docs-paper` tip | PR 12A / `9393de76`; exact Rapid artifacts remain open | Local commit; evidence/human review pending — do not submit |
+| 13 | [Dynamic wrapper membership](13-dynamic-membership-wrapper.md) | `feat/mtp-dynamic-membership-wrapper` | `be0b3e8c` | PR 12A / `9393de76` | Integration commit mirrored privately; publication branch/review pending |
+| 14 | [Runtime assembly and GDN rollback](14-runtime-rollback.md) | `feat/mtp-continuous-runtime-rollback` | extract from `d7cf5bbb` | PR 13 / `be0b3e8c` | Publication split, trained-head gates, and review pending |
+| 15 | [Live fixed-cohort delivery](15-live-fixed-cohort-delivery.md) | `feat/mtp-live-fixed-cohort-delivery` | extract from `d7cf5bbb` | PR 14 publication split | Queue-atomicity fix/test and review pending |
+| 16 | [Dynamic Qwen3.5 scheduler turnover](16-dynamic-scheduler-turnover.md) | `feat/mtp-dynamic-scheduler-turnover` | extract from `d7cf5bbb` | PR 15 publication split | Memory-cost calibration and trained-head gates pending |
+| 17 | [Documentation and paper](17-docs-paper.md) | `docs/continuous-self-mtp-batching` | rebase `580042d2` docs onto final splits | PR 16; exact Rapid artifacts remain open | Evidence/human review pending — do not submit |
 
 The commits are intentionally linear. A body may be rebased onto a merged
 predecessor, but its dependency must not be hidden by combining unrelated
@@ -70,19 +74,22 @@ separately reviewable.
 - `0995cbc` maps to PR 12A: batched-B1 is exact, B>1 is compared with its own
   B1 within the shape band, legacy cross-engine comparison is informative,
   and cache/transaction equality stays exact.
+- `1a0a2474` is later source-only admission work: a compute-saturation ceiling
+  and configurable per-lane transient estimate. It is not yet ported here.
+- `be0b3e8c` maps to PR 13; `d7cf5bbb` must be decomposed across PRs 14--16.
 
 ## Verification recorded in this packet
 
-PR bodies 1–6 retain their focused model-free results. The latest cumulative
-stack-tip battery passed 163 model-free tests, and all 28 changed Python files
-passed Ruff lint and formatting checks. PR 12 separately records 28 focused
-telemetry tests and 40 combined core-plus-telemetry tests, plus compile and
-import-isolation checks. These cumulative results are not substitutes for
-per-PR-head receipts.
+PR bodies 1–6 retain their focused historical results. On the amended current
+tip, 261 model-free tests pass and all 34 Python files changed from the Rapid
+base pass Ruff lint and formatting. Two vendored-handoff tests initially failed
+because their test doubles widened `uids` without widening `tokens`; the
+fixtures now model `GenerationBatch.extend()` and the full 261-test battery
+passes. These cumulative results are not substitutes for per-PR-head receipts.
 
-This formatting update performs documentation-only static checks. It does not
-run tests, import MLX, execute a model, use the GPU, start a service, benchmark
-a candidate, push, or submit anything.
+This sweep ran model-free tests that import the installed MLX Python package
+but perform no model load or benchmark; it did not intentionally execute a GPU
+workload, start a service, push, or submit anything.
 
 The existing evidence does not replace Ruff/formatting, the full unit suite,
 `pr_validate`, mutation spot-checks for production lines, scheduler stress,
@@ -94,22 +101,26 @@ exact candidate.
 Every submitted body must preserve these statements until new evidence changes
 them:
 
-- no commit in this packet has been pushed or submitted;
+- the consolidated integration tip is mirrored on private Forgejo, but no
+  publication branch is pushed and nothing is submitted upstream;
 - no Rapid candidate has reproduced the source prototype's throughput;
 - no Rapid performance claim is made;
-- PR 11 installs a metadata planner only; it does not route live token delivery
-  through `ContinuousMTPGenerationBatch`;
-- Rapid Flash/27B dynamic membership is not wired or hardware-qualified; the
-  source prototype's join passes do not transfer automatically;
-- fixed-membership batching remains non-operational in live serving until a
-  later coordinator and candidate-specific cache, digest, memory, throughput,
-  abort, and EOS gates land;
+- PR 11 is planner-only at its own head; later commits add a default-off live
+  coordinator and Qwen3.5 boundary joins/leaves;
+- Rapid Flash dynamic membership remains capability-refused; source Flash
+  evidence does not transfer to Rapid's distinct cache/runtime path;
+- the real-target Rapid smoke used a random head with zero acceptance and
+  cannot qualify trained-head acceptance, accepted-draft commits, or speedup;
+- live APC restore and transformed-distribution sampling are not wired;
+- live admission currently sets incremental draft-token memory cost to zero;
+- queue removal around driver creation/join is not failure-atomic and is a
+  blocking correction for the publication split;
 - AI assistance must name the touched files and human review actually completed
   before submission.
 
 ## Scope exclusions
 
 NAX QSA, PLE offload, fused-expert experiments, GDN normalization fusion,
-quantized/windowed batched caches, live continuous scheduler token delivery,
-and source-prototype benchmark prose are not implemented by PRs 1–12. They
-require independent mechanisms and qualification.
+quantized/windowed batched caches, Flash dynamic joins, live APC restore,
+sampled live delivery, and source-prototype benchmark claims remain outside the
+qualified Rapid surface. They require independent mechanisms and evidence.

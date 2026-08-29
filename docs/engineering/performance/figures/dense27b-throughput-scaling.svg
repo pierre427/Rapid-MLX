@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000" role="img" aria-labelledby="title desc">
+<title id="title">Dense 27B self-MTP throughput scaling</title>
+<desc id="desc">Paper figure generated from the adjacent machine-readable CSV files.</desc>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="80.0" y="68.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="600" fill="#16202a" style="">Dense 27B self-MTP scaling: throughput rises, then saturates</text>
+<text x="80.0" y="108.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="400" fill="#5f6b76" style="">Qwen3.8-27B-oQ4e-mtp, k=2, M=3N, context about 256; protocols shown separately</text>
+<text x="63.0" y="175.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" fill="#16202a" style="">A. Aggregate service throughput</text>
+<line x1="150.0" y1="750.0" x2="862.0" y2="750.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="758.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">0</text>
+<line x1="150.0" y1="658.3" x2="862.0" y2="658.3" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="666.3" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">50</text>
+<line x1="150.0" y1="566.7" x2="862.0" y2="566.7" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="574.7" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">100</text>
+<line x1="150.0" y1="475.0" x2="862.0" y2="475.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="483.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">150</text>
+<line x1="150.0" y1="383.3" x2="862.0" y2="383.3" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="391.3" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">200</text>
+<line x1="150.0" y1="291.7" x2="862.0" y2="291.7" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="299.7" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">250</text>
+<line x1="150.0" y1="200.0" x2="862.0" y2="200.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="136.0" y="208.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">300</text>
+<line x1="150.0" y1="200.0" x2="150.0" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="150.0" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">0</text>
+<line x1="285.6" y1="200.0" x2="285.6" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="285.6" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">8</text>
+<line x1="421.2" y1="200.0" x2="421.2" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="421.2" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">16</text>
+<line x1="556.9" y1="200.0" x2="556.9" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="556.9" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">24</text>
+<line x1="692.5" y1="200.0" x2="692.5" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="692.5" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">32</text>
+<line x1="828.1" y1="200.0" x2="828.1" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="828.1" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">40</text>
+<rect x="150.0" y="200.0" width="712.0" height="550.0" rx="0.0" fill="none" fill-opacity="1.0" stroke="#9aa6b2" stroke-width="1.5"/>
+<text x="506.0" y="820.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="400" fill="#16202a" style="">Active lanes N</text>
+<text x="83.0" y="475.0" transform="rotate(-90 83.0 475.0)" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" fill="#16202a">Aggregate throughput (token/s)</text>
+<line x1="421.2" y1="200.0" x2="421.2" y2="750.0" stroke="#25835b" stroke-width="3" stroke-dasharray="10 8"/>
+<text x="431.2" y="227.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#25835b" style="">measured knee / cap</text>
+<polyline points="167.0,658.0 183.9,628.8 217.8,600.8 285.6,495.4 421.2,404.2" fill="none" stroke="#2563a6" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="167.0" cy="658.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="183.9" cy="628.8" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="217.8" cy="600.8" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="285.6" cy="495.4" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="421.2" cy="404.2" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<polyline points="421.2,255.0 489.0,394.1 556.9,574.7 692.5,622.0" fill="none" stroke="#d97706" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="411.2" y="245.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<rect x="479.0" y="384.1" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<rect x="546.9" y="564.7" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<rect x="682.5" y="612.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<polygon points="828.1,642.2 841.1,655.2 828.1,668.2 815.1,655.2" fill="#b7352d" stroke="#ffffff" stroke-width="3"/>
+<text x="918.0" y="175.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" fill="#16202a" style="">B. Per-lane throughput tradeoff</text>
+<line x1="1005.0" y1="750.0" x2="1717.0" y2="750.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="991.0" y="758.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">0</text>
+<line x1="1005.0" y1="650.0" x2="1717.0" y2="650.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="991.0" y="658.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">10</text>
+<line x1="1005.0" y1="550.0" x2="1717.0" y2="550.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="991.0" y="558.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">20</text>
+<line x1="1005.0" y1="450.0" x2="1717.0" y2="450.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="991.0" y="458.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">30</text>
+<line x1="1005.0" y1="350.0" x2="1717.0" y2="350.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="991.0" y="358.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">40</text>
+<line x1="1005.0" y1="250.0" x2="1717.0" y2="250.0" stroke="#d9dee3" stroke-width="1.5"/>
+<text x="991.0" y="258.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">50</text>
+<line x1="1005.0" y1="200.0" x2="1005.0" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="1005.0" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">0</text>
+<line x1="1140.6" y1="200.0" x2="1140.6" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="1140.6" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">8</text>
+<line x1="1276.2" y1="200.0" x2="1276.2" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="1276.2" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">16</text>
+<line x1="1411.9" y1="200.0" x2="1411.9" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="1411.9" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">24</text>
+<line x1="1547.5" y1="200.0" x2="1547.5" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="1547.5" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">32</text>
+<line x1="1683.1" y1="200.0" x2="1683.1" y2="750.0" stroke="#d9dee3" stroke-width="1.2"/>
+<text x="1683.1" y="784.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#5f6b76" style="">40</text>
+<rect x="1005.0" y="200.0" width="712.0" height="550.0" rx="0.0" fill="none" fill-opacity="1.0" stroke="#9aa6b2" stroke-width="1.5"/>
+<text x="1361.0" y="820.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="400" fill="#16202a" style="">Active lanes N</text>
+<text x="938.0" y="475.0" transform="rotate(-90 938.0 475.0)" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" fill="#16202a">Per-lane throughput (token/s)</text>
+<line x1="1276.2" y1="200.0" x2="1276.2" y2="750.0" stroke="#25835b" stroke-width="3" stroke-dasharray="10 8"/>
+<text x="1286.2" y="227.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#25835b" style="">measured knee / cap</text>
+<polyline points="1022.0,248.0 1038.9,420.0 1072.8,546.0 1140.6,576.0 1276.2,632.0" fill="none" stroke="#2563a6" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="1022.0" cy="248.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="1038.9" cy="420.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="1072.8" cy="546.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="1140.6" cy="576.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<circle cx="1276.2" cy="632.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<polyline points="1276.2,581.0 1344.0,653.0 1411.9,710.0 1547.5,728.0" fill="none" stroke="#d97706" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="1266.2" y="571.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<rect x="1334.0" y="643.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<rect x="1401.9" y="700.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<rect x="1537.5" y="718.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<polygon points="1683.1,724.0 1696.1,737.0 1683.1,750.0 1670.1,737.0" fill="#b7352d" stroke="#ffffff" stroke-width="3"/>
+<circle cx="105.0" cy="882.0" r="10.0" fill="#2563a6" stroke="#ffffff" stroke-width="3"/>
+<text x="129.0" y="890.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#16202a" style="">single-process sweep (raw-log-attested)</text>
+<rect x="615.0" y="872.0" width="20.0" height="20.0" rx="0.0" fill="#d97706" fill-opacity="1.0" stroke="#ffffff" stroke-width="3"/>
+<text x="649.0" y="890.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#16202a" style="">fresh-process single-N (transcript/screenshot-attested)</text>
+<polygon points="1275.0,869.0 1288.0,882.0 1275.0,895.0 1262.0,882.0" fill="#b7352d" stroke="#ffffff" stroke-width="3"/>
+<text x="1299.0" y="890.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#16202a" style="">controller-selected N=40 run (raw-log-attested)</text>
+<text x="80.0" y="950.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" fill="#5f6b76" style="">The N=16 fresh-process point reaches 270.0 token/s (5.4x the N=1 baseline); the real N=40 controller run falls to 51.7 token/s.</text>
+</svg>

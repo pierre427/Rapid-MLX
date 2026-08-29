@@ -1,15 +1,16 @@
-# PR 13 — `docs(perf): document continuous self-MTP batching`
+# PR 17 — `docs(perf): document continuous self-MTP batching`
 
 Local commit: `codex/rapid-mtp-13-docs-paper` branch tip; its SHA changes when
 this self-describing packet is amended.
 
 Publication branch: `docs/continuous-self-mtp-batching`
 
-Depends on: PR 12A / `9393de76fd5e684c971b50bf631d2ce969b52b9c`
-and future exact Rapid artifacts.
+Depends on: PR 16 / publication dynamic-turnover split and future exact Rapid
+artifacts.
 
-Status: documentation is committed locally; qualification evidence and human
-review are pending, so do not submit yet.
+Status: documentation source is mirrored on the private Forgejo integration
+branch; the final publication branch is not pushed or submitted. Qualification
+evidence and human review are pending, so do not submit yet.
 
 ## Why
 
@@ -21,13 +22,15 @@ session rates are useful motivation but cannot be presented as Rapid results.
 
 - Document the transaction, wrapper, backend, residual verifier, planner, APC
   composition, telemetry, refusal, and rollback boundaries.
-- State explicitly that PR 11 is planning-only and that live continuous token
-  delivery still requires a later integration.
+- State explicitly that PR 11 is planning-only at its own head and that PRs
+  13--16 later add wrapper membership, runtime assembly, live delivery, and
+  Qwen3.5 turnover behind default-off controls.
 - Publish an engineering report and paper source whose Rapid tables point to
   raw artifacts and an exact candidate SHA.
 - Distinguish source-prototype raw-log/transcript evidence from Rapid
   measurements and from artifact-complete qualification.
-- State Flash fixed-cohort/dynamic-join boundaries beside relevant results.
+- State that Rapid Qwen3.5 turnover is wired but incompletely qualified, while
+  Rapid Flash remains capability-refused for dynamic joins.
 - Include reproducible commands, environment, model revisions, prompt/seed
   manifest, thermal order, aggregate/per-lane metrics, and limitations.
 
@@ -44,7 +47,7 @@ once the commit and evidence exist.
 ## Acceptance
 
 - Every Rapid number points to raw evidence and an exact candidate SHA.
-- Planning-only and live-delivery states are never conflated.
+- Historical planner-only and later live-delivery states are never conflated.
 - Commands/environment/model identity reproduce the reported battery.
 - Aggregate/per-lane outcomes, negative controls, and unsupported boundaries
   appear together.
@@ -52,21 +55,21 @@ once the commit and evidence exist.
 
 ## Verification
 
-The local TeX source passed a Pandoc parse (with one equation retained as raw
-TeX), local Markdown links resolved, and TeX environments were balanced.
-Before submission, rerun documented commands on the exact candidate and
-complete human technical/factual review. No model/service benchmark or Rapid
-performance qualification was performed while preparing this packet.
+The amended TeX source passes a Pandoc parse, local Markdown links resolve, and
+TeX environments balance. The later Rapid tip has only a
+real-target/random-head, zero-acceptance smoke with no checked-in raw artifact;
+it is not a production-head or performance qualification.
 
 ## AI assistance disclosure
 
 Codex assisted in writing and reviewing
 `docs/engineering/performance/continuous-self-mtp-batching.tex`,
-`docs/engineering/performance/rapid-qwen4-performance-pr-stack.md`, and the 16
-Markdown files under `docs/engineering/performance/qwen4-pr-stack/`. No
-generated figure or hardware-result artifact is included. Human factual and
-technical review plus independent evidence reruns remain pending; update this
-disclosure before submission.
+`docs/engineering/performance/rapid-qwen4-performance-pr-stack.md`, the
+Markdown packet under `docs/engineering/performance/qwen4-pr-stack/`, and the
+generated figure candidates under `docs/engineering/performance/figures/`.
+The figure CSVs retain per-row evidence grades; underlying lab-root logs are not
+packaged in this Rapid draft. Human factual/technical review and independent
+evidence reruns remain pending; update this disclosure before submission.
 
 > By submitting this PR I confirm I can explain the intent, risk, and behavior
 > of every non-generated change in this PR. For any generated / boilerplate /

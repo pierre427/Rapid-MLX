@@ -6,16 +6,19 @@ Depends on: PR 5 / `0a3be1757f8c904adcebc024bd1021ffab2bd18b`
 
 Publication branch: `feat/mtp-family-capabilities`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
 The model-neutral core cannot infer whether an injected model exposes a
 recursive hidden-state draft seam, fixed-cohort cache semantics, or qualified
 dynamic membership. Family claims must be immutable, explicit, conservative,
-and validated by the existing injectors. Flash and Qwen3.5 also require
-different join claims: the source evidence qualifies 27B joins but not
-Flash-Next joins.
+and validated by the existing injectors. Source evidence qualifies 27B joins
+exactly and Flash-Next joins only under the batched-B1 hierarchy: B1 remains
+exact, B>1 stays within the declared BF16 shape band, and cache/rollback state
+remains exact. That source result does not attest Rapid's distinct live path,
+so Rapid keeps Flash dynamic membership false pending its own qualification.
 
 ## Scope
 
@@ -64,7 +67,7 @@ Files:
   cases pass.
 - Tests use mocked forwards and AST/descriptor checks. No model weights, GPU,
   service, or performance run.
-- Stack-tip qualification battery: 163 model-free tests pass; all changed
+- Current-tip qualification battery: 261 model-free tests pass; all changed
   Python files pass `ruff check` and `ruff format --check`.
 - Pending before submission: per-PR full unit suite, contract mutation
   spot-check, PR-number `pr_validate`, human review, real injector smoke,

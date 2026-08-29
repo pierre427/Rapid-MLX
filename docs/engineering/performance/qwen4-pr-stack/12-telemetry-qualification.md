@@ -6,7 +6,8 @@ Depends on: PR 11 / `7ed6326cf2ab3e5aeb1eeae058816049d5a776c1`
 
 Publication branch: `feat/mtp-qualification-telemetry`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -58,7 +59,7 @@ Files:
 - Recorded combined core+telemetry result — 40 passed.
 - `py_compile`, import isolation (`mlx` and `mlx.core` unloaded), and an
   88-column scan passed.
-- Stack-tip qualification battery: 163 model-free tests pass; all changed
+- Current-tip qualification battery: 261 model-free tests pass; all changed
   Python files pass `ruff check` and `ruff format --check`.
 - CPU/static/model-free only. No GPU, model, service, hardware artifact, or
   Rapid performance qualification was produced.

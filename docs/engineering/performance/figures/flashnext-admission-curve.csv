@@ -1,0 +1,6 @@
+context_tokens,modeled_lane_gib_k2,admitted_n,compute_cap,stage,live_free_gib,hard_reserve_gib,source
+256,1.87,10,16,fewer_lanes,39.9,20.0,results/window-flashnext-lane-ladder/flash_next_dynamic.log
+1024,2.20,9,16,fewer_lanes,39.9,20.0,results/window-flashnext-lane-ladder/flash_next_dynamic.log
+4096,3.52,5,16,fewer_lanes,39.9,20.0,results/window-flashnext-lane-ladder/flash_next_dynamic.log
+16384,8.80,2,16,fewer_lanes,39.9,20.0,results/window-flashnext-lane-ladder/flash_next_dynamic.log
+32768,15.84,1,16,fewer_lanes,39.9,20.0,results/window-flashnext-lane-ladder/flash_next_dynamic.log

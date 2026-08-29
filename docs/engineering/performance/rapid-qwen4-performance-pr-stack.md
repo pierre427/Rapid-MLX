@@ -1,9 +1,11 @@
 # Rapid-MLX Qwen performance PR stack
 
 Status: locally staged integration plan on `codex/qwen4-performance-stack` at
-Rapid-MLX base `746522837c2cde5deca3784786ce06d10b45e66c`. Nothing in this
-stack has been pushed or submitted. No model or Metal/GPU validation was run
-during staging.
+Rapid-MLX base `746522837c2cde5deca3784786ce06d10b45e66c`. The consolidated
+tip `d7cf5bbb` is mirrored to private Forgejo; no publication branch is pushed
+and nothing is submitted upstream. This assertion sweep used model-free tests
+and static checks only. A separate real-target/random-head smoke is diagnostic,
+not a production-head or performance qualification.
 
 ## What current Rapid already contains
 
@@ -33,12 +35,16 @@ The stack explicitly captures all four final source commits:
 
 The first two map across the transaction, wrapper, backend, capability, and
 routing PRs. The latter two remain separately reviewable as PR 8A and PR 12A.
+Source commit `1a0a2474` later added a compute-saturation ceiling and
+configurable per-lane transient estimate; that admission change is not yet
+ported into this Rapid stack. Rapid integration commits `be0b3e8c` and
+`d7cf5bbb` map to PRs 13--16 below.
 
 ## Dependency sequence
 
-The staged submission plan contains fourteen code/test PRs plus the final
-documentation PR. Each publication branch follows Rapid's required prefix
-convention; local `codex/` branches remain private staging refs.
+The staged submission plan contains eighteen code/test PR entries (counting 8A
+and 12A) plus the final documentation PR. Each publication branch follows
+Rapid's required prefix convention; private `codex/` refs are staging only.
 
 | Order | Local commit / branch | Proposed PR | Default / hardware boundary |
 | ---: | --- | --- | --- |
@@ -56,16 +62,21 @@ convention; local `codex/` branches remain private staging refs.
 | 11 | `7ed6326c` / `codex/rapid-mtp-11-routing-apc` | `feat(mtp): plan continuous routing and APC restore` | Opt-in planner only; legacy `_step` remains live |
 | 12 | `32904806` / `codex/rapid-mtp-12-qualification-telemetry` | `feat(mtp): add bounded qualification telemetry` | Synthetic evidence can never qualify performance |
 | 12A | `9393de76` / `codex/rapid-mtp-12a-digest-gate-oracles` | `fix(mtp): separate digest qualification oracles` | Source `0995cbc`; B1 exact, B>1 band, cache exact |
-| 13 | current documentation tip | `docs(perf): document continuous self-MTP batching` | Paper, sequence, and PR packet; no Rapid perf claim |
+| 13 | `be0b3e8c` | `feat(mtp): implement dynamic membership in the continuous wrapper` | Wrapper boundary joins/leaves; still no scheduler delivery |
+| 14 | split from `d7cf5bbb` | `feat(mtp): assemble the continuous runtime and exact GDN rollback` | Default-off; trained-head rollback unqualified |
+| 15 | split from `d7cf5bbb` | `feat(mtp): deliver continuous fixed-cohort responses live` | Queue-atomicity fix/test blocks publication |
+| 16 | split from `d7cf5bbb` | `feat(mtp): admit and retire Qwen3.5 lanes at cycle boundaries` | Qwen3.5 only; memory cost and trained-head gates pending |
+| 17 | rebase `580042d2` docs last | `docs(perf): document continuous self-MTP batching` | Paper, figures, sequence, and PR packet; no Rapid perf claim |
 
-PR 11 deliberately stops before live continuous token delivery. Rapid's
-current scheduler and its external mlx-lm `GenerationBatch` do not expose the
-source prototype's prepared cohort at a safe ownership boundary. The opt-in
-therefore reaches a non-mutating admission/APC planner, while the incumbent
-single-lane vendored MTP `_step` remains authoritative. A later live-coordinator
-PR must bind PRs 7--9 and 8A to scheduler request delivery and pass the hardware matrix
-before the feature can be described as enabled. Model-specific QSA kernels
-remain separate side work and are not prerequisites.
+PR 11 deliberately stops before live continuous token delivery at its own
+head. PR 13 then exposes wrapper membership, and the combined integration
+commit `d7cf5bbb` adds default-off runtime assembly, scheduler delivery, and
+Qwen3.5 turnover. Publication must split that broad commit across PRs 14--16.
+The tip is greedy-only, does not consume APC prepared state, passes zero for
+incremental draft-token memory cost, and removes requests before driver
+creation/join is known to succeed. Those boundaries and the queue-atomicity fix
+must remain explicit. Qwen4/Flash dynamic membership is capability-refused.
+Model-specific QSA kernels remain separate side work and are not prerequisites.
 
 ## Side work: QSA kernels
 
@@ -79,10 +90,11 @@ rerun that measurement. Keep it behind `RAPID_MLX_QSA_BLOCK_SPARSE`.
 
 The actual lab MPP/NAX kernel is separate in `mlx-lm-unified`; committed JSON
 records median prefill gains of 16.0%, 31.6%, and 37.9% at 16K, 32K, and 64K
-with flat decode. A later default-on restart served one request and then exited
-without a fresh traceback. That unrooted incident keeps NAX default-off pending
-isolated, memory-observed service qualification. Do not mix either kernel into
-scheduler/MTP reviews.
+with flat decode. A session note records that a later default-on production
+restart returned one request and the service then disappeared without a new
+traceback. No process-level artifact captured that attempt, so it does not
+establish a kernel defect. NAX remains default-off pending an isolated,
+memory-observed rerun. Do not mix either kernel into scheduler/MTP reviews.
 
 Likewise, do not duplicate Rapid's fused gate/up path. A sorted-gather threshold
 change from 64 to the lab's measured 20 is a later micro-PR only after a
@@ -90,8 +102,8 @@ Rapid-target paired benchmark.
 
 ## Excluded work
 
-- Rapid-native incremental joins: the initial stack is fixed-cohort-only;
-  scheduler turnover and Rapid-native real-BF16 qualification are follow-ups.
+- Flash dynamic joins: source Flash evidence does not attest Rapid's separate
+  runtime, and the Rapid capability remains false pending real-BF16 gates.
 - NVMe PLE offload (swap abort gate failed).
 - `moe_shared_in_gather` (logprob and digest divergence).
 - GDN q/k normalization fusion (decode regression).
@@ -108,6 +120,11 @@ The no-GPU staging gate can cover Ruff, formatting, AST/import checks, mocked
 state-machine tests, fail-closed capability tests, and the repository's
 `no-mlx` suite. It cannot qualify inference behavior.
 
+Current receipt: 261 model-free tests pass on Python 3.12.13, and all 34 Python
+files changed from base pass Ruff lint and formatting. The tests are primarily
+pure-Python, mocked cache/runtime, and AST wiring coverage; they are not a live
+service integration result. No model or GPU workload was used for this sweep.
+
 Before any inference PR is called merge-ready, run on the exact candidate
 commit and immutable checkpoints:
 
@@ -120,8 +137,8 @@ commit and immutable checkpoints:
 5. EOS, max-token, abort, disconnect, UID reuse, and B=1↔B>1 handoff tests.
 6. APC miss, trivial hit, exact-boundary hit, radix reuse, eviction, and
    persistence/restart tests.
-7. Dynamic leave/join tests after Rapid scheduler turnover is wired. The source
-   Flash/27B join gates pass, but that does not qualify the unwired Rapid path.
+7. Dynamic leave/join tests on the publication scheduler splits. Qwen3.5 is
+   wired with only a random-head, zero-acceptance smoke; Flash remains refused.
 8. Interleaved cold/hot controls to bound Apple-Silicon thermal drift.
 9. Raw JSON/JSONL artifacts checked into the benchmark ledger with commands,
    environment, checkpoint revisions, and candidate SHA.
@@ -132,4 +149,6 @@ Each PR should use Rapid's current six-field template: Why, Scope, Non-goals,
 Acceptance, Verification, and Behaviour delta when applicable. Include a
 truthful AI-assistance disclosure naming the AI-touched files and the human
 review/verification performed. Do not claim the source prototype's 120.3 or
-82.0 token/s as Rapid results until the candidate Rapid commit reproduces them.
+82.0 token/s as Rapid results until the exact Rapid candidate reproduces them.
+Likewise, the Rapid random-head 18.4-to-87.3 ladder is a zero-acceptance
+batching diagnostic, not self-MTP uplift.

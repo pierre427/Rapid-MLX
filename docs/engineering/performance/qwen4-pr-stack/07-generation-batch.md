@@ -6,7 +6,8 @@ Depends on: PR 6 / `57df9e28ee38a6f15549a4d14eae6d34e7b40626`
 
 Publication branch: `feat/mtp-continuous-generation-batch`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -50,7 +51,7 @@ Files:
 
 - Commit contains focused pure-Python lifecycle tests for initial delivery,
   proposal/commit, stop, length, failure, detach, and Flash join refusal.
-- The focused file passed within the 163-test stack-tip model-free battery; all
+- The focused file passed within the 261-test current-tip model-free battery; all
   changed Python files pass `ruff check` and `ruff format --check`.
 - No GPU, MLX model, service, stress, or Rapid performance qualification was
   performed for this packet.
@@ -73,7 +74,7 @@ pending; update this disclosure before submission.
 
 ## Checklist
 
-- Targeted tests: **passed within the 163-test stack-tip battery**.
+- Targeted tests: **passed within the 261-test current-tip battery**.
 - Lint/format: **passed on the stack tip**; rerun on the final PR head.
 - PR-number self-validation: **pending until the PR exists**.
 - Critical-path mutation spot-check: **pending**.

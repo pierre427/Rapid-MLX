@@ -16,21 +16,24 @@ Autoregressive decode on unified-memory systems is commonly limited by the
 cost of streaming model weights for one token at a time.  Native multi-token
 prediction (MTP) reduces the number of target-model rounds for a single
 request, while continuous batching amortizes a target round across requests;
-existing serving paths generally implement only one of these dimensions at a
-time.  We describe \emph{continuous self-MTP batching}, a transactional
-decode engine that batches each request's current token and its MTP-proposed
-continuation in one target forward.  For $N$ homogeneous lanes and draft depth
-$k$, a cycle presents $M=(k+1)N$ verification positions while streaming the
-target weights once.  The design adds per-lane residual verification,
-per-row ragged rollback, persistent MTP-head state, dynamic lane admission,
-and prefix-cache composition.  In a local MLX prototype, aggregate decode on
+prior work has explored these dimensions both independently and jointly.  We
+describe and characterize an MLX-specific realization of \emph{continuous
+self-MTP batching}: a transactional decode engine that batches each request's
+current token and its MTP-proposed continuation in one target forward.  For
+$N$ homogeneous lanes and draft depth $k$, a cycle presents $M=(k+1)N$
+verification positions while streaming the target weights once.  The design
+adds per-lane residual verification, per-row ragged rollback, persistent
+MTP-head state, dynamic lane admission, and prefix-cache composition.  In a
+local MLX prototype, aggregate decode on
 Qwen3.8-Flash-Next rose from 63.4 to 120.3 token/s between $N=1$ and $N=4$;
 Qwen3.8-27B rose from 49.0 to 82.0 token/s.  These are session-trace
 measurements from the source prototype, not measurements of the Rapid-MLX
-port staged with this paper.  In the source prototype, fixed cohorts and
-mid-flight joins for both model families pass their available hierarchical
-hardware gates.  The staged Rapid port remains fixed-cohort-only pending live
-scheduler integration and Rapid-native dynamic-membership qualification.
+port staged with this paper.  Flash is raw-log-attested and 27B is
+transcript-attested; neither record is artifact-complete.  In the source
+prototype, fixed cohorts and mid-flight joins for both families pass their
+available hierarchical gates.  Rapid tip \texttt{d7cf5bbb} now contains a
+default-off live coordinator and Qwen3.5 boundary joins/leaves; Rapid
+Qwen4/Flash remains fixed-cohort and capability-refused for dynamic join.
 \end{abstract}
 
 \section{Motivation}
@@ -111,7 +114,9 @@ declared BF16 batch-shape band.  The older single-lane-versus-$B>1$ comparison
 is retained as an informative compatibility diagnostic.  Cache equality,
 rollback, commit, and detach remain bit-exact gates, so distributional token
 tolerance cannot mask transaction corruption.  This hierarchy follows source
-commit \texttt{0995cbc}.
+commit \texttt{0995cbc}.  Rapid PR 12A encodes the offline classification
+policy only: an external runner must calculate the numeric band, bind each
+B$>$1 lane to its matching batched-B1 run, and persist the raw evidence.
 
 \subsection{Propose--commit transaction}
 Every cycle is a two-phase transaction:
@@ -143,9 +148,10 @@ increments a membership epoch.  Model-family capability controls are
 independent.  In the source prototype, 27B joins are token-exact and Flash-Next
 joins pass the real-BF16 hierarchical gate distributionally: batched-B1 remains
 exact, B$>$1 lanes---including the joined lane---stay inside the declared
-batch-shape band, and cache/rollback contracts remain exact.  The staged Rapid
-capability remains fixed-cohort-only because dynamic membership is not yet
-wired or qualified in Rapid.
+batch-shape band, and cache/rollback contracts remain exact.  This source result
+does not attest Rapid's distinct cache/runtime path.  Rapid wires Qwen3.5
+dynamic membership behind default-off controls but keeps Qwen4/Flash
+capability-refused pending Rapid-native BF16 qualification.
 
 Admission is memory-aware and degrades monotonically:
 \begin{equation}
@@ -154,9 +160,9 @@ Admission is memory-aware and degrades monotonically:
 \end{equation}
 The Rapid-MLX planning layer reuses the server's existing allocator cap and
 KV-footprint accounting instead of introducing a second memory model.
-Decisions occur only between transactions, before widening a cache batch.  At
-this staging revision the planner is opt-in and non-mutating; it does not yet
-replace Rapid's live single-lane MTP generation step.
+Decisions occur only between transactions, before widening a cache batch.
+The current live path is opt-in, but its incremental draft-token cost is still
+passed as zero, so depth-dependent memory degradation is not yet calibrated.
 
 \section{Prefix-cache composition}
 An exact prefix-cache record for self-MTP must represent one token boundary
@@ -180,7 +186,9 @@ The source implementation is preserved in four local commits:
 \texttt{92576ced} (batched engine and Flash-Next gates),
 \texttt{93d7aa9a} (27B/Qwen3.5 qualification and join tests),
 \texttt{393eddf} (cycle-local QSA selection preservation), and
-\texttt{0995cbc} (batched-B1 digest-oracle reframing).  Together they contain
+\texttt{0995cbc} (batched-B1 digest-oracle reframing), and
+\texttt{1a0a2474} (compute-saturation admission ceiling and configurable
+per-lane transient estimate).  Together they contain
 an $N$-lane propose--commit core, a batch wrapper, server routing, per-lane RNG,
 ragged cache lifecycle, admission, QSA draft reuse, and the final qualification
 hierarchy.
@@ -189,7 +197,10 @@ series separates handoff correctness, pure transaction contracts, ragged
 rollback, APC prepared state, the fixed-cohort core, family capabilities,
 generation ownership, the MLX data plane, QSA selection sharing, transformed
 residual sampling, planner routing, bounded qualification telemetry, and digest
-oracle policy into reviewable commits.
+oracle policy into reviewable commits.  Rapid commits \texttt{be0b3e8c} and
+\texttt{d7cf5bbb} subsequently add wrapper membership and a combined runtime,
+rollback, driver, scheduler-delivery, and Qwen3.5-turnover integration.  The
+publication plan splits that broad final commit into narrower review layers.
 
 Rapid already contains the Qwen4 architecture, vectorized QSA mask
 construction, native one-layer MTP, batched compressed-key prefill, atomic
@@ -205,12 +216,12 @@ kernel.  Its upstream M3 Ultra evidence reports a 10.7\% prefill gain at 32K
 with unchanged decode; this local rebase did not independently rerun that
 measurement.  Separately, the lab's MPP/NAX QSA prototype measured median
 prefill gains of 16.0\%, 31.6\%, and 37.9\% at 16K, 32K, and 64K with flat
-decode, preserved in committed per-arm JSON artifacts.  A later default-on
-production restart served one request and then exited without a fresh Python
-traceback.  The incident is not root-caused---first-use compilation or memory
-pressure is only a hypothesis---so NAX remains default-off pending isolated,
-memory-observed service qualification.  Neither kernel is part of the headline
-self-MTP series.  NVMe PLE offload, shared-in-gather MoE, GDN normalization
+decode, preserved in committed per-arm JSON artifacts.  A session note records
+that a later default-on production restart returned one request and the service
+then disappeared without a new traceback.  No process-level artifact captured
+that attempt, so it does not establish a kernel defect.  NAX remains
+default-off pending an isolated, memory-observed rerun.  Neither kernel is part
+of the headline self-MTP series.  NVMe PLE offload, shared-in-gather MoE, GDN normalization
 fusion, and an untracked fused-expert kernel are also excluded because they
 failed a gate or lack real-model validation.
 
@@ -256,13 +267,18 @@ immutable revisions, per-sample timings, thermal/interleave order, digests,
 memory, and acceptance.  We therefore label Flash raw-log-attested and 27B
 transcript-attested, pending a machine-readable rerun.
 
-The Rapid staging effort did not run a model or inference benchmark.  One
-legacy CLI regression file accidentally constructed tiny
-\texttt{mlx.core} arrays during a broader test sweep, so this paper does not
-claim that Metal was never initialized; all subsequent checks were restricted
-to pure-Python, NumPy, AST, lint, and compilation.  Therefore the Rapid stack
-is not claimed merge-ready or performance-qualified.  Its later acceptance
-matrix must use
+The initial Rapid PRs 1--13 staging effort was model-free.  A later limited
+smoke exercised the real Qwen3.8-27B target trunk with an explicitly test-only
+randomly initialized MTP head.  Acceptance was zero at every cohort size; the
+observed ladder rose from 18.4 token/s at $N=1$ to 87.3 at $N=16$
+(4.74$\times$).  That run exercised real-Metal runtime assembly, correction-token
+delivery, a mid-flight join, per-lane leave, and cleanup, but it has no
+checked-in raw artifact.  A checked-in recovery CSV binds every row to the
+session trace, random-head warning, and zero-acceptance boundary; it is not a
+substitute for raw output.  The run does not qualify trained-head acceptance,
+accepted-draft commit behavior, production throughput, or self-MTP speedup.
+The Rapid stack is therefore not claimed merge-ready or
+performance-qualified.  Its acceptance matrix must use
 immutable checkpoints, process isolation, interleaved thermal controls,
 prompt/seed manifests, per-lane and aggregate rates, acceptance, active and
 peak memory, cache equality, abort/EOS behavior, APC hits, and join/leave
@@ -271,9 +287,8 @@ discriminators.
 \section{Excluded work}
 The staged series deliberately excludes the following paths:
 \begin{itemize}
-  \item Rapid-native incremental joins: the initial upstream stack ships fixed
-        cohorts; scheduler admission/turnover and Rapid-native real-BF16
-        dynamic-membership qualification remain follow-up work;
+  \item Rapid Qwen4/Flash dynamic joins, which remain capability-refused until
+        the distinct Rapid path passes the real-BF16 hierarchical gate;
   \item NVMe PLE offload, whose swap abort gate failed;
   \item \texttt{moe\_shared\_in\_gather}, which diverged in logprobs and
         output digest;
@@ -287,19 +302,18 @@ The staged series deliberately excludes the following paths:
 \end{itemize}
 
 \section{Limitations and open work}
-First, live scheduler token delivery is not wired in this Rapid staging tip:
-the opt-in reaches an APC-aware fixed-cohort planner, while Rapid's incumbent
-vendored single-lane MTP step remains authoritative.  The source implementation
-demonstrates the end-to-end coordinator, but the Rapid ownership boundary needs
-a dedicated follow-up PR and hardware acceptance.  Second, aggregate
+First, the live scheduler removes requests from its queue before driver
+creation or join is known to succeed; publication requires construct-first or
+exception restoration plus fault injection.  Second, APC prepared state exists
+as a planner contract but is not consumed by the live runtime.  Third, the live
+route is greedy-only even though transformed verification exists offline.
+Fourth, live admission currently passes zero incremental draft-token memory
+cost, so depth-dependent degradation needs calibration.  Fifth, aggregate
 throughput trades against per-lane inter-token latency and must be evaluated
-under arrival processes, not only fixed cohorts.  Third, heterogeneous depth
-complicates shapes and is excluded from the first Rapid coordinator.  Fourth,
-quantized and windowed caches need independent rollback proofs.  Fifth, the
-source prototype's distributional Flash join pass does not qualify the unwired
-Rapid membership path; fixed membership is the safe Rapid boundary.  Finally,
-results on one unified-memory operating point do not establish portability
-across model sizes, quantization, context lengths, or Apple SoCs.
+under arrival processes.  Heterogeneous depth and quantized/windowed caches
+need independent proofs.  Finally, source Flash join evidence does not qualify
+Rapid Flash, and results at one unified-memory operating point do not establish
+portability across model sizes, quantization, context lengths, or Apple SoCs.
 
 \section{Conclusion}
 Continuous self-MTP batching treats speculative decode as an iteration-level
@@ -307,12 +321,72 @@ transaction rather than a private per-request generator.  It composes the two
 available batching axes---tokens within a speculative block and requests
 within a service cohort---while preserving per-lane distribution, rollback,
 and cache ownership.  The source results show substantial aggregate-throughput
-headroom.  The staged Rapid integration deliberately separates proven
-fixed-membership mechanics from unported Rapid dynamic-membership and
-candidate-kernel work, so later hardware qualification can promote each
-capability without weakening the fail-closed boundary.
+headroom.  The staged Rapid integration separates the historical planner,
+wrapper membership, runtime/rollback, fixed-cohort live delivery, and Qwen3.5
+turnover into review layers.  Qwen3.5 dynamic membership is wired but not
+trained-head-qualified; Qwen4/Flash remains refused.  This lets later hardware
+qualification promote each capability without weakening the fail-closed
+boundary.
 
-\begin{thebibliography}{9}
+\section{Prior art and novelty boundary}
+The broad concepts of self-speculative MTP, batched speculative verification,
+and continuously scheduled speculative serving are established prior art.
+Meta's MTP work used a model's own prediction heads for self-speculative
+decoding and explicitly supported heterogeneous batch sizes~\cite{metamtp2024}.
+BASS jointly parallelized the request and draft-token dimensions, including
+per-sequence acceptance lengths, ragged KV handling, and sharing model-weight
+reads across the batch~\cite{bass2024}.  TurboSpec incorporated
+speculative proposal and collective target verification into an online
+continuous-batching system with adaptive proposal lengths~\cite{smartspec2024}.
+DeepSeek-V3 established recurrent native MTP as a speculative drafter, although
+its report did not specify the continuous-serving cache lifecycle
+\cite{deepseek2024}.
+
+Production-oriented open-source systems further narrow the claim.  vLLM added
+native DeepSeek MTP to its continuously scheduled online server and tested
+multi-request execution and preemption~\cite{vllmmtp}.  SGLang documents native
+MTP at substantial concurrency and experimental draft/verification overlap
+\cite{sglangmtp}.  TensorRT-LLM documents recurrent MTP-head reuse, a distinct
+MTP KV state, rejected-token eviction and target-cache rewind, and integration
+with its overlap scheduler~\cite{trtmtp}.  AngelSpec treats shared batch-level
+verification as a resource allocated across concurrent requests; its closest
+cross-request mechanism is evaluated separately from its recurrent-MTP arm,
+so it is strong adjacent rather than evidence of the exact construction here
+\cite{angelspec2026}.
+
+The closest MLX precedent found in this sweep is AirRunner's batched native-MTP
+branch.  Commit \texttt{79a8367} implements $B>1$ MTP with per-sequence
+acceptance, \texttt{GenerationBatch.extend()} and filtering, and selective SSM
+and KV rollback; \texttt{99d0cc8} follows by committing accepted-token MTP
+cache state in a batched forward~\cite{airrunnermtp}.  The commit objects carry
+May 2026 author dates and August 2026 rebased committer dates, both preceding
+the present 29 August prototype.  This is direct prior art for generic claims
+about batched native MTP, batch resize/filter primitives, or selective
+hybrid-cache rollback.  Its published cycle drafts one MTP token and verifies $M=2N$;
+the present engine targets recursive depth two and $M=3N$, and extends the
+transaction to Qwen's GDN, PLE, QSA, APC, lane-owned RNG, and admission state.
+
+The \texttt{mlxcel} runtime independently added $B>1$ MTP/DFlash server cohorts
+in May 2026 and later admitted ragged prompt lengths~\cite{mlxcelmtp}.  Its
+current scheduler documentation states that each $B>1$ speculative burst is a
+compatible cohort fixed at dispatch and run to completion inside one scheduler
+tick.  It is therefore direct Apple/MLX prior art for batched MTP, but not for
+admitting replacements at transaction boundaries inside an already-live
+$B>1$ speculative service cohort.
+
+Accordingly, this paper does \emph{not} claim the invention or first use of
+batched MTP, continuous speculative serving, per-lane rollback, or their broad
+combination.  Its contribution is the implementation and characterization of
+a narrower conjunction: depth-two $M=3N$ execution for Qwen hybrid state in
+MLX; a single propose--commit boundary spanning KV, recurrence, PLE, QSA, and
+MTP-head state; lane-local transformed-sampling RNG and APC ownership; and, in
+the source prototype, dual memory/compute admission validated at distinct dense
+and MoE operating points.  This bounded primary-source sweep found no
+disclosure of that full
+conjunction.  ``No exact prior found'' is a scoped research result, not proof
+of absence.
+
+\begin{thebibliography}{99}
 \bibitem{leviathan2023}
 Y. Leviathan, M. Kalman, and Y. Matias.
 \newblock Fast inference from transformers via speculative decoding.
@@ -340,6 +414,59 @@ G.-I. Yu et al.
 models.
 \newblock \emph{OSDI}, 2022.
 \url{https://www.usenix.org/conference/osdi22/presentation/yu}.
+
+\bibitem{metamtp2024}
+A. Gloeckle et al.
+\newblock Better \& faster large language models via multi-token prediction.
+\newblock 2024. \url{https://arxiv.org/abs/2404.19737}.
+
+\bibitem{bass2024}
+H. Qian et al.
+\newblock BASS: Batched attention-optimized speculative sampling.
+\newblock 2024. \url{https://arxiv.org/abs/2404.15778}.
+
+\bibitem{smartspec2024}
+X. Liu et al.
+\newblock TurboSpec: Closed-loop speculation control system for optimizing
+LLM serving goodput.
+\newblock 2024. \url{https://arxiv.org/abs/2406.14066}.
+
+\bibitem{vllmmtp}
+vLLM contributors.
+\newblock DeepSeek native-MTP speculative decoding, pull request 12755.
+\newblock 2025.
+\url{https://github.com/vllm-project/vllm/pull/12755}.
+
+\bibitem{sglangmtp}
+SGLang contributors.
+\newblock DeepSeek-V3 and native-MTP serving documentation.
+\newblock \url{https://github.com/sgl-project/sglang/blob/main/docs/basic_usage/deepseek_v3.md}.
+
+\bibitem{trtmtp}
+NVIDIA TensorRT-LLM contributors.
+\newblock DeepSeek-R1 MTP implementation and optimization.
+\newblock \url{https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.md}.
+
+\bibitem{angelspec2026}
+H. Liu et al.
+\newblock AngelSpec: Towards real-world high performance inference with
+speculative decoding.
+\newblock 2026. \url{https://arxiv.org/abs/2607.25852}.
+
+\bibitem{airrunnermtp}
+AirRunner.
+\newblock Batched speculative decoding ($B>1$) with selective rollback;
+accepted-token MTP-cache follow-up.
+\newblock 2026.
+\url{https://github.com/AirRunner/mlx-lm/commit/79a836750bd5b363cc1ec9a24df85741376afe5e};
+\url{https://github.com/AirRunner/mlx-lm/commit/99d0cc8b090e5e8322534fe31f695b607bd1754e}.
+
+\bibitem{mlxcelmtp}
+lablup \texttt{mlxcel} contributors.
+\newblock Batched MTP/DFlash server dispatch and continuous-batching design.
+\newblock 2026.
+\url{https://github.com/lablup/mlxcel/commit/6a816947e11882b5f174156c7c483acfd00ca409};
+\url{https://github.com/lablup/mlxcel/blob/main/docs/CONTINUOUS_BATCHING.md}.
 \end{thebibliography}
 
 \end{document}

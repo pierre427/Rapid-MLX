@@ -6,7 +6,8 @@ Depends on: PR 1 / `de2c5c9a5047edfacbd3b847dbd8015568a698b1`
 
 Publication branch: `feat/mtp-batched-transaction-contracts`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -58,7 +59,7 @@ Files:
   `python3 -m pytest -q tests/test_batched_self_mtp_contract.py` — 24 test
   cases pass.
 - Combined focused stack: 70 tests pass in 0.29 seconds.
-- Stack-tip qualification battery: 163 model-free tests pass; all changed
+- Current-tip qualification battery: 261 model-free tests pass; all changed
   Python files pass `ruff check` and `ruff format --check`.
 - Model-free only. No GPU, MLX model, service, stress, or performance run.
 - Pending before submission: per-PR full unit suite, contract mutation

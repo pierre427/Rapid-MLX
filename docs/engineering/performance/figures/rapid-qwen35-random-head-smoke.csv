@@ -1,0 +1,6 @@
+evidence_grade,model_trunk,mtp_head,n,aggregate_tps,acceptance_rate,claim_boundary,source
+session_trace_attested,Qwen3.8-27B oQ4e,random_init_test_only,1,18.4,0.00,real_target_batching_diagnostic_only,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c line 13110
+session_trace_attested,Qwen3.8-27B oQ4e,random_init_test_only,2,26.6,0.00,real_target_batching_diagnostic_only,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c line 13110
+session_trace_attested,Qwen3.8-27B oQ4e,random_init_test_only,4,32.9,0.00,real_target_batching_diagnostic_only,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c line 13110
+session_trace_attested,Qwen3.8-27B oQ4e,random_init_test_only,8,57.7,0.00,real_target_batching_diagnostic_only,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c line 13110
+session_trace_attested,Qwen3.8-27B oQ4e,random_init_test_only,16,87.3,0.00,real_target_batching_diagnostic_only,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c line 13110

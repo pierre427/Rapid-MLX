@@ -6,7 +6,8 @@ Depends on: PR 2 / `203cb5be39b9deb391aee76a5d793187b7693559`
 
 Publication branch: `feat/mtp-ragged-cache-rollback`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 
@@ -55,7 +56,7 @@ Files:
 - Current stacked checkout:
   `python3 -m pytest -q tests/test_mtp_ragged_cache.py` — 17 test cases pass.
 - Combined focused stack: 70 tests pass in 0.29 seconds.
-- Stack-tip qualification battery: 163 model-free tests pass; all changed
+- Current-tip qualification battery: 261 model-free tests pass; all changed
   Python files pass `ruff check` and `ruff format --check`.
 - Model-free/fake-array evidence only. No MLX model, GPU, service, stress, or
   performance run.

@@ -6,7 +6,8 @@ Depends on: PR 9 / `7d4a9370215d9e35d11bf7642aaf1c7ee44df56a`
 
 Publication branch: `fix/mtp-handoff-regression-tests`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 

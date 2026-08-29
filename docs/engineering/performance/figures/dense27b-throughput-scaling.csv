@@ -1,0 +1,11 @@
+protocol,evidence_grade,n,m,aggregate_tps,per_lane_tps,free_after_gib,source
+single_process_sweep,raw_log_attested,1,3,50.2,50.2,90.4,results/window-dense27b-lane-ladder/static_dynamic_27b.log
+single_process_sweep,raw_log_attested,2,6,66.1,33.0,87.2,results/window-dense27b-lane-ladder/static_dynamic_27b.log
+single_process_sweep,raw_log_attested,4,12,81.4,20.4,79.5,results/window-dense27b-lane-ladder/static_dynamic_27b.log
+single_process_sweep,raw_log_attested,8,24,138.9,17.4,66.5,results/window-dense27b-lane-ladder/static_dynamic_27b.log
+single_process_sweep,raw_log_attested,16,48,188.6,11.8,43.8,results/window-dense27b-lane-ladder/static_dynamic_27b.log
+fresh_process_single_n,transcript_screenshot_attested,16,48,270.0,16.9,30.0,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c plus supplied screenshot
+fresh_process_single_n,transcript_screenshot_attested,20,60,194.1,9.7,32.6,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c plus supplied screenshot
+fresh_process_single_n,transcript_screenshot_attested,24,72,95.6,4.0,14.4,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c plus supplied screenshot
+fresh_process_single_n,transcript_screenshot_attested,32,96,69.8,2.2,22.8,Claude session 1c3a4880-ce64-415d-9bb0-b06f7a29f73c plus supplied screenshot
+controller_selected_run,raw_log_attested,40,120,51.7,1.3,42.2,results/window-dense27b-lane-ladder/dynamic_only_27b.log

@@ -6,8 +6,9 @@ Depends on: PR 10 / `6f9d4d706c61a2b79c99331c07350888661cc158`
 
 Publication branch: `feat/mtp-continuous-routing-planner`
 
-Status: local-only; not pushed or submitted. **Planning only: no live
-continuous token delivery.**
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch. **At this
+PR head, planning only: no live continuous token delivery.**
 
 ## Why
 
@@ -65,7 +66,7 @@ Files:
   default-off CLI/config/scheduler seam.
 - Source inspection confirms scheduler comments and control flow retain
   `_install_mtp_vendored` as the live data plane.
-- The focused file passed within the 163-test stack-tip model-free battery; all
+- The focused file passed within the 261-test current-tip model-free battery; all
   changed Python files pass `ruff check` and `ruff format --check`.
 - No GPU, model, service, stress, live continuous delivery, or Rapid
   performance qualification was performed for this packet.
@@ -97,7 +98,7 @@ before submission.
 
 ## Checklist
 
-- Targeted tests: **passed within the 163-test stack-tip battery**.
+- Targeted tests: **passed within the 261-test current-tip battery**.
 - Lint/format: **passed on the stack tip**; rerun on the final PR head.
 - PR-number self-validation: **pending until the PR exists**.
 - Critical-path mutation spot-check: **pending**.

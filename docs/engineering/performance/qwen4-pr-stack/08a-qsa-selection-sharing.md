@@ -6,7 +6,8 @@ Depends on: PR 8 / `f48fadb21237c7e94cddacd6fd3dfb20a204b83e`
 
 Publication branch: `feat/mtp-qsa-selection-sharing`
 
-Status: local-only; not pushed or submitted.
+Status: publication branch not pushed and nothing submitted upstream; this
+commit is mirrored only on the private Forgejo integration branch.
 
 ## Why
 

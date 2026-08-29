@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
+<title id="title">Continuous self-MTP execution workflow</title>
+<desc id="desc">Paper figure generated from the adjacent machine-readable CSV files.</desc>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="80.0" y="68.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="600" fill="#16202a" style="">Continuous self-MTP composes two independent batching axes</text>
+<text x="80.0" y="108.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="400" fill="#5f6b76" style="">Each panel is one target-model weight stream; the lower-right cell is the new execution shape</text>
+<text x="1050.0" y="160.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#25835b" style="">more requests per target pass</text>
+<line x1="560.0" y1="170.0" x2="1540.0" y2="170.0" stroke="#25835b" stroke-width="3"/>
+<polygon points="1540.0,170.0 1524.0,161.0 1524.0,179.0" fill="#25835b" stroke="#25835b" stroke-width="1"/>
+<text x="48" y="610" transform="rotate(-90 48 610)" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#d97706">more proposed positions per request</text>
+<line x1="64.0" y1="290.0" x2="64.0" y2="920.0" stroke="#d97706" stroke-width="3"/>
+<polygon points="64.0,920.0 55.0,904.0 73.0,904.0" fill="#d97706" stroke="#d97706" stroke-width="1"/>
+<rect x="110.0" y="210.0" width="760.0" height="350.0" rx="12.0" fill="#ffffff" fill-opacity="1.0" stroke="#9aa6b2" stroke-width="2"/>
+<text x="138.0" y="252.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" fill="#2563a6" style="">A</text>
+<text x="182.0" y="252.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="600" fill="#16202a" style="">Ordinary autoregressive decode</text>
+<text x="182.0" y="285.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#5f6b76" style="">1 request x 1 position</text>
+<text x="163.0" y="360.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">A</text>
+<rect x="185.0" y="335.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="223.0" y="361.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<rect x="500.0" y="330.0" width="295.0" height="105.0" rx="10.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2.5"/>
+<text x="647.5" y="369.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#2563a6" style="">target forward</text>
+<text x="647.5" y="400.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#5f6b76" style="">stream weights once</text>
+<line x1="450.0" y1="383.0" x2="500.0" y2="383.0" stroke="#2563a6" stroke-width="3"/>
+<polygon points="500.0,383.0 486.0,375.0 486.0,391.0" fill="#2563a6" stroke="#2563a6" stroke-width="1"/>
+<text x="490.0" y="485.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="600" fill="#25835b" style="">one next-token position</text>
+<text x="490.0" y="517.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#5f6b76" style="">1 position per weight stream</text>
+<rect x="920.0" y="210.0" width="760.0" height="350.0" rx="12.0" fill="#ffffff" fill-opacity="1.0" stroke="#9aa6b2" stroke-width="2"/>
+<text x="948.0" y="252.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" fill="#2563a6" style="">B</text>
+<text x="992.0" y="252.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="600" fill="#16202a" style="">Ordinary continuous batching</text>
+<text x="992.0" y="285.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#5f6b76" style="">N requests x 1 position</text>
+<text x="973.0" y="360.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">A</text>
+<rect x="995.0" y="335.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="1033.0" y="361.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<text x="973.0" y="407.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">B</text>
+<rect x="995.0" y="382.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="1033.0" y="408.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<text x="973.0" y="454.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">C</text>
+<rect x="995.0" y="429.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="1033.0" y="455.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<rect x="1310.0" y="330.0" width="295.0" height="105.0" rx="10.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2.5"/>
+<text x="1457.5" y="369.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#2563a6" style="">target forward</text>
+<text x="1457.5" y="400.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#5f6b76" style="">stream weights once</text>
+<line x1="1260.0" y1="383.0" x2="1310.0" y2="383.0" stroke="#2563a6" stroke-width="3"/>
+<polygon points="1310.0,383.0 1296.0,375.0 1296.0,391.0" fill="#2563a6" stroke="#2563a6" stroke-width="1"/>
+<text x="1300.0" y="485.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="600" fill="#25835b" style="">one next-token position per lane</text>
+<text x="1300.0" y="517.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#5f6b76" style="">N positions per weight stream</text>
+<rect x="110.0" y="610.0" width="760.0" height="350.0" rx="12.0" fill="#ffffff" fill-opacity="1.0" stroke="#9aa6b2" stroke-width="2"/>
+<text x="138.0" y="652.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" fill="#2563a6" style="">C</text>
+<text x="182.0" y="652.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="600" fill="#16202a" style="">Single-request self-MTP</text>
+<text x="182.0" y="685.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#5f6b76" style="">1 request x (k+1) positions</text>
+<rect x="177.0" y="698.0" width="280.0" height="30.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="317.0" y="720.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">MTP head proposes d1, d2</text>
+<text x="163.0" y="760.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">A</text>
+<rect x="185.0" y="735.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="223.0" y="761.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<rect x="277.0" y="735.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="315.0" y="761.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d1</text>
+<rect x="369.0" y="735.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="407.0" y="761.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d2</text>
+<rect x="500.0" y="730.0" width="295.0" height="105.0" rx="10.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2.5"/>
+<text x="647.5" y="769.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#2563a6" style="">target verify</text>
+<text x="647.5" y="800.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#5f6b76" style="">stream weights once</text>
+<line x1="450.0" y1="783.0" x2="500.0" y2="783.0" stroke="#2563a6" stroke-width="3"/>
+<polygon points="500.0,783.0 486.0,775.0 486.0,791.0" fill="#2563a6" stroke="#2563a6" stroke-width="1"/>
+<text x="490.0" y="885.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="600" fill="#25835b" style="">accept longest verified prefix; rollback suffix</text>
+<text x="490.0" y="917.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#5f6b76" style="">up to k+1 positions per weight stream</text>
+<rect x="920.0" y="610.0" width="760.0" height="350.0" rx="12.0" fill="#e9f6ef" fill-opacity="1.0" stroke="#25835b" stroke-width="4"/>
+<text x="948.0" y="652.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" fill="#25835b" style="">D</text>
+<text x="992.0" y="652.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="600" fill="#16202a" style="">Continuous self-MTP batching</text>
+<text x="992.0" y="685.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#5f6b76" style="">N requests x (k+1) positions</text>
+<rect x="987.0" y="698.0" width="280.0" height="30.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="1127.0" y="720.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">MTP head proposes d1, d2</text>
+<text x="973.0" y="760.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">A</text>
+<rect x="995.0" y="735.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="1033.0" y="761.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<rect x="1087.0" y="735.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="1125.0" y="761.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d1</text>
+<rect x="1179.0" y="735.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="1217.0" y="761.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d2</text>
+<text x="973.0" y="807.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">B</text>
+<rect x="995.0" y="782.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="1033.0" y="808.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<rect x="1087.0" y="782.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="1125.0" y="808.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d1</text>
+<rect x="1179.0" y="782.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="1217.0" y="808.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d2</text>
+<text x="973.0" y="854.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" fill="#2563a6" style="">C</text>
+<rect x="995.0" y="829.0" width="76.0" height="38.0" rx="5.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2"/>
+<text x="1033.0" y="855.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#2563a6" style="">t</text>
+<rect x="1087.0" y="829.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="1125.0" y="855.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d1</text>
+<rect x="1179.0" y="829.0" width="76.0" height="38.0" rx="5.0" fill="#fff3df" fill-opacity="1.0" stroke="#d97706" stroke-width="2"/>
+<text x="1217.0" y="855.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" fill="#d97706" style="">d2</text>
+<rect x="1310.0" y="730.0" width="295.0" height="105.0" rx="10.0" fill="#eaf2fb" fill-opacity="1.0" stroke="#2563a6" stroke-width="2.5"/>
+<text x="1457.5" y="769.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#2563a6" style="">target verify</text>
+<text x="1457.5" y="800.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#5f6b76" style="">stream weights once</text>
+<line x1="1260.0" y1="783.0" x2="1310.0" y2="783.0" stroke="#2563a6" stroke-width="3"/>
+<polygon points="1310.0,783.0 1296.0,775.0 1296.0,791.0" fill="#2563a6" stroke="#2563a6" stroke-width="1"/>
+<text x="1300.0" y="905.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="600" fill="#25835b" style="">per-lane accept / rollback / EOS / commit</text>
+<text x="1300.0" y="937.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#5f6b76" style="">up to (k+1)N verified positions per weight stream</text>
+<rect x="145.0" y="1026.0" width="28.0" height="20.0" rx="3.0" fill="#2563a6" fill-opacity="1.0" stroke="none" stroke-width="2"/>
+<text x="187.0" y="1045.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#16202a" style="">current/target position</text>
+<rect x="520.0" y="1026.0" width="28.0" height="20.0" rx="3.0" fill="#d97706" fill-opacity="1.0" stroke="none" stroke-width="2"/>
+<text x="562.0" y="1045.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#16202a" style="">MTP-proposed position</text>
+<rect x="940.0" y="1026.0" width="28.0" height="20.0" rx="3.0" fill="#25835b" fill-opacity="1.0" stroke="none" stroke-width="2"/>
+<text x="982.0" y="1045.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#16202a" style="">verified per-lane commit</text>
+<text x="1480.0" y="1045.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#5f6b76" style="font-style:italic;">Scheduling changes; target distribution does not.</text>
+</svg>
