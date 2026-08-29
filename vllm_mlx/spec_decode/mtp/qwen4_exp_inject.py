@@ -13,9 +13,36 @@ import inspect
 import json
 import logging
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+BATCHED_MTP_CAPABILITY = MappingProxyType(
+    {
+        "protocol_version": 1,
+        "model_family": "qwen4_exp",
+        "batch_forward": "mtp_batch_forward",
+        "recursive_draft_depth": 2,
+        "fixed_membership": True,
+        "dynamic_join": False,
+        "quantized_cache": False,
+        "windowed_cache": False,
+        "xtc": False,
+    }
+)
+
+
+def _mtp_batch_forward(self, hidden_states, next_token_ids, mtp_cache):
+    """Batch seam: recursive drafting always needs the returned hidden state."""
+
+    return self.mtp_forward(
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden=True,
+    )
 
 
 def _resolve_inner(model: Any) -> Any | None:
@@ -203,6 +230,9 @@ def inject_qwen4_exp_mtp_support(
 
         class _Qwen4ExpWithMTP(original_class):  # type: ignore[valid-type, misc]
             mtp_prompt_lookup_supported = False
+            batched_mtp_capability = BATCHED_MTP_CAPABILITY
+            mtp_recursive_draft_depth = 2
+            mtp_batch_forward = _mtp_batch_forward
 
             def mtp_forward(
                 self,
@@ -229,11 +259,15 @@ def inject_qwen4_exp_mtp_support(
                 ratio = self.mtp.layers[0].self_attn.indexer.compress_ratio
                 return [CacheList(KVCache(), QSAIndexCache(ratio))]
 
+        mx.eval(mtp.parameters())
         inner.mtp = mtp
         inner.mtp_max_speculative_tokens = 1
-        model.mtp_max_speculative_tokens = 1
         inner.__class__ = _Qwen4ExpWithMTP
-        mx.eval(mtp.parameters())
+        model.mtp_max_speculative_tokens = 1
+        model.batched_mtp_capability = BATCHED_MTP_CAPABILITY
+        model.mtp_recursive_draft_depth = 2
+        if model is not inner:
+            model.mtp_batch_forward = inner.mtp_batch_forward
         return True
     except Exception:
         logger.exception("[mtp.qwen4] native MTP attachment failed")
@@ -250,7 +284,10 @@ def validate_qwen4_exp_mtp_support(model: Any) -> bool:
         return False
     return (
         callable(getattr(inner, "mtp_forward", None))
+        and callable(getattr(inner, "mtp_batch_forward", None))
         and callable(getattr(inner, "make_mtp_cache", None))
+        and getattr(inner, "batched_mtp_capability", None) is BATCHED_MTP_CAPABILITY
+        and getattr(inner, "mtp_recursive_draft_depth", None) == 2
         and "return_hidden" in signature.parameters
         and "n_confirmed" in signature.parameters
     )
