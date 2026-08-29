@@ -70,7 +70,9 @@ def _clean_record(
             proposed_draft_tokens=2,
             accepted_draft_tokens=1,
             elapsed_seconds=1.0 + index / 10,
-            digest=DigestClassification.EXACT,
+            batched_b1_digest=DigestClassification.EXACT,
+            batch_shape_digest=DigestClassification.EXACT,
+            legacy_single_lane_digest=DigestClassification.EXACT,
             finish_reason=FinishReason.STOP,
         )
         for index in range(cohort_size)
@@ -315,16 +317,81 @@ def test_qualification_reconciles_lane_and_counter_totals() -> None:
     assert "committed token totals do not reconcile" in result.errors
 
 
-def test_divergent_or_unrun_digest_refuses_structural_record() -> None:
+def test_batched_b1_digest_must_be_exact_without_shape_tolerance() -> None:
     record = _clean_record()
     for classification in (
+        DigestClassification.DISTRIBUTIONAL,
         DigestClassification.DIVERGENT,
         DigestClassification.NOT_RUN,
     ):
-        lane = replace(record.lanes[0], digest=classification)
+        lane = replace(record.lanes[0], batched_b1_digest=classification)
         changed = replace(record, lanes=(lane,) + record.lanes[1:])
         result = evaluate_cohort_qualification(changed)
-        assert "digest classification gate failed" in result.errors
+        assert "batched-B1 exact digest gate failed" in result.errors
+
+
+def test_b1_cohort_cannot_claim_a_distributional_batch_shape_band() -> None:
+    record = _clean_record(cohort_size=1)
+    lane = replace(
+        record.lanes[0],
+        batch_shape_digest=DigestClassification.DISTRIBUTIONAL,
+    )
+
+    result = evaluate_cohort_qualification(replace(record, lanes=(lane,)))
+
+    assert result.structurally_valid is False
+    assert "batched-B1 cannot use a batch-shape tolerance" in result.errors
+
+
+def test_bn_may_use_own_b1_distributional_band_but_not_diverge() -> None:
+    record = _clean_record(cohort_size=4)
+    lane = replace(
+        record.lanes[0],
+        batch_shape_digest=DigestClassification.DISTRIBUTIONAL,
+    )
+    banded = replace(record, lanes=(lane,) + record.lanes[1:])
+
+    assert evaluate_cohort_qualification(banded).structurally_valid is True
+
+    divergent = replace(
+        lane,
+        batch_shape_digest=DigestClassification.DIVERGENT,
+    )
+    result = evaluate_cohort_qualification(
+        replace(record, lanes=(divergent,) + record.lanes[1:])
+    )
+    assert result.structurally_valid is False
+    assert "B>1 batch-shape digest gate failed" in result.errors
+
+
+@pytest.mark.parametrize(
+    "classification",
+    [DigestClassification.DIVERGENT, DigestClassification.NOT_RUN],
+)
+def test_legacy_single_lane_comparison_is_informative_only(classification) -> None:
+    record = _clean_record(cohort_size=4)
+    lane = replace(record.lanes[0], legacy_single_lane_digest=classification)
+
+    result = evaluate_cohort_qualification(
+        replace(record, lanes=(lane,) + record.lanes[1:])
+    )
+
+    assert result.structurally_valid is True
+
+
+def test_distributional_band_never_substitutes_for_cache_equality() -> None:
+    record = _clean_record(cohort_size=4)
+    lanes = tuple(
+        replace(lane, batch_shape_digest=DigestClassification.DISTRIBUTIONAL)
+        for lane in record.lanes
+    )
+
+    result = evaluate_cohort_qualification(
+        replace(record, lanes=lanes, cache_equal=False)
+    )
+
+    assert result.structurally_valid is False
+    assert "cache equality gate failed" in result.errors
 
 
 def test_hardware_label_without_artifact_digest_cannot_qualify() -> None:

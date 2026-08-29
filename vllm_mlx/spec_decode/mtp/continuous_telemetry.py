@@ -317,7 +317,9 @@ class LaneQualification:
     proposed_draft_tokens: int
     accepted_draft_tokens: int
     elapsed_seconds: float
-    digest: DigestClassification
+    batched_b1_digest: DigestClassification
+    batch_shape_digest: DigestClassification
+    legacy_single_lane_digest: DigestClassification
     finish_reason: FinishReason
 
     def __post_init__(self) -> None:
@@ -332,7 +334,21 @@ class LaneQualification:
         if accepted > proposed:
             raise ValueError("lane accepted drafts cannot exceed proposals")
         _positive_float(self.elapsed_seconds, "elapsed_seconds")
-        _require_enum(self.digest, DigestClassification, "digest")
+        _require_enum(
+            self.batched_b1_digest,
+            DigestClassification,
+            "batched_b1_digest",
+        )
+        _require_enum(
+            self.batch_shape_digest,
+            DigestClassification,
+            "batch_shape_digest",
+        )
+        _require_enum(
+            self.legacy_single_lane_digest,
+            DigestClassification,
+            "legacy_single_lane_digest",
+        )
         _require_enum(self.finish_reason, FinishReason, "finish_reason")
 
 
@@ -429,10 +445,21 @@ def evaluate_cohort_qualification(
     if not record.cache_equal:
         errors.append("cache equality gate failed")
     if any(
-        lane.digest in (DigestClassification.DIVERGENT, DigestClassification.NOT_RUN)
+        lane.batched_b1_digest is not DigestClassification.EXACT
         for lane in record.lanes
     ):
-        errors.append("digest classification gate failed")
+        errors.append("batched-B1 exact digest gate failed")
+    if any(
+        lane.batch_shape_digest
+        in (DigestClassification.DIVERGENT, DigestClassification.NOT_RUN)
+        for lane in record.lanes
+    ):
+        errors.append("B>1 batch-shape digest gate failed")
+    if record.cohort_size == 1 and any(
+        lane.batch_shape_digest is not DigestClassification.EXACT
+        for lane in record.lanes
+    ):
+        errors.append("batched-B1 cannot use a batch-shape tolerance")
 
     structurally_valid = not errors
     hardware_evidence = (
