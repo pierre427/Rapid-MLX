@@ -972,6 +972,9 @@ class QSAAttention(nn.Module):
             keys, values = kv_cache.update_and_fetch(keys, values)
         if (
             isinstance(selected, _QSASelection)
+            # The custom Metal kernel has no VJP. Keep training and fine-tuning
+            # on the dense SDPA route, which remains differentiable.
+            and not self.training
             and should_use_block_sparse(length, physical_length)
             and block_sparse_layout_supported(
                 query_heads=self.num_attention_heads,
