@@ -9,8 +9,9 @@ Base: Rapid-MLX `origin/main` at
 This directory contains one proposed PR body per focused layer in the local
 Qwen4 continuous self-MTP stack. PRs 1--12A map to existing focused commits.
 PR 13 maps to `be0b3e8c`. PRs 14--16 are the required publication split of the
-combined 2,075-line integration commit `d7cf5bbb`; PR 17 keeps documentation
-last. No body is submission-ready while a blocking or pending line remains.
+combined 2,075-line integration commit `d7cf5bbb`; corrective PR 15A maps to
+`b1be6d00` and `77eda833`; PR 17 keeps documentation last. No body is
+submission-ready while a blocking or pending line remains.
 
 The original PRs 1--13 staging pass was model-free. A later real
 Qwen3.8-27B target smoke used an explicitly test-only randomly initialized MTP
@@ -54,7 +55,8 @@ status line says `pending`.
 | 13 | [Dynamic wrapper membership](13-dynamic-membership-wrapper.md) | `feat/mtp-dynamic-membership-wrapper` | `be0b3e8c` | PR 12A / `9393de76` | Integration commit mirrored privately; publication branch/review pending |
 | 14 | [Runtime assembly and GDN rollback](14-runtime-rollback.md) | `feat/mtp-continuous-runtime-rollback` | extract from `d7cf5bbb` | PR 13 / `be0b3e8c` | Publication split, trained-head gates, and review pending |
 | 15 | [Live fixed-cohort delivery](15-live-fixed-cohort-delivery.md) | `feat/mtp-live-fixed-cohort-delivery` | extract from `d7cf5bbb` | PR 14 publication split | Queue-atomicity fix/test and review pending |
-| 16 | [Dynamic Qwen3.5 scheduler turnover](16-dynamic-scheduler-turnover.md) | `feat/mtp-dynamic-scheduler-turnover` | extract from `d7cf5bbb` | PR 15 publication split | Memory-cost calibration and trained-head gates pending |
+| 15A | [Native Qwen3.5 head and continuous B1](15a-native-qwen35-continuous-b1.md) | `fix/mtp-native-qwen35-continuous-b1` | `b1be6d00`, `77eda833` | PR 15 publication split | CPU-pinned tests pass; dense live benchmark in progress, serial B1 hardware gate pending |
+| 16 | [Dynamic Qwen3.5 scheduler turnover](16-dynamic-scheduler-turnover.md) | `feat/mtp-dynamic-scheduler-turnover` | extract from `d7cf5bbb` | PR 15A | Memory-cost calibration and trained-head gates pending |
 | 17 | [Documentation and paper](17-docs-paper.md) | `docs/continuous-self-mtp-batching` | rebase `580042d2` docs onto final splits | PR 16; exact Rapid artifacts remain open | Evidence/human review pending — do not submit |
 
 The commits are intentionally linear. A body may be rebased onto a merged
@@ -77,6 +79,9 @@ separately reviewable.
 - `1a0a2474` is later source-only admission work: a compute-saturation ceiling
   and configurable per-lane transient estimate. It is not yet ported here.
 - `be0b3e8c` maps to PR 13; `d7cf5bbb` must be decomposed across PRs 14--16.
+- `b1be6d00` and `77eda833` map to corrective PR 15A: use the compatible
+  native embedded Qwen3.5 MTP contract and route an explicitly enabled serial
+  cohort through the same continuous engine at batched-B1.
 
 ## Verification recorded in this packet
 

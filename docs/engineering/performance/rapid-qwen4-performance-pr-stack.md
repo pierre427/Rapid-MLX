@@ -38,13 +38,15 @@ routing PRs. The latter two remain separately reviewable as PR 8A and PR 12A.
 Source commit `1a0a2474` later added a compute-saturation ceiling and
 configurable per-lane transient estimate; that admission change is not yet
 ported into this Rapid stack. Rapid integration commits `be0b3e8c` and
-`d7cf5bbb` map to PRs 13--16 below.
+`d7cf5bbb` map to PRs 13--16 below. Corrective commits `b1be6d00` and
+`77eda833` map to PR 15A between fixed-cohort delivery and dynamic turnover.
 
 ## Dependency sequence
 
-The staged submission plan contains eighteen code/test PR entries (counting 8A
-and 12A) plus the final documentation PR. Each publication branch follows
-Rapid's required prefix convention; private `codex/` refs are staging only.
+The staged submission plan contains nineteen code/test PR entries (counting
+8A, 12A, and 15A) plus the final documentation PR. Each publication branch
+follows Rapid's required prefix convention; private `codex/` refs are staging
+only.
 
 | Order | Local commit / branch | Proposed PR | Default / hardware boundary |
 | ---: | --- | --- | --- |
@@ -65,6 +67,7 @@ Rapid's required prefix convention; private `codex/` refs are staging only.
 | 13 | `be0b3e8c` | `feat(mtp): implement dynamic membership in the continuous wrapper` | Wrapper boundary joins/leaves; still no scheduler delivery |
 | 14 | split from `d7cf5bbb` | `feat(mtp): assemble the continuous runtime and exact GDN rollback` | Default-off; trained-head rollback unqualified |
 | 15 | split from `d7cf5bbb` | `feat(mtp): deliver continuous fixed-cohort responses live` | Queue-atomicity fix/test blocks publication |
+| 15A | `b1be6d00`, `77eda833` | `fix(mtp): adopt native Qwen3.5 heads for continuous B1` | Native mixed packing preserved; serial uses continuous driver; hardware gate pending |
 | 16 | split from `d7cf5bbb` | `feat(mtp): admit and retire Qwen3.5 lanes at cycle boundaries` | Qwen3.5 only; memory cost and trained-head gates pending |
 | 17 | rebase `580042d2` docs last | `docs(perf): document continuous self-MTP batching` | Paper, figures, sequence, and PR packet; no Rapid perf claim |
 
@@ -72,6 +75,10 @@ PR 11 deliberately stops before live continuous token delivery at its own
 head. PR 13 then exposes wrapper membership, and the combined integration
 commit `d7cf5bbb` adds default-off runtime assembly, scheduler delivery, and
 Qwen3.5 turnover. Publication must split that broad commit across PRs 14--16.
+PR 15A then corrects native embedded-head adoption and makes explicit serial
+continuous runs use the same driver at batched-B1; PR 16 depends on that
+corrective boundary.
+
 The tip is greedy-only, does not consume APC prepared state, passes zero for
 incremental draft-token memory cost, and removes requests before driver
 creation/join is known to succeed. Those boundaries and the queue-atomicity fix
