@@ -10,6 +10,9 @@ Status: local draft only; no publication branch is pushed and nothing is
 submitted upstream. The pre-fix failure was observed in a live dense-27B
 warmup, but this correction has only model-free CPU verification. The exact
 live rerun and serial batched-B1 hardware validation are pending and blocking.
+The old candidate service arm is invalid for final throughput and quality:
+eight nominally successful lanes stopped at 255 of 256 tokens without a finish
+reason or usage trailer and must be rerun after this fix.
 
 ## Why
 
@@ -51,6 +54,9 @@ AI-assisted files:
 - `max_tokens=1` closes after the prepared initial token without a proposal.
 - `max_tokens=2` emits the prepared token plus one target-only final token and
   closes normally for batched-B1.
+- At the observed 256-token boundary, B1 and B>1 each deliver token 256 exactly
+  once, attach `finish_reason="length"` only to that response, and expose a
+  256-token terminal ledger to scheduler accounting.
 - An all-boundary B>1 cohort uses one batched target forward and preserves
   per-lane response and detach ownership.
 - The target-only cycle performs no draft forward; detach alone flushes each
@@ -70,7 +76,7 @@ env PYTHONPATH=/Users/pierrelamy/Desktop/mlx-uag/Rapid-MLX-worktrees/qwen35-nati
   'import mlx.core as mx; mx.set_default_device(mx.cpu); import pytest; raise SystemExit(pytest.main(["-q", "tests/test_continuous_mtp_generation_batch.py", "tests/test_continuous_mtp_driver.py", "tests/test_continuous_self_mtp_mlx_backend.py", "tests/test_continuous_mtp_telemetry.py", "tests/test_continuous_self_mtp_engine.py", "tests/test_continuous_mtp_runtime.py", "tests/test_metrics_route.py"]))'
 ```
 
-Result: **126 passed in 1.36s**. Ruff lint and formatting pass for all five
+Result: **128 passed in 1.39s**. Ruff lint and formatting pass for all five
 changed files, and `git diff --check` passes.
 
 Pending and blocking: rerun the exact dense-27B `max_tokens=2` service warmup
@@ -101,7 +107,7 @@ rerun, and hardware qualification remain pending.
 
 ## Checklist
 
-- CPU-pinned model-free focused suite: **passed, 126 tests**.
+- CPU-pinned model-free focused suite: **passed, 128 tests**.
 - Ruff lint, Ruff formatting, and whitespace validation: **passed**.
 - Exact dense-27B boundary rerun: **pending and blocking**.
 - Serial batched-B1 hardware validation: **pending and blocking**.

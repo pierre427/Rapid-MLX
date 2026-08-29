@@ -166,6 +166,27 @@ def _triples(responses):
     ]
 
 
+def _drive_length_boundary(*, lane_count: int, max_tokens: int = 256):
+    runtime, compute, _caches = _runtime()
+    batch_driver = driver.ContinuousMTPDriver.create(
+        [_spec(uid, max_tokens=max_tokens) for uid in range(1, lane_count + 1)],
+        runtime,
+    )
+    delivered = {uid: [] for uid in range(1, lane_count + 1)}
+    for response in batch_driver.next():
+        delivered[response.uid].append(response)
+    compute.queued_outputs.extend(
+        [
+            [(_target(uid * 1000 + step),) for uid in delivered]
+            for step in range(1, max_tokens)
+        ]
+    )
+    for _ in range(1, max_tokens):
+        for response in batch_driver.next():
+            delivered[response.uid].append(response)
+    return batch_driver, compute, delivered
+
+
 def test_variable_burst_queues_and_drains_one_response_per_uid_before_next_step():
     runtime, compute, _caches = _runtime()
     batch_driver = driver.ContinuousMTPDriver.create([_spec(1), _spec(2)], runtime)
@@ -211,6 +232,67 @@ def test_b1_target_only_terminal_response_drains_before_driver_closes() -> None:
     assert batch_driver.has_pending_responses is False
     assert batch_driver.next() == []
     assert [package.uid for package in batch_driver.take_terminal_detaches()] == [1]
+
+
+def test_256_token_boundary_delivers_final_token_and_trailer_once_for_b1_and_b2():
+    """Pin the live 255-token/missing-trailer failure at its observed size."""
+    for lane_count in (1, 2):
+        batch_driver, compute, delivered = _drive_length_boundary(lane_count=lane_count)
+
+        assert batch_driver.closed is True
+        assert batch_driver.has_pending_responses is False
+        assert batch_driver.next() == []
+        assert sum(call[0] == "propose" for call in compute.calls) == 255
+        for uid, responses in delivered.items():
+            assert len(responses) == 256
+            assert all(response.finish_reason is None for response in responses[:-1])
+            final = responses[-1]
+            assert final.finish_reason == "length"
+            assert final.all_tokens == [response.token for response in responses]
+            assert len(final.all_tokens) == 256
+            assert final.prompt_cache == f"target-cache-{uid}"
+            assert final.mtp_state == (f"draft-cache-{uid}", f"hidden-{uid}")
+
+
+def test_256th_continuous_token_drives_scheduler_finish_and_usage_count():
+    """The terminal driver response is the scheduler's finish/usage trigger."""
+    from unittest.mock import MagicMock
+
+    from vllm_mlx.request import Request, RequestStatus, SamplingParams
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+    _batch_driver, _compute, delivered = _drive_length_boundary(lane_count=1)
+    responses = delivered[1]
+    terminal = responses[-1]
+
+    scheduler = Scheduler(
+        MagicMock(),
+        MagicMock(encode=lambda value: list(range(len(value.split())))),
+        SchedulerConfig(max_num_seqs=1),
+    )
+    request = Request(
+        request_id="boundary-256",
+        prompt="hello",
+        sampling_params=SamplingParams(max_tokens=256),
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_prompt_tokens = 1
+    for response in responses[:-1]:
+        request.append_output_token(response.token)
+    scheduler.running[request.request_id] = request
+    scheduler.uid_to_request_id[terminal.uid] = request.request_id
+    scheduler._decode_tokens = lambda tokens: "x" * len(tokens)  # type: ignore[method-assign]
+
+    outputs, finished = scheduler._process_batch_responses([terminal])
+
+    assert finished == {request.request_id}
+    assert len(outputs) == 1
+    assert outputs[0].finished is True
+    assert outputs[0].finish_reason == "length"
+    assert outputs[0].completion_tokens == 256
+    assert len(outputs[0].output_token_ids) == 256
+    assert scheduler.total_completion_tokens == 256
+    assert scheduler.num_requests_processed == 1
 
 
 def test_join_waits_for_delivery_drain_then_emits_joined_initial_before_proposal():
