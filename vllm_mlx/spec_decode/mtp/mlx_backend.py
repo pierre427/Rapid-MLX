@@ -300,6 +300,9 @@ class RapidMLXSelfMTPBackend:
             raise ContinuousSelfMTPUnsupported(
                 "transformed sampling requires exact residual hooks"
             )
+        validate_sampling = getattr(hooks, "validate_sampling", None)
+        if callable(validate_sampling):
+            validate_sampling(lane.sampling)
         logprobs = hooks.logprobs(logits, lane.sampling.temperature)
         return hooks.sample(logprobs, lane.sampling.temperature), logprobs
 
@@ -329,6 +332,12 @@ class RapidMLXSelfMTPBackend:
             raise ContinuousSelfMTPUnsupported(
                 "transformed sampling requires exact residual hooks"
             )
+        if self.residual_sampling is not None:
+            validate_sampling = getattr(
+                self.residual_sampling, "validate_sampling", None
+            )
+            if callable(validate_sampling):
+                validate_sampling(spec.sampling)
         if spec.sampling.has_logits_processors and self.logits_processor is None:
             raise ContinuousSelfMTPUnsupported(
                 "logits processors require an exact injected hook"
