@@ -1370,7 +1370,16 @@ def _build_tiny_qwen3_5_text_model():
 
     args = _tiny_text_model_args()
     object.__setattr__(args, "mtp_num_hidden_layers", 1)
-    return TextModel(args)
+    model = TextModel(args)
+    # These legacy injector tests exercise Rapid's compatibility-head path.
+    # Newer mlx-lm builds construct a native embedded module from the same
+    # config, while older builds (the original test environment) did not.
+    # Remove only that randomly initialized test module so these cases remain
+    # version-stable; native embedded adoption has its own synthetic contract
+    # suite in ``test_mtp_native_embedded_contract.py``.
+    if hasattr(model, "mtp"):
+        del model.mtp
+    return model
 
 
 def test_inject_mtp_support_attaches_four_surfaces():

@@ -11,11 +11,15 @@ can't drive the model.
 This module mirrors the pattern from
 :mod:`vllm_mlx.patches.qwen3_next_mtp` (the Qwen3-Next runtime injection):
 
-1. Construct the MTP module that PR #990 adds to ``TextModel`` —
-   delegated to :func:`vllm_mlx.spec_decode.mtp.head.build_mtp_module`.
-2. Quantize the MTP module to match the base model's quantization (so
-   the weight tensors land in the right shape for ``load_weights``).
-3. Load the MTP weights from a separate ``mtp_sidecar`` checkpoint —
+1. Prefer mlx-lm's native embedded ``TextModel.mtp`` / ``mtp_step``
+   contract when the loaded checkpoint already supplied it.  This preserves
+   the module exactly as mlx-lm loaded it, including mixed per-leaf
+   quantization.
+2. For older mlx-lm builds without that native contract, construct the MTP
+   module that PR #990 adds to ``TextModel`` — delegated to
+   :func:`vllm_mlx.spec_decode.mtp.head.build_mtp_module`.
+3. Quantize the compatibility module and load MTP weights from a separate
+   ``mtp_sidecar`` checkpoint —
    ``mlx-community/Qwen3.5-9B-MTP-4bit`` ships the head as a 131 MB
    standalone safetensors file with top-level keys (``fc.*``,
    ``layers.0.*``, ``norm.weight``, ``pre_fc_norm_{hidden,embedding}.weight``).
@@ -123,6 +127,71 @@ def _resolve_inner_text_model(model: Any) -> Any:
         return model
 
     return None
+
+
+def _resolve_native_embedded_mtp_step(inner: Any, num_mtp_layers: int):
+    """Return mlx-lm's bound native ``mtp_step`` or ``None``.
+
+    Current mlx-lm constructs ``TextModel.mtp`` while loading a checkpoint
+    whose config declares MTP layers, retains the module only when embedded
+    ``mtp.*`` weights are present, and exposes ``mtp_step`` plus
+    ``make_mtp_cache`` as its runtime contract.  That loaded module is the
+    authority for per-leaf quantization; rebuilding it and inferring one
+    packing from ``fc`` corrupts mixed-quantized checkpoints.
+
+    Keep this gate structural and fail closed.  An object that merely carries
+    an ``mtp`` attribute is not enough: the native runtime methods, complete
+    module surface, and configured layer count must all agree before Rapid
+    adopts it.
+    """
+
+    mtp = getattr(inner, "mtp", None)
+    if mtp is None:
+        return None
+
+    mtp_step = getattr(inner, "mtp_step", None)
+    make_mtp_cache = getattr(inner, "make_mtp_cache", None)
+    if not callable(mtp_step) or not callable(make_mtp_cache):
+        logger.warning(
+            "[mtp.inject] embedded MTP module lacks callable mtp_step / "
+            "make_mtp_cache; refusing the native contract."
+        )
+        return None
+
+    required_module_parts = (
+        "fc",
+        "pre_fc_norm_embedding",
+        "pre_fc_norm_hidden",
+        "layers",
+        "norm",
+    )
+    missing_parts = [name for name in required_module_parts if not hasattr(mtp, name)]
+    if missing_parts:
+        logger.warning(
+            "[mtp.inject] embedded MTP module is incomplete; missing %s. "
+            "Refusing the native contract.",
+            missing_parts,
+        )
+        return None
+
+    try:
+        embedded_layers = len(mtp.layers)
+    except (TypeError, AttributeError):
+        logger.warning(
+            "[mtp.inject] embedded MTP layers are not countable; refusing the "
+            "native contract."
+        )
+        return None
+    if embedded_layers != num_mtp_layers:
+        logger.warning(
+            "[mtp.inject] embedded MTP layer count %d disagrees with config %d; "
+            "refusing the native contract.",
+            embedded_layers,
+            num_mtp_layers,
+        )
+        return None
+
+    return mtp_step
 
 
 def _detect_base_quantization(inner: Any) -> dict | None:
@@ -441,10 +510,11 @@ def inject_mtp_support(
             wrapper ``Model`` (with ``model.language_model``) or the
             inner ``TextModel`` directly (tests pass this shape).
         mtp_sidecar: Optional reference to a separate checkpoint
-            holding the MTP head's safetensors. Accepts an HF Hub
-            repo id (``mlx-community/Qwen3.5-9B-MTP-4bit``), a local
-            directory path, or a direct path to a ``.safetensors``
-            file.
+            holding the MTP head's safetensors. When omitted, a compatible
+            native ``TextModel.mtp`` already populated by mlx-lm is adopted
+            in place. Otherwise accepts an HF Hub repo id
+            (``mlx-community/Qwen3.5-9B-MTP-4bit``), a local directory path,
+            or a direct path to a ``.safetensors`` file.
         allow_random_init: When ``True``, permit ``mtp_sidecar=None``
             and ship the MTP head with its RANDOM INIT weights (the
             patched ``mtp_forward`` produces useless drafts, accept
@@ -462,9 +532,9 @@ def inject_mtp_support(
         ``n_confirmed`` — the four contract surfaces
         :func:`vllm_mlx.spec_decode.mtp.generator.mtp_generate_step`
         depends on. ``False`` when the model is not Qwen3.5 / 3.6,
-        the config lacks ``mtp_num_hidden_layers``, the sidecar
-        cannot be resolved, or ``mtp_sidecar`` is ``None`` and
-        ``allow_random_init`` is ``False``.
+        the config lacks ``mtp_num_hidden_layers``, the sidecar cannot be
+        resolved, or neither a compatible embedded native module nor an
+        explicit sidecar is available (unless ``allow_random_init`` is true).
 
     Notes:
         This function is NEW in this PR (Qwen3.5 native MTP). It is
@@ -531,15 +601,42 @@ def inject_mtp_support(
         )
         return False
 
-    # --- Step 1: Build the MTP module from the vendored head ---
-    from .head import build_mtp_module
-
-    mtp = build_mtp_module(args, num_mtp_layers)
-    logger.info(
-        "[mtp.inject] Built MTP module (%d layer(s), hidden_size=%d).",
-        num_mtp_layers,
-        getattr(args, "hidden_size", -1),
+    # --- Step 1: Prefer mlx-lm's already-loaded native MTP contract ---
+    # A native module is authoritative for its own per-leaf quantization.  In
+    # particular, Qwen3.8-27B-oQ4e carries mixed packed leaves that cannot be
+    # represented by the external-sidecar path's single fc-derived packing.
+    # An explicit sidecar remains an explicit request for the compatibility
+    # loader, so native adoption is intentionally limited to sidecar=None.
+    native_mtp_step = (
+        _resolve_native_embedded_mtp_step(inner, num_mtp_layers)
+        if mtp_sidecar is None
+        else None
     )
+    using_native_embedded_mtp = native_mtp_step is not None
+    if mtp_sidecar is None and not using_native_embedded_mtp and not allow_random_init:
+        logger.warning(
+            "[mtp.inject] no compatible native embedded MTP contract and no "
+            "mtp_sidecar; refusing to build a random-init head. Use a target "
+            "checkpoint with loaded mtp.* weights or pass an explicit sidecar."
+        )
+        return False
+    if using_native_embedded_mtp:
+        mtp = inner.mtp
+        logger.info(
+            "[mtp.inject] Adopting mlx-lm native embedded MTP module "
+            "(%d layer(s)); preserving loaded per-leaf quantization.",
+            num_mtp_layers,
+        )
+    else:
+        from .head import build_mtp_module
+
+        mtp = build_mtp_module(args, num_mtp_layers)
+        logger.info(
+            "[mtp.inject] Built compatibility MTP module "
+            "(%d layer(s), hidden_size=%d).",
+            num_mtp_layers,
+            getattr(args, "hidden_size", -1),
+        )
 
     # --- Step 2: Resolve the sidecar file up-front ---
     # Resolved before quantization because the MTP module must be
@@ -565,7 +662,14 @@ def inject_mtp_support(
     runtime_contract = (
         _load_mtplx_runtime_contract(weights_file) if weights_file is not None else {}
     )
-    base_hidden_variant = runtime_contract.get("base_hidden_variant", "pre_norm")
+    # mlx-lm's native ``mtp_step`` contract consumes the trunk's post-final-
+    # norm hidden.  The compatibility head historically consumes pre-norm
+    # hidden unless an MTPLX manifest says otherwise.
+    base_hidden_variant = (
+        "post_norm"
+        if using_native_embedded_mtp
+        else runtime_contract.get("base_hidden_variant", "pre_norm")
+    )
     mtp_concat_order = runtime_contract.get("concat_order", "embedding_hidden")
 
     # --- Step 3: Match the MTP module's quantization to the SIDECAR ---
@@ -689,9 +793,12 @@ def inject_mtp_support(
                 sidecar_quant["bits"],
                 sidecar_quant["group_size"],
             )
-    else:
+    elif not using_native_embedded_mtp:
         # No explicit sidecar: the MTP head is the base checkpoint's own,
-        # so the base model's quantization is the correct match.
+        # so the base model's quantization is the correct match. This branch is
+        # only the test-only compatibility-module path; a native embedded MTP
+        # module was already quantized and populated by mlx-lm and must not be
+        # rebuilt or re-quantized here.
         base_quant = _detect_base_quantization(inner)
         if base_quant is not None:
             # Same fail-safe as the sidecar path: never let a quantize
@@ -859,8 +966,14 @@ def inject_mtp_support(
             _detect_base_quantization(inner), sidecar_quant
         )
     else:
-        # No sidecar.
-        if not allow_random_init:
+        # No explicit sidecar.  A validated native embedded module was loaded
+        # with the target checkpoint and is production-ready as-is.
+        if using_native_embedded_mtp:
+            logger.info(
+                "[mtp.inject] Native embedded MTP contract accepted; no external "
+                "sidecar or weight reinjection required."
+            )
+        elif not allow_random_init:
             # Codex round-5 BLOCKING fix: default is fail-closed. A
             # missing sidecar in production silently enabled a draft
             # model with random init weights (~0% accept rate) —
@@ -875,16 +988,17 @@ def inject_mtp_support(
                 "allow_random_init=True for unit-test wiring probes."
             )
             return False
-        # Test-only path — explicit opt-in to random-init weights for
-        # wiring tests that pin the surfaces without paying the
-        # 131 MB sidecar download cost.
-        mx.eval(mtp.parameters())
-        logger.warning(
-            "[mtp.inject] inject_mtp_support called with "
-            "allow_random_init=True — MTP head retains RANDOM init "
-            "weights (accept rate ~0%%). This is the test-only path; "
-            "do not use in production."
-        )
+        else:
+            # Test-only path — explicit opt-in to random-init weights for
+            # wiring tests that pin the surfaces without paying the
+            # 131 MB sidecar download cost.
+            mx.eval(mtp.parameters())
+            logger.warning(
+                "[mtp.inject] inject_mtp_support called with "
+                "allow_random_init=True — MTP head retains RANDOM init "
+                "weights (accept rate ~0%%). This is the test-only path; "
+                "do not use in production."
+            )
 
     # --- Step 5: Install global ArraysCache + GatedDeltaNet patches ---
     # Deferred from the top of this function so a failed validation /
@@ -993,6 +1107,13 @@ def inject_mtp_support(
             return_hidden: bool = False,
         ):
             """Run the MTP head and project through the shared lm_head."""
+            if native_mtp_step is not None:
+                logits, mtp_out = native_mtp_step(
+                    hidden_states,
+                    next_token_ids,
+                    mtp_cache,
+                )
+                return (logits, mtp_out) if return_hidden else logits
             mtp_out = self.mtp(
                 hidden_states,
                 next_token_ids,
@@ -1008,6 +1129,12 @@ def inject_mtp_support(
 
         def mtp_greedy(self, hidden_states, next_token_ids, mtp_cache):
             """Return greedy MTP ids without materializing full-vocab logits."""
+            # The native mlx-lm contract owns the exact mixed-quantized
+            # forward through ``mtp_step``.  Its public seam returns logits;
+            # bypassing it to call the module directly would both violate that
+            # contract and fail because native MTPModule is not callable.
+            if native_mtp_step is not None:
+                return None
             if self.args.tie_word_embeddings:
                 return None
             from .quantized_argmax import quantized_argmax
