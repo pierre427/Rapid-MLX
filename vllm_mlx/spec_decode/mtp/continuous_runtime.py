@@ -33,12 +33,55 @@ def _unsupported(message: str) -> ContinuousSelfMTPUnsupportedError:
     )
 
 
-def _make_prompt_cache(model: Any) -> Any:
-    """Construct a target-trunk cache without making module import eager."""
+def _make_prompt_cache(
+    model: Any,
+    kv_quantization: tuple[int, int] | None = None,
+) -> Any:
+    """Construct the target cache, quantizing attention leaves when requested.
+
+    ``kv_quantization`` is ``(group_size, bits)`` after Rapid's live-cache
+    compatibility probe.  Quantization starts at offset zero, matching the
+    only continuous-batching contract supported by mlx-lm-unified.  Hybrid
+    recurrent leaves are left in their native representation by
+    ``maybe_quantize_kv_cache``.
+    """
 
     from mlx_lm.models.cache import make_prompt_cache
 
-    return make_prompt_cache(model)
+    prompt_cache = make_prompt_cache(model)
+    if kv_quantization is not None:
+        from mlx_lm.generate import maybe_quantize_kv_cache
+
+        group_size, bits = kv_quantization
+        maybe_quantize_kv_cache(prompt_cache, 0, group_size, bits)
+    return prompt_cache
+
+
+def _require_quantized_cache_abi() -> None:
+    """Fail at install time unless the dependency exposes the proven ABI."""
+
+    from mlx_lm.models.cache import BatchQuantizedKVCache, QuantizedKVCache
+
+    required = {
+        QuantizedKVCache: ("merge",),
+        BatchQuantizedKVCache: (
+            "preflight_ragged_trim",
+            "trim_ragged",
+            "extend",
+            "extract",
+            "filter",
+        ),
+    }
+    missing = [
+        f"{cache_type.__name__}.{name}"
+        for cache_type, names in required.items()
+        for name in names
+        if not callable(getattr(cache_type, name, None))
+    ]
+    if missing:
+        raise _unsupported(
+            "mlx-lm quantized cache ABI is missing " + ", ".join(missing)
+        )
 
 
 def _descriptor_for(model: Any) -> Mapping[str, Any]:
@@ -89,7 +132,7 @@ def _require_descriptor(
         "confirmed_target_forward": True,
         "ragged_rollback": True,
         "atomic_cache_commit": True,
-        "quantized_cache": False,
+        "quantized_cache": True,
         "windowed_cache": False,
         "xtc": False,
     }
@@ -133,6 +176,7 @@ def assemble_continuous_self_mtp_runtime(
     logits_processor: Any = None,
     prefill_step_size: int = 512,
     speculation_rollback: bool = False,
+    kv_quantization: tuple[int, int] | None = None,
 ) -> ContinuousSelfMTPRuntime:
     """Build a ready runtime from an MTP-injected Rapid model.
 
@@ -159,6 +203,8 @@ def assemble_continuous_self_mtp_runtime(
     make_mtp_cache = getattr(inner, "make_mtp_cache", None)
     if not callable(make_mtp_cache):
         raise _unsupported("injected make_mtp_cache is not callable")
+    if kv_quantization is not None:
+        _require_quantized_cache_abi()
 
     def mtp_forward(hidden: Any, token_ids: Any, cache: Any, *, return_hidden: bool):
         # RapidForwardSeams always asks for hidden state.  The injected batched
@@ -197,7 +243,7 @@ def assemble_continuous_self_mtp_runtime(
         capabilities=capabilities,
         forwards=RapidForwardSeams(inner, mtp_forward),
         compute=RapidMLXSelfMTPBackend(
-            target_cache_factory=lambda: _make_prompt_cache(inner),
+            target_cache_factory=lambda: _make_prompt_cache(inner, kv_quantization),
             draft_cache_factory=make_mtp_cache,
             array_ops=array_ops,
             residual_sampling=residual_sampling,

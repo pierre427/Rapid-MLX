@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -31,7 +32,7 @@ def _descriptor(family: str = "qwen3_5", **changes):
         "atomic_cache_commit": True,
         "dynamic_join": family == "qwen3_5",
         "flash_dynamic_membership_attested": False,
-        "quantized_cache": False,
+        "quantized_cache": True,
         "windowed_cache": False,
         "xtc": False,
     }
@@ -92,6 +93,28 @@ class _ArrayOpsStub:
     pass
 
 
+def test_prompt_cache_factory_quantizes_immediately_via_dependency(monkeypatch):
+    cache_module = ModuleType("mlx_lm.models.cache")
+    generate_module = ModuleType("mlx_lm.generate")
+    prompt_cache = [object(), object()]
+    calls = []
+
+    cache_module.make_prompt_cache = lambda model: (
+        calls.append(("make", model)) or prompt_cache
+    )
+    generate_module.maybe_quantize_kv_cache = lambda cache, start, group, bits: (
+        calls.append(("quantize", cache, start, group, bits))
+    )
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_module)
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", generate_module)
+
+    assert runtime_module._make_prompt_cache("target", (32, 8)) is prompt_cache
+    assert calls == [
+        ("make", "target"),
+        ("quantize", prompt_cache, 0, 32, 8),
+    ]
+
+
 def test_assembler_resolves_inner_model_and_wires_forward_and_cache_seams(
     monkeypatch,
 ):
@@ -101,7 +124,9 @@ def test_assembler_resolves_inner_model_and_wires_forward_and_cache_seams(
     monkeypatch.setattr(
         runtime_module,
         "_make_prompt_cache",
-        lambda model: target_cache_calls.append(model) or ["target-cache"],
+        lambda model, quantization=None: (
+            target_cache_calls.append((model, quantization)) or ["target-cache"]
+        ),
     )
 
     runtime = runtime_module.assemble_continuous_self_mtp_runtime(
@@ -137,7 +162,7 @@ def test_assembler_resolves_inner_model_and_wires_forward_and_cache_seams(
     assert inner.calls[-1] == ("draft", "hidden", "tokens", "draft-kv")
 
     assert runtime.compute.target_cache_factory() == ["target-cache"]
-    assert target_cache_calls == [inner]
+    assert target_cache_calls == [(inner, None)]
     assert runtime.compute.draft_cache_factory() == ["draft-cache"]
     assert runtime.caches._preflight is preflight_ragged_cache
     assert runtime.caches._trim is trim_ragged_cache
@@ -149,7 +174,9 @@ def test_speculation_rollback_is_opt_in_and_reaches_the_backend(monkeypatch):
     inner = _InjectedTextModel()
     outer = _OuterModel(inner)
     monkeypatch.setattr(
-        runtime_module, "_make_prompt_cache", lambda model: ["target-cache"]
+        runtime_module,
+        "_make_prompt_cache",
+        lambda model, quantization=None: ["target-cache"],
     )
     default = runtime_module.assemble_continuous_self_mtp_runtime(outer)
     assert default.compute.speculation_rollback is False
@@ -157,6 +184,34 @@ def test_speculation_rollback_is_opt_in_and_reaches_the_backend(monkeypatch):
         outer, speculation_rollback=True
     )
     assert enabled.compute.speculation_rollback is True
+
+
+def test_effective_quantized_kv_settings_reach_target_cache_factory(monkeypatch):
+    inner = _InjectedTextModel()
+    calls = []
+    abi_checks = []
+    monkeypatch.setattr(
+        runtime_module,
+        "_require_quantized_cache_abi",
+        lambda: abi_checks.append(True),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_make_prompt_cache",
+        lambda model, quantization=None: (
+            calls.append((model, quantization)) or ["quantized-target-cache"]
+        ),
+    )
+
+    runtime = runtime_module.assemble_continuous_self_mtp_runtime(
+        inner,
+        kv_quantization=(32, 8),
+        array_ops=_ArrayOpsStub(),
+    )
+
+    assert runtime.compute.target_cache_factory() == ["quantized-target-cache"]
+    assert calls == [(inner, (32, 8))]
+    assert abi_checks == [True]
 
 
 def test_dynamic_membership_requires_both_policy_and_descriptor_attestation():
@@ -228,7 +283,7 @@ def test_qwen4_uses_its_injector_resolver_and_qsa_policy():
         ({"confirmed_target_forward": False}, "confirmed_target_forward"),
         ({"ragged_rollback": False}, "ragged_rollback"),
         ({"atomic_cache_commit": False}, "atomic_cache_commit"),
-        ({"quantized_cache": True}, "quantized_cache"),
+        ({"quantized_cache": False}, "quantized_cache"),
         ({"windowed_cache": True}, "windowed_cache"),
         ({"xtc": True}, "xtc"),
         ({"batch_forward": None}, "batch_forward"),

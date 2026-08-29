@@ -82,7 +82,10 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
         "atomic_cache_commit": True,
         "dynamic_join": True,
         "flash_dynamic_membership_attested": False,
-        "quantized_cache": False,
+        # mlx-lm-unified a7893ef4/66cc8751 provide the complete
+        # QuantizedKVCache -> BatchQuantizedKVCache transaction surface used
+        # by continuous self-MTP (merge, ragged rollback, extract/filter).
+        "quantized_cache": True,
         "windowed_cache": False,
         "xtc": False,
     }

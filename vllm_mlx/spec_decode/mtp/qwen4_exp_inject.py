@@ -34,7 +34,9 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
         "atomic_cache_commit": True,
         "dynamic_join": False,
         "flash_dynamic_membership_attested": False,
-        "quantized_cache": False,
+        # The target attention leaves use mlx-lm-unified's native quantized
+        # batched cache contract; recurrent GDN/PLE leaves remain unquantized.
+        "quantized_cache": True,
         "windowed_cache": False,
         "xtc": False,
     }

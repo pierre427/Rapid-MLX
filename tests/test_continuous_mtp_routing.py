@@ -39,7 +39,7 @@ def _descriptor(family="qwen3_5"):
             "recursive_draft_depth": 2,
             "fixed_membership": True,
             "dynamic_join": family == "qwen3_5",
-            "quantized_cache": False,
+            "quantized_cache": True,
             "windowed_cache": False,
             "xtc": False,
         }
@@ -83,12 +83,12 @@ def _router(**changes):
     return decision.router
 
 
-def _identity():
+def _identity(target_cache_layout="qwen4-batch-kv:bf16"):
     return PreparedStateIdentity.from_config(
         model_id="Qwen/Qwen3.8-Flash-Next",
         model_revision="revision-a",
         speculative_config={"method": "mtp", "continuous_batching": True},
-        target_cache_layout="qwen4-batch-kv:bf16",
+        target_cache_layout=target_cache_layout,
         mtp_cache_layout="qwen4-mtp-batch-kv:bf16",
         seed_hidden_layout="bf16[1,1,2048]",
         gdn_state_layout="qwen4:gdn:conv+matrix",
@@ -97,8 +97,8 @@ def _identity():
     )
 
 
-def _apc_hit(prefix, *, identity=None):
-    expected = _identity()
+def _apc_hit(prefix, *, identity=None, expected_identity=None):
+    expected = expected_identity or _identity()
     state = prepare_mtp_state(
         identity=identity or expected,
         prefix_tokens=prefix,
@@ -144,7 +144,7 @@ def test_speculative_config_continuous_batching_is_explicit_and_mtp_only():
         parse_speculative_config('{"method":"suffix","continuous_batching":true}')
 
 
-def test_install_plan_is_default_off_and_fails_closed_without_mutation():
+def test_install_plan_is_default_off_and_quantized_capable_without_mutation():
     model = _Model()
     before = dict(vars(model))
 
@@ -159,8 +159,9 @@ def test_install_plan_is_default_off_and_fails_closed_without_mutation():
     assert disabled.admitted is False
     assert disabled.fallback is ContinuousMTPIntegrationRoute.LEGACY_MTP
     assert "disabled" in " ".join(disabled.reasons)
-    assert quantized.admitted is False
-    assert "quantized cache" in " ".join(quantized.reasons)
+    assert quantized.admitted is True
+    assert quantized.router is not None
+    assert quantized.router.runtime.cache_quantized is True
     assert vars(model) == before
 
 
@@ -417,6 +418,82 @@ def test_live_integration_executes_b1_continuous_driver(monkeypatch, caplog):
     ) in caplog.text
 
 
+def test_quantized_requests_and_matching_apc_sidecars_remain_eligible():
+    router = _router(cache_quantized=True)
+    prefix = tuple(range(64))
+    int8_identity = _identity("qwen4-batch-kv:int8-g32")
+    requests = [
+        _request(
+            "warm-int8",
+            1,
+            prompt_tokens=prefix + (999,),
+            cache_quantized=True,
+            apc_hit=_apc_hit(prefix, expected_identity=int8_identity),
+        ),
+        _request("cold-int8", 2, cache_quantized=True),
+    ]
+
+    decision = router.plan(requests, free_bytes=1)
+
+    assert decision.route is ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED
+    assert [lane.lane_id for lane in decision.cohort] == [
+        "warm-int8",
+        "cold-int8",
+    ]
+    assert decision.cohort[0].resume_at == 64
+    assert decision.cohort[0].spec.prompt_cache == "target-cache"
+
+
+def test_quantized_apc_precision_mismatch_fails_closed_per_lane():
+    router = _router(cache_quantized=True)
+    prefix = tuple(range(64))
+    int8_identity = _identity("qwen4-batch-kv:int8-g32")
+    bf16_identity = _identity()
+    decision = router.plan(
+        [
+            _request(
+                "foreign-bf16",
+                1,
+                prompt_tokens=prefix + (999,),
+                cache_quantized=True,
+                apc_hit=_apc_hit(
+                    prefix,
+                    identity=bf16_identity,
+                    expected_identity=int8_identity,
+                ),
+            ),
+            _request("int8-a", 2, cache_quantized=True),
+            _request("int8-b", 3, cache_quantized=True),
+        ],
+        free_bytes=1,
+    )
+
+    assert decision.route is ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED
+    assert [lane.lane_id for lane in decision.cohort] == ["int8-a", "int8-b"]
+    assert decision.plain_lane_ids == ("foreign-bf16",)
+    assert "config_mismatch" in " ".join(decision.reasons)
+
+
+def test_windowed_request_still_falls_through_while_other_lane_batches():
+    router = _router(cache_quantized=True)
+    decision = router.plan(
+        [
+            _request("windowed", 1, cache_windowed=True),
+            _request("quantized", 2, cache_quantized=True),
+            _request("quantized-2", 3, cache_quantized=True),
+        ],
+        free_bytes=1,
+    )
+
+    assert decision.route is ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED
+    assert [lane.lane_id for lane in decision.cohort] == [
+        "quantized",
+        "quantized-2",
+    ]
+    assert decision.plain_lane_ids == ("windowed",)
+    assert "windowed cache is unsupported" in " ".join(decision.reasons)
+
+
 def test_exact_apc_sidecar_is_validated_and_carried_as_a_resume_plan():
     router = _router()
     prefix = tuple(range(64))
@@ -614,6 +691,9 @@ def test_cli_and_scheduler_config_carry_the_default_off_opt_in_by_ast():
     assert "mtp_lane_transient_gib: float = 1.76" in scheduler_source
     assert "mtp_multi_lane_max_prompt_tokens: int = 0" in scheduler_source
     assert "mtp_single_lane_max_prompt_tokens: int = 0" in scheduler_source
+    assert "kv_quantization=self._live_kv_quant" in scheduler_source
+    assert "kv_quantization=kv_quantization" in scheduler_source
+    assert "TurboQuant KV is unsupported" in scheduler_source
 
 
 def test_scheduler_config_validates_continuous_mtp_admission_controls():

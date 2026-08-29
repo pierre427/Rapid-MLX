@@ -1000,6 +1000,7 @@ def _install_continuous_mtp_router(
     uid_to_request_id: dict[int, str] | None = None,
     free_bytes_getter: Any = None,
     stop_tokens: set[int] | frozenset[int] = frozenset(),
+    kv_quantization: tuple[int, int] | None = None,
 ) -> bool:
     """Install the live continuous-MTP coordinator after static admission.
 
@@ -1051,11 +1052,17 @@ def _install_continuous_mtp_router(
         )
         return False
 
-    cache_quantized = bool(
-        getattr(config, "kv_cache_quantization", False)
-        or getattr(config, "kv_cache_turboquant", False)
-        or getattr(config, "kv_cache_dtype", "bf16") != "bf16"
-    )
+    # Standard int4/int8 KV reaches the continuous runtime only after Rapid's
+    # head-dimension probe and live-cache install have produced the effective
+    # ``(group_size, bits)`` tuple. TurboQuant has a distinct cache ABI and
+    # remains explicitly outside the mlx-lm-unified quantized-MTP contract.
+    if getattr(config, "kv_cache_turboquant", False):
+        logger.warning(
+            "[MTP-continuous] TurboQuant KV is unsupported; retaining "
+            "vendored MTP/plain decode"
+        )
+        return False
+    cache_quantized = kv_quantization is not None
     max_lanes = min(
         int(getattr(config, "max_num_seqs", 4)),
         int(getattr(config, "completion_batch_size", 32)),
@@ -1106,6 +1113,7 @@ def _install_continuous_mtp_router(
             speculation_rollback=bool(
                 getattr(config, "mtp_speculation_rollback", False)
             ),
+            kv_quantization=kv_quantization,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at optional install
         logger.warning(
@@ -1247,7 +1255,9 @@ def _install_continuous_mtp_router(
             not history and not any(_cache_offset(cache) for cache in caches)
         )
         capabilities = tuple(type(cache).__name__.lower() for cache in caches)
-        cache_quantized = any("quantized" in name for name in capabilities)
+        request_cache_quantized = cache_quantized or any(
+            "quantized" in name for name in capabilities
+        )
         cache_windowed = any(
             marker in name
             for name in capabilities
@@ -1291,7 +1301,7 @@ def _install_continuous_mtp_router(
                 float(getattr(config, "mtp_lane_transient_gib", 1.76)) * 1024**3 / 2
             ),
             cache_ready=cache_ready,
-            cache_quantized=cache_quantized,
+            cache_quantized=request_cache_quantized,
             cache_windowed=cache_windowed,
             effective_context_tokens=effective_context,
             projected_context_tokens=effective_context + requested_output,
@@ -4927,6 +4937,7 @@ class Scheduler:
                         uid_to_request_id=self.uid_to_request_id,
                         free_bytes_getter=self._continuous_mtp_free_bytes,
                         stop_tokens=frozenset(stop_tokens),
+                        kv_quantization=self._live_kv_quant,
                     )
                 # The vendored hook remains installed beneath the continuous
                 # BatchGenerator.next diversion. Admitted uids are removed from

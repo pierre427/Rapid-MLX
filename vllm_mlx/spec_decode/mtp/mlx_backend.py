@@ -102,10 +102,6 @@ def _as_group(value: Any, name: str) -> list[Any]:
 
 def _reject_cache(cache: Any) -> None:
     name = type(cache).__name__.lower()
-    if "quantized" in name:
-        raise ContinuousSelfMTPUnsupported(
-            f"quantized cache {type(cache).__name__} is unsupported"
-        )
     if any(marker in name for marker in ("window", "rotating", "sink")):
         raise ContinuousSelfMTPUnsupported(
             f"windowed cache {type(cache).__name__} is unsupported"
@@ -845,7 +841,11 @@ class RapidMLXSelfMTPBackend:
 
 
 class RapidRaggedCacheAdapter:
-    """Merge/extend/rollback/extract adapter for mlx-lm 0.31.x caches."""
+    """Merge/extend/rollback/extract adapter for mlx-lm 0.31.x caches.
+
+    Quantized caches use mlx-lm-unified's native transaction surface.  The
+    adapter continues to reject rotating/windowed layouts before mutation.
+    """
 
     def __init__(
         self,

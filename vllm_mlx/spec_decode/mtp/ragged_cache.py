@@ -7,8 +7,9 @@ accept different numbers of draft tokens.  This module vendors the narrow
 control/cache adapter while Rapid remains pinned to ``mlx-lm>=0.31.3,<0.32``.
 
 Installation is explicit and idempotent.  Existing scalar ``trim`` and
-``restore_rollback`` methods are never replaced.  Unknown, quantized, and
-rotating/windowed caches fail loudly instead of receiving a uniform rewind.
+``restore_rollback`` methods are never replaced.  Unknown and rotating/windowed
+caches fail loudly instead of receiving a uniform rewind.  Quantized caches
+are admitted only through their native mlx-lm-unified ragged methods.
 The module imports no MLX surface until :func:`install_ragged_cache_rollback`
 is called, which keeps its contract testable with pure Python fakes.
 """
@@ -431,10 +432,6 @@ def _cache_children(cache: Any) -> tuple[Any, ...]:
 
 def _reject_unsupported_shape(cache: Any) -> None:
     name = type(cache).__name__.lower()
-    if "quantized" in name:
-        raise RaggedCacheUnsupportedError(
-            f"quantized cache {type(cache).__name__} has no supported ragged contract"
-        )
     if "rotating" in name or "window" in name:
         raise RaggedCacheUnsupportedError(
             f"windowed cache {type(cache).__name__} has no supported ragged contract"

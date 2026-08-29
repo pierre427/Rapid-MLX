@@ -39,7 +39,7 @@ def test_capability_descriptor_is_explicit_immutable_and_conservative(
         "atomic_cache_commit": True,
         "dynamic_join": dynamic_join,
         "flash_dynamic_membership_attested": False,
-        "quantized_cache": False,
+        "quantized_cache": True,
         "windowed_cache": False,
         "xtc": False,
     }

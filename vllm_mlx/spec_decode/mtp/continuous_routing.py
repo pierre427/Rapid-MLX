@@ -230,11 +230,9 @@ class ContinuousMTPIntegrationRouter:
                     f"exceeds self-MTP operating limit {prompt_limit}"
                 )
                 continue
-            if request.cache_quantized or request.cache_windowed:
+            if request.cache_windowed:
                 apc_plain.append(request.lane_id)
-                apc_reasons.append(
-                    f"{request.lane_id}: quantized/windowed cache is unsupported"
-                )
+                apc_reasons.append(f"{request.lane_id}: windowed cache is unsupported")
                 continue
             if request.apc_hit is not None:
                 eligibility = _evaluate_apc(request)
@@ -371,15 +369,9 @@ def plan_router_install(
     capabilities = BatchedMTPCapabilities(
         target_batch_forward=descriptor_core and callable(candidate),
         mtp_batch_forward=descriptor_core,
-        ragged_target_rollback=descriptor_core
-        and not cache_quantized
-        and not cache_windowed,
-        ragged_mtp_rollback=descriptor_core
-        and not cache_quantized
-        and not cache_windowed,
-        atomic_cache_commit=descriptor_core
-        and not cache_quantized
-        and not cache_windowed,
+        ragged_target_rollback=descriptor_core and not cache_windowed,
+        ragged_mtp_rollback=descriptor_core and not cache_windowed,
+        atomic_cache_commit=descriptor_core and not cache_windowed,
         dynamic_membership=descriptor_core
         and descriptor_map.get("dynamic_join") is True,
     )
@@ -435,15 +427,13 @@ def _runtime_refusals(
         "protocol_version": 1,
         "recursive_draft_depth": 2,
         "fixed_membership": True,
-        "quantized_cache": False,
+        "quantized_cache": True,
         "windowed_cache": False,
         "xtc": False,
     }
     for name, expected in required_descriptor.items():
         if descriptor.get(name) != expected:
             reasons.append(f"capability descriptor mismatch: {name}")
-    if runtime.cache_quantized:
-        reasons.append("quantized cache is unsupported")
     if runtime.cache_windowed:
         reasons.append("windowed cache is unsupported")
     reasons.extend(

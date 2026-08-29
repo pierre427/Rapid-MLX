@@ -540,9 +540,18 @@ def test_cache_adapter_merge_extend_extract_filter_and_atomic_preflight():
     assert remaining.target[0].rows == ["t1", "t3"]
 
 
-@pytest.mark.parametrize("name", ["QuantizedKVCache", "SinkWindowKVCache"])
-def test_cache_adapter_rejects_quantized_and_windowed_classes(name):
-    unsupported = type(name, (_LayerCache,), {})
+def test_cache_adapter_accepts_quantized_classes_with_transaction_surface():
+    quantized = type("QuantizedKVCache", (_LayerCache,), {})
+    pair = SelfMTPCachePair([quantized("target")], [_LayerCache("draft")])
+    adapter = RapidRaggedCacheAdapter(
+        preflight=lambda *a, **k: None, trim=lambda *a, **k: None
+    )
+    merged = adapter.attach(None, [pair])
+    assert type(merged.target[0]).__name__ == "QuantizedKVCache"
+
+
+def test_cache_adapter_rejects_windowed_classes():
+    unsupported = type("SinkWindowKVCache", (_LayerCache,), {})
     pair = SelfMTPCachePair([unsupported("target")], [_LayerCache("draft")])
     adapter = RapidRaggedCacheAdapter(
         preflight=lambda *a, **k: None, trim=lambda *a, **k: None

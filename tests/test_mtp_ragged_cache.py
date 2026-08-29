@@ -337,15 +337,31 @@ def test_qsa_rewinds_logical_rows_only_within_retained_raw_group():
         cache.preflight_ragged_trim([2, 1], verify_size=3)
 
 
-@pytest.mark.parametrize(
-    "cache_type, message",
-    [("BatchQuantizedKVCache", "quantized"), ("BatchRotatingKVCache", "windowed")],
-)
-def test_public_preflight_fails_loud_for_unsupported_cache_families(
-    cache_type, message
-):
-    cache = type(cache_type, (), {})()
-    with pytest.raises(RaggedCacheUnsupportedError, match=message):
+def test_public_preflight_accepts_native_quantized_ragged_contract():
+    events = []
+
+    class BatchQuantizedKVCache:
+        def preflight_ragged_trim(self, values, *, validate=True):
+            events.append(("preflight", tuple(values), validate))
+            return list(values)
+
+        def trim_ragged(self, values, *, validate=True):
+            self.preflight_ragged_trim(values, validate=validate)
+            events.append(("trim", tuple(values), validate))
+            return list(values)
+
+    cache = BatchQuantizedKVCache()
+    assert trim_ragged_cache(cache, [1, 0], verify_size=2) == [1, 0]
+    assert events == [
+        ("preflight", (1, 0), True),
+        ("preflight", (1, 0), False),
+        ("trim", (1, 0), False),
+    ]
+
+
+def test_public_preflight_fails_loud_for_windowed_cache_family():
+    cache = type("BatchRotatingKVCache", (), {})()
+    with pytest.raises(RaggedCacheUnsupportedError, match="windowed"):
         preflight_ragged_cache(cache, [1, 1], verify_size=2)
 
 
@@ -358,10 +374,10 @@ def test_cache_tree_preflights_every_member_before_mutating_anything():
 
     _install(FakeOps(), arrays=Arrays, batch_kv=Batch, qwen=None, qsa=None)
     first = Batch()
-    unsupported = type("QuantizedKVCache", (), {})()
+    unsupported = type("UnknownCache", (), {})()
     tree = SimpleNamespace(caches=(first, unsupported))
 
-    with pytest.raises(RaggedCacheUnsupportedError, match="quantized"):
+    with pytest.raises(RaggedCacheUnsupportedError, match="no ragged"):
         trim_ragged_cache(tree, [1, 1], verify_size=2)
     assert first._idx == 8
     assert first.offset.tolist() == [8, 6]
