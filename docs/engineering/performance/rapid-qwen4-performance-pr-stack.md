@@ -40,14 +40,15 @@ configurable per-lane transient estimate; that admission change is not yet
 ported into this Rapid stack. Rapid integration commits `be0b3e8c` and
 `d7cf5bbb` map to PRs 13--16 below. Corrective commits `b1be6d00` and
 `77eda833` map to PR 15A between fixed-cohort delivery and dynamic turnover;
-`001b1919` maps to the following PR 15B observability layer.
+`001b1919` maps to the following PR 15B observability layer, and `91af1da5`
+maps to PR 15C's target-only terminal drain.
 
 ## Dependency sequence
 
-The staged submission plan contains twenty code/test PR entries (counting 8A,
-12A, 15A, and 15B) plus the final documentation PR. Each publication branch
-follows Rapid's required prefix convention; private `codex/` refs are staging
-only.
+The staged submission plan contains twenty-one code/test PR entries (counting
+8A, 12A, 15A, 15B, and 15C) plus the final documentation PR. Each publication
+branch follows Rapid's required prefix convention; private `codex/` refs are
+staging only.
 
 | Order | Local commit / branch | Proposed PR | Default / hardware boundary |
 | ---: | --- | --- | --- |
@@ -70,6 +71,7 @@ only.
 | 15 | split from `d7cf5bbb` | `feat(mtp): deliver continuous fixed-cohort responses live` | Queue-atomicity fix/test blocks publication |
 | 15A | `b1be6d00`, `77eda833` | `fix(mtp): adopt native Qwen3.5 heads for continuous B1` | Native mixed packing preserved; serial uses continuous driver; hardware gate pending |
 | 15B | `001b1919` | `feat(mtp): expose continuous engine metrics` | Separate proposal/accept/commit/rollback/failure/timing series; live observation pending |
+| 15C | `91af1da5` | `fix(mtp): drain target-only terminal cycles` | Width-one target drain at final budget; true exhaustion fails closed; live rerun pending |
 | 16 | split from `d7cf5bbb` | `feat(mtp): admit and retire Qwen3.5 lanes at cycle boundaries` | Qwen3.5 only; memory cost and trained-head gates pending |
 | 17 | rebase `580042d2` docs last | `docs(perf): document continuous self-MTP batching` | Paper, figures, sequence, and PR packet; no Rapid perf claim |
 
@@ -79,8 +81,9 @@ commit `d7cf5bbb` adds default-off runtime assembly, scheduler delivery, and
 Qwen3.5 turnover. Publication must split that broad commit across PRs 14--16.
 PR 15A then corrects native embedded-head adoption and makes explicit serial
 continuous runs use the same driver at batched-B1. PR 15B adds the continuous
-engine's distinct operational metrics; PR 16 depends on that observable
-boundary.
+engine's distinct operational metrics. PR 15C then makes the final one-token
+budget a target-only transaction rather than an engine abort; PR 16 depends on
+that clean, observable detach boundary.
 
 The tip is greedy-only, does not consume APC prepared state, passes zero for
 incremental draft-token memory cost, and removes requests before driver
