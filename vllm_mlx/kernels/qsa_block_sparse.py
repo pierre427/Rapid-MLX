@@ -21,6 +21,11 @@ _SOURCE = r"""
     constexpr int VALUES_PER_LANE = HEAD_DIM / 32;
     constexpr int THREADS = GQA_HEADS * 32;
 
+    // Variable prompt geometry is a runtime uniform. Keeping it out of the
+    // template lets one compiled pipeline serve every prefill chunk width.
+    const int query_length = dims[0];
+    const int key_length = dims[1];
+
     const uint tid = thread_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint simdgroup = simdgroup_index_in_threadgroup;
@@ -41,13 +46,13 @@ _SOURCE = r"""
     for (int value_index = 0; value_index < VALUES_PER_LANE; ++value_index) {
         const int dim = int(lane) + value_index * 32;
         const int offset =
-            ((batch * QUERY_HEADS + query_head) * QUERY_LENGTH + query_index)
+            ((batch * QUERY_HEADS + query_head) * query_length + query_index)
             * HEAD_DIM + dim;
         query_values[value_index] = float(queries[offset]);
         output_values[value_index] = 0.0f;
     }
 
-    const int query_offset = batch * QUERY_LENGTH + query_index;
+    const int query_offset = batch * query_length + query_index;
     const int block_count = block_counts[query_offset];
     const int block_base = query_offset * BLOCK_TOPK;
     for (int block_index = 0; block_index < block_count; ++block_index) {
@@ -58,7 +63,7 @@ _SOURCE = r"""
             const int dim = element - token * HEAD_DIM;
             const int key_index = physical_start + token;
             const int offset =
-                ((batch * KV_HEADS + kv_head) * KEY_LENGTH + key_index)
+                ((batch * KV_HEADS + kv_head) * key_length + key_index)
                 * HEAD_DIM + dim;
             shared_keys[element] = keys[offset];
             shared_values[element] = values[offset];
@@ -97,7 +102,7 @@ _SOURCE = r"""
         const int key_index = tail_indices[tail_base + tail_index];
         for (int dim = int(tid); dim < HEAD_DIM; dim += THREADS) {
             const int offset =
-                ((batch * KV_HEADS + kv_head) * KEY_LENGTH + key_index)
+                ((batch * KV_HEADS + kv_head) * key_length + key_index)
                 * HEAD_DIM + dim;
             shared_keys[dim] = keys[offset];
             shared_values[dim] = values[offset];
@@ -127,7 +132,7 @@ _SOURCE = r"""
     for (int value_index = 0; value_index < VALUES_PER_LANE; ++value_index) {
         const int dim = int(lane) + value_index * 32;
         const int output_index =
-            ((batch * QUERY_HEADS + query_head) * QUERY_LENGTH + query_index)
+            ((batch * QUERY_HEADS + query_head) * query_length + query_index)
             * HEAD_DIM + dim;
         output[output_index] = running_sum == 0.0f
             ? T(0.0f)
@@ -148,6 +153,7 @@ def _kernel():
             "block_counts",
             "tail_indices",
             "tail_counts",
+            "dims",
         ],
         output_names=["output"],
         source=_SOURCE,
@@ -264,14 +270,13 @@ def block_sparse_attention(
             block_counts,
             tail_indices,
             tail_counts,
+            mx.array([query_length, key_length], dtype=mx.int32),
         ],
         template=[
             ("T", queries.dtype),
             ("QUERY_HEADS", query_heads),
             ("KV_HEADS", kv_heads),
             ("GQA_HEADS", gqa_heads),
-            ("QUERY_LENGTH", query_length),
-            ("KEY_LENGTH", key_length),
             ("HEAD_DIM", head_dim),
             ("BLOCK_SIZE", block_size),
             ("BLOCK_TOPK", block_topk),
