@@ -7,13 +7,21 @@ boundary: it delivers the prepared first token, limits one proposal to each
 lane's remaining token budget and stop-token set, and commits exactly the
 prefix that the caller receives.
 
-This milestone is intentionally fixed-cohort.  A lane reaching a terminal
-condition tears down the *whole* cohort after the open proposal is committed.
-Terminal lanes are marked for finalization; companion lanes are returned as
-resumable detach packages.  A later scheduler integration may form a new
-cohort from those companions, but it must not turn that turnover into an
-incremental join.  In particular, the wrapper never enables Flash dynamic
-membership, even if a lower-level runtime is accidentally over-attested.
+Membership policy follows the runtime.  When dynamic membership is **not**
+attested the wrapper is fixed-cohort: a lane reaching a terminal condition
+tears down the *whole* cohort after the open proposal is committed, terminal
+lanes are marked for finalization, and companion lanes are returned as
+resumable detach packages.  ``attach_lanes`` refuses incremental joins.
+
+When the runtime attests dynamic membership (``allow_dynamic_membership`` plus
+the ``dynamic_membership`` capability, and the Flash-specific attestation for a
+Flash architecture) the wrapper is a living batch: ``attach_lanes`` merges new
+lanes at a closed-transaction boundary and a terminal lane detaches by itself
+while its companions keep decoding.  A freshly attached lane delivers its
+prepared first token on its next serviced burst before it joins a proposal,
+mirroring the proven source contract.  Every membership change still happens
+only between transactions, and the underlying engine fails closed if the
+attestation is missing, so an over-eager driver cannot force an unsafe merge.
 
 No MLX type is imported here.  Model execution, cache merge/rollback/extract,
 and the target/MTP forward calls remain injected through ``continuous_engine``.
@@ -38,6 +46,7 @@ from .continuous_engine import (
     detach_self_mtp_lanes,
     prepare_self_mtp_lane,
     propose_batched_self_mtp,
+    supports_dynamic_membership,
 )
 
 
@@ -83,7 +92,9 @@ class ContinuousMTPDetachPackage:
     ``terminal`` distinguishes a request the scheduler should finalize from a
     companion that was detached only because fixed-cohort turnover was
     required.  Companion packages retain their canonical lane and cache pair
-    and are therefore resumable by a later integration.
+    and are therefore resumable by a later integration.  Under dynamic
+    membership a terminal lane detaches on its own, so every package a per-lane
+    detach yields is terminal and the surviving companions are never detached.
     """
 
     detached: DetachedSelfMTPLane
@@ -149,6 +160,10 @@ class _LaneDeliveryState:
     stop_tokens: frozenset[int]
     tokens: list[MTPToken] = field(default_factory=list)
     finish_reason: str | None = None
+    # A prepared first token that has not been delivered yet.  Set on cohort
+    # creation and on every dynamic join; cleared once the initial burst emits
+    # it.  A lane with a pending initial must never enter a proposal.
+    pending_initial: MTPToken | None = None
 
     @property
     def terminal(self) -> bool:
@@ -156,7 +171,11 @@ class _LaneDeliveryState:
 
 
 class ContinuousMTPGenerationBatch:
-    """Own one fixed cohort from preparation through full-cohort extraction."""
+    """Own one cohort from preparation through extraction.
+
+    Fixed-cohort by default; a living batch when the runtime attests dynamic
+    membership.
+    """
 
     def __init__(
         self,
@@ -168,8 +187,6 @@ class ContinuousMTPGenerationBatch:
         if len(first_tokens) != len(batch.lanes):
             raise ValueError("first_tokens must have one entry per lane")
         self._batch = batch
-        self._first_tokens = tuple(first_tokens)
-        self._initial_pending = True
         self._closed = False
         self._detached: tuple[ContinuousMTPDetachPackage, ...] = ()
         self._states = {
@@ -177,8 +194,9 @@ class ContinuousMTPGenerationBatch:
                 uid=lane.uid,
                 max_tokens=lane.max_tokens,
                 stop_tokens=stop_tokens[lane.uid],
+                pending_initial=first,
             )
-            for lane in batch.lanes
+            for lane, first in zip(batch.lanes, first_tokens)
         }
 
     @classmethod
@@ -216,12 +234,17 @@ class ContinuousMTPGenerationBatch:
         )
 
     @property
+    def dynamic_membership(self) -> bool:
+        """Whether this cohort's runtime attests incremental membership."""
+        return supports_dynamic_membership(self._batch._runtime)
+
+    @property
     def lane_uids(self) -> tuple[int, ...]:
         return tuple(self._states)
 
     @property
     def initial_pending(self) -> bool:
-        return self._initial_pending
+        return any(state.pending_initial is not None for state in self._states.values())
 
     @property
     def closed(self) -> bool:
@@ -245,24 +268,68 @@ class ContinuousMTPGenerationBatch:
             )
         return tuple(snapshots)
 
-    def attach_lanes(self, joining: Sequence[DetachedSelfMTPLane]) -> None:
-        """Refuse incremental joins at the wrapper's fixed-cohort boundary.
+    def attach_lanes(
+        self,
+        specs: Sequence[SelfMTPLaneSpec],
+        *,
+        stop_tokens: Mapping[int, Iterable[int]] | None = None,
+    ) -> tuple[int, ...]:
+        """Merge new lanes into the living batch at a transaction boundary.
 
-        This is unconditional, including for a Flash runtime whose lower-level
-        dynamic flags were set.  ``joining`` is accepted only to make the
-        scheduler integration seam explicit; its contents are never touched.
+        Refused unless the runtime attests dynamic membership (the engine's
+        ``attach_self_mtp_lanes`` fails closed on the same rule, so this can
+        never merge an unsafe cohort).  Each joined lane is prepared here so it
+        arrives with its own canonical caches and first token; that first token
+        is delivered on the next serviced burst before the lane joins any
+        proposal.  Returns the uids attached, in row order.
         """
-        del joining
-        raise ContinuousSelfMTPUnsupportedError(
-            "ContinuousMTPGenerationBatch is fixed-cohort; incremental join "
-            "is unsupported (including Flash)"
-        )
+        specs = tuple(specs)
+        self._require_open()
+        if not self.dynamic_membership:
+            raise ContinuousSelfMTPUnsupportedError(
+                "ContinuousMTPGenerationBatch is fixed-cohort; incremental join "
+                "is unsupported (including Flash) without dynamic-membership "
+                "attestation"
+            )
+        if not specs:
+            return ()
+        joining_uids = tuple(spec.uid for spec in specs)
+        if len(joining_uids) != len(set(joining_uids)):
+            raise ValueError("joining lane uid values must be unique")
+        overlap = set(joining_uids).intersection(self._states)
+        if overlap:
+            raise ValueError(
+                f"joining lanes reuse live uid values: {sorted(overlap)}"
+            )
+        normalized_stops = _normalize_stop_tokens(joining_uids, stop_tokens)
+
+        runtime = self._batch._runtime
+        prepared: list[DetachedSelfMTPLane] = []
+        first_tokens: list[MTPToken] = []
+        for spec in specs:
+            detached, first = prepare_self_mtp_lane(spec, runtime)
+            prepared.append(detached)
+            first_tokens.append(first)
+        self._batch = attach_self_mtp_lanes(self._batch, prepared, runtime=runtime)
+        for spec, first in zip(specs, first_tokens):
+            self._states[spec.uid] = _LaneDeliveryState(
+                uid=spec.uid,
+                max_tokens=spec.max_tokens,
+                stop_tokens=normalized_stops[spec.uid],
+                pending_initial=first,
+            )
+        return joining_uids
 
     def next_burst(self) -> ContinuousMTPGenerationBurst:
-        """Deliver initial tokens or run, bound, and commit one proposal."""
+        """Deliver pending initial tokens, or run and commit one proposal."""
         self._require_open()
-        if self._initial_pending:
-            return self._deliver_initial()
+        pending = [
+            uid
+            for uid in self.lane_uids
+            if self._states[uid].pending_initial is not None
+        ]
+        if pending:
+            return self._deliver_initial(pending)
 
         proposal = propose_batched_self_mtp(self._batch)
         planned: list[tuple[int, tuple[MTPToken, ...], str | None]] = []
@@ -294,7 +361,7 @@ class ContinuousMTPGenerationBatch:
                     finish_reason=state.finish_reason,
                 )
             )
-        detached = self._detach_cohort() if any(terminal) else ()
+        detached = self._resolve_terminals(terminal)
         return ContinuousMTPGenerationBurst(
             emissions=tuple(emissions),
             emitted_counts=tuple(emitted_counts),
@@ -306,19 +373,25 @@ class ContinuousMTPGenerationBatch:
         """Extract every lane/cache pair without inventing finish reasons.
 
         This is idempotent after a successful teardown.  It is suitable for
-        cancellation, shutdown, or scheduler turnover.  If the prepared first
-        tokens have not yet been delivered, their token ledger is intentionally
-        empty even though the detached canonical lane retains its ``cur``.
+        cancellation, shutdown, or scheduler turnover.  If a lane's prepared
+        first token has not yet been delivered, its token ledger is
+        intentionally empty even though the detached canonical lane retains its
+        ``cur``.
         """
         if self._closed:
             return self._detached
         return self._detach_cohort()
 
-    def _deliver_initial(self) -> ContinuousMTPGenerationBurst:
+    def _deliver_initial(
+        self, pending: Sequence[int]
+    ) -> ContinuousMTPGenerationBurst:
         emissions: list[ContinuousMTPLaneEmission] = []
-        terminal: list[bool] = []
-        for uid, token in zip(self.lane_uids, self._first_tokens):
+        terminal_by_row = [False] * len(self._batch.lanes)
+        row_of = {lane.uid: index for index, lane in enumerate(self._batch.lanes)}
+        for uid in pending:
             state = self._states[uid]
+            token = state.pending_initial
+            state.pending_initial = None
             state.tokens.append(token)
             if token.token in state.stop_tokens:
                 state.finish_reason = "stop"
@@ -332,15 +405,50 @@ class ContinuousMTPGenerationBatch:
                     finish_reason=state.finish_reason,
                 )
             )
-            terminal.append(state.terminal)
-        self._initial_pending = False
-        detached = self._detach_cohort() if any(terminal) else ()
+            if state.terminal:
+                terminal_by_row[row_of[uid]] = True
+        detached = self._resolve_terminals(terminal_by_row)
         return ContinuousMTPGenerationBurst(
             emissions=tuple(emissions),
             emitted_counts=tuple(1 for _ in emissions),
             initial=True,
             detached=detached,
         )
+
+    def _resolve_terminals(
+        self, terminal: Sequence[bool]
+    ) -> tuple[ContinuousMTPDetachPackage, ...]:
+        """Detach terminal lanes after a committed burst.
+
+        Dynamic membership detaches only the terminal rows and keeps the batch
+        alive for its companions; the fixed-cohort milestone (and the case
+        where every lane is terminal at once) tears the whole cohort down so
+        the survivors return as resumable packages.
+        """
+        indices = [row for row, is_terminal in enumerate(terminal) if is_terminal]
+        if not indices:
+            return ()
+        if self.dynamic_membership and len(indices) < len(self._batch.lanes):
+            return self._detach_indices(indices)
+        return self._detach_cohort()
+
+    def _detach_indices(
+        self, indices: Sequence[int]
+    ) -> tuple[ContinuousMTPDetachPackage, ...]:
+        """Detach the given terminal rows; the batch stays open for the rest."""
+        self._batch, detached = detach_self_mtp_lanes(self._batch, indices)
+        packages = []
+        for item in detached:
+            state = self._states.pop(item.lane.uid)
+            packages.append(
+                ContinuousMTPDetachPackage(
+                    detached=item,
+                    tokens=tuple(state.tokens),
+                    terminal=True,
+                    finish_reason=state.finish_reason,
+                )
+            )
+        return tuple(packages)
 
     def _detach_cohort(self) -> tuple[ContinuousMTPDetachPackage, ...]:
         if self._closed:

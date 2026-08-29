@@ -279,8 +279,16 @@ def plan_router_install(
     cache_windowed: bool = False,
     max_lanes: int = 4,
     hard_reserve_bytes: int = 8 * 1024**3,
+    allow_dynamic_membership: bool = False,
 ) -> ContinuousMTPRouterInstallDecision:
-    """Feature-detect a model and return an install plan without mutation."""
+    """Feature-detect a model and return an install plan without mutation.
+
+    ``allow_dynamic_membership`` opts the planned cohort into incremental joins
+    / partial detach.  It only sets policy intent here; the engine and
+    generation wrapper still fail closed unless the loaded runtime's
+    capabilities attest dynamic membership (and the Flash-specific attestation
+    for a Flash architecture), so an opt-in can never force an unsafe merge.
+    """
     candidate = getattr(model, "language_model", model)
     descriptor = getattr(candidate, "batched_mtp_capability", None)
     descriptor_map = descriptor if isinstance(descriptor, Mapping) else {}
@@ -330,7 +338,7 @@ def plan_router_install(
             enabled=enabled,
             max_lanes=max_lanes,
             hard_reserve_bytes=hard_reserve_bytes,
-            allow_dynamic_membership=False,
+            allow_dynamic_membership=allow_dynamic_membership,
         ),
         runtime=runtime,
     )

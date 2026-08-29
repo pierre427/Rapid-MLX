@@ -312,6 +312,27 @@ def _require_fixed_core(runtime: ContinuousSelfMTPRuntime) -> None:
         )
 
 
+def supports_dynamic_membership(runtime: ContinuousSelfMTPRuntime) -> bool:
+    """Return whether incremental attach / partial detach is attested.
+
+    This is the non-raising twin of ``_require_dynamic``: callers that must
+    branch on membership policy (the generation wrapper choosing per-lane
+    versus whole-cohort detach) read this, while call sites that perform a
+    membership change keep calling ``_require_dynamic`` to fail closed with a
+    specific reason.  Both share one gating rule so they can never disagree.
+    """
+    if runtime.config.allow_dynamic_membership is not True:
+        return False
+    if runtime.capabilities.dynamic_membership is not True:
+        return False
+    if (
+        "flash" in runtime.config.architecture.lower()
+        and runtime.capabilities.flash_dynamic_membership_attested is not True
+    ):
+        return False
+    return True
+
+
 def _require_dynamic(runtime: ContinuousSelfMTPRuntime) -> None:
     if runtime.config.allow_dynamic_membership is not True:
         raise ContinuousSelfMTPUnsupportedError(
@@ -638,4 +659,5 @@ __all__ = [
     "detach_self_mtp_lanes",
     "prepare_self_mtp_lane",
     "propose_batched_self_mtp",
+    "supports_dynamic_membership",
 ]

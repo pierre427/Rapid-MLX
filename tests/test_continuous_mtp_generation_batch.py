@@ -83,12 +83,14 @@ class _Caches:
         self.calls = []
 
     def attach(self, current, joining):
-        assert current is None
-        self.calls.append(("attach", tuple(joining)))
-        return engine.SelfMTPCachePair(
-            target=[pair.target for pair in joining],
-            draft=[pair.draft for pair in joining],
+        self.calls.append(
+            ("attach", None if current is None else "live", tuple(joining))
         )
+        target = [] if current is None else list(current.target)
+        draft = [] if current is None else list(current.draft)
+        target.extend(pair.target for pair in joining)
+        draft.extend(pair.draft for pair in joining)
+        return engine.SelfMTPCachePair(target=target, draft=draft)
 
     def rollback(self, caches, *, target_drops, draft_drops, verify_width):
         del caches
@@ -111,7 +113,16 @@ class _Caches:
         return remaining, detached
 
 
-def _runtime(*, flash_dynamic=False):
+def _runtime(*, dynamic=False, flash=False, flash_attested=None):
+    """Build a fake runtime.
+
+    ``dynamic`` attests incremental membership (``allow_dynamic_membership`` and
+    the ``dynamic_membership`` capability).  ``flash`` selects a Flash-family
+    architecture, whose join additionally needs ``flash_attested`` (defaults to
+    ``dynamic``) so the Flash-specific refusal can be exercised in isolation.
+    """
+    if flash_attested is None:
+        flash_attested = dynamic
     compute = _Compute()
     caches = _Caches()
     capabilities = engine.ContinuousSelfMTPCapabilities(
@@ -120,14 +131,14 @@ def _runtime(*, flash_dynamic=False):
         confirmed_target_forward=True,
         ragged_rollback=True,
         atomic_cache_commit=True,
-        dynamic_membership=flash_dynamic,
-        flash_dynamic_membership_attested=flash_dynamic,
+        dynamic_membership=dynamic,
+        flash_dynamic_membership_attested=flash_attested,
     )
     runtime = engine.ContinuousSelfMTPRuntime(
         config=engine.ContinuousSelfMTPConfig(
             enabled=True,
-            allow_dynamic_membership=flash_dynamic,
-            architecture="qwen4_flash_next" if flash_dynamic else "qwen3_5",
+            allow_dynamic_membership=dynamic,
+            architecture="qwen4_flash_next" if flash else "qwen3_5",
         ),
         capabilities=capabilities,
         forwards=engine.RapidForwardSeams(
@@ -272,15 +283,90 @@ def test_failed_commit_does_not_publish_delivery_ledger():
     assert batch.closed is False
 
 
-def test_flash_incremental_join_stays_impossible_despite_core_attestation():
-    runtime, _compute, _caches = _runtime(flash_dynamic=True)
+def test_fixed_cohort_wrapper_refuses_incremental_join():
+    # Core capabilities alone (no dynamic attestation) never unlock a join.
+    runtime, _compute, _caches = _runtime()
     batch = generation.ContinuousMTPGenerationBatch.create([_spec(1)], runtime)
+    assert batch.dynamic_membership is False
 
     with pytest.raises(
         engine.ContinuousSelfMTPUnsupportedError,
         match="fixed-cohort.*including Flash",
     ):
-        batch.attach_lanes([])
+        batch.attach_lanes([_spec(2)])
+
+
+def test_flash_join_refused_without_flash_attestation():
+    # Dynamic + core attested, but a Flash architecture still needs its own
+    # attestation; the wrapper reports non-dynamic and the engine fails closed.
+    runtime, _compute, _caches = _runtime(dynamic=True, flash=True, flash_attested=False)
+    batch = generation.ContinuousMTPGenerationBatch.create([_spec(1)], runtime)
+    assert batch.dynamic_membership is False
+
+    with pytest.raises(engine.ContinuousSelfMTPUnsupportedError, match="fixed-cohort"):
+        batch.attach_lanes([_spec(2)])
+
+
+def test_dynamic_join_delivers_first_token_then_participates_in_a_proposal():
+    runtime, compute, caches = _runtime(dynamic=True)
+    batch = generation.ContinuousMTPGenerationBatch.create([_spec(1)], runtime)
+    assert batch.dynamic_membership is True
+    batch.next_burst()  # lane 1 delivers its prepared first token
+
+    attached = batch.attach_lanes([_spec(2)])
+    assert attached == (2,)
+    assert batch.lane_uids == (1, 2)
+    # The merge went into a live batch, not a fresh one.
+    assert any(call[0] == "attach" and call[1] == "live" for call in caches.calls)
+
+    # The next burst delivers only the joined lane's prepared first token.
+    join_initial = batch.next_burst()
+    assert join_initial.initial is True
+    assert [emission.uid for emission in join_initial.emissions] == [2]
+    assert join_initial.emissions[0].token_ids == (102,)
+    assert not join_initial.detached
+    assert not any(call[0] == "propose" for call in compute.calls)
+
+    # Only now does a proposal run, over both lanes together.
+    compute.queued_outputs.append([(_target(111),), (_target(211),)])
+    proposal_burst = batch.next_burst()
+    assert proposal_burst.initial is False
+    assert ("propose", (1, 2)) in compute.calls
+    assert {emission.uid for emission in proposal_burst.emissions} == {1, 2}
+    assert batch.closed is False
+
+
+def test_dynamic_terminal_lane_detaches_alone_while_companions_continue():
+    runtime, compute, _caches = _runtime(dynamic=True)
+    batch = generation.ContinuousMTPGenerationBatch.create(
+        [_spec(1), _spec(2)], runtime, stop_tokens={1: {111}}
+    )
+    batch.next_burst()  # both deliver their prepared first tokens
+
+    compute.queued_outputs.append([(_target(111),), (_target(211),)])
+    burst = batch.next_burst()
+
+    # Lane 1 hit its stop token and detaches by itself; lane 2 keeps decoding.
+    assert [package.uid for package in burst.terminal_detaches] == [1]
+    assert burst.resumable_detaches == ()
+    assert burst.terminal_detaches[0].finish_reason == "stop"
+    assert batch.closed is False
+    assert batch.lane_uids == (2,)
+
+    # The survivor continues to produce tokens on its own.
+    compute.queued_outputs.append([(_target(212),)])
+    survivor = batch.next_burst()
+    assert [emission.uid for emission in survivor.emissions] == [2]
+    assert survivor.emissions[0].token_ids == (212,)
+    assert batch.closed is False
+
+
+def test_dynamic_join_rejects_a_uid_already_live():
+    runtime, _compute, _caches = _runtime(dynamic=True)
+    batch = generation.ContinuousMTPGenerationBatch.create([_spec(1)], runtime)
+    batch.next_burst()
+    with pytest.raises(ValueError, match="reuse live uid"):
+        batch.attach_lanes([_spec(1)])
 
 
 def test_stop_token_configuration_fails_closed_on_unknown_lane_or_bad_token():
