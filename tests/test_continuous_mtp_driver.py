@@ -195,6 +195,24 @@ def test_variable_burst_queues_and_drains_one_response_per_uid_before_next_step(
     assert sum(call[0] == "propose" for call in compute.calls) == 2
 
 
+def test_b1_target_only_terminal_response_drains_before_driver_closes() -> None:
+    runtime, compute, _caches = _runtime()
+    batch_driver = driver.ContinuousMTPDriver.create([_spec(1, max_tokens=2)], runtime)
+    assert _triples(batch_driver.next()) == [(1, 101, None)]
+    compute.queued_outputs.append([(_target(111),)])
+
+    final = batch_driver.next()
+
+    assert _triples(final) == [(1, 111, "length")]
+    assert final[0].prompt_cache == "target-cache-1"
+    assert final[0].all_tokens == [101, 111]
+    assert final[0].mtp_state == ("draft-cache-1", "hidden-1")
+    assert batch_driver.closed is True
+    assert batch_driver.has_pending_responses is False
+    assert batch_driver.next() == []
+    assert [package.uid for package in batch_driver.take_terminal_detaches()] == [1]
+
+
 def test_join_waits_for_delivery_drain_then_emits_joined_initial_before_proposal():
     runtime, compute, caches = _runtime()
     batch_driver = driver.ContinuousMTPDriver.create([_spec(1)], runtime)

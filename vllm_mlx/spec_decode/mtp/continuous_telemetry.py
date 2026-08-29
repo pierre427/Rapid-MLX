@@ -312,7 +312,7 @@ class ContinuousMTPCounters:
         array.
         """
 
-        proposed = _positive_int(proposed_draft_tokens, "proposed_draft_tokens")
+        proposed = _non_negative_int(proposed_draft_tokens, "proposed_draft_tokens")
         accepted = _non_negative_int(accepted_draft_tokens, "accepted_draft_tokens")
         committed = _positive_int(committed_tokens, "committed_tokens")
         verify = _non_negative_int(verify_rollbacks, "verify_rollbacks")
@@ -346,7 +346,7 @@ class ContinuousMTPCounters:
     ) -> None:
         """Publish a validated production proposal before its commit attempt."""
 
-        proposed = _positive_int(proposed_draft_tokens, "proposed_draft_tokens")
+        proposed = _non_negative_int(proposed_draft_tokens, "proposed_draft_tokens")
         verify = _non_negative_int(verify_rollbacks, "verify_rollbacks")
         draft_elapsed = _non_negative_float(draft_seconds, "draft_seconds")
         target_elapsed = _non_negative_float(

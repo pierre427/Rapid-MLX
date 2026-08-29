@@ -445,6 +445,65 @@ class RapidMLXSelfMTPBackend:
             backend_state={"forwards": forwards},
         )
 
+    def _target_only_drain(
+        self,
+        lanes: Sequence[SelfMTPLane],
+        target: Sequence[Any],
+        forwards: RapidForwardSeams,
+    ) -> CycleComputation:
+        """Emit one authoritative target token when no draft fits.
+
+        A lane with one token of output budget remaining is not terminal: it
+        needs the target bonus position but has no room for draft + bonus.  The
+        final transaction therefore runs the width-one target path, records no
+        draft work, and lets the normal commit/detach logic flush the owed
+        hidden/token pair into the draft cache.
+        """
+
+        verify_ids = self.ops.uint32([[lane.cur] for lane in lanes])
+        verify_lengths = [1] * len(lanes)
+        target_verify_started = time.perf_counter()
+        _prepare_group(target, verify_lengths)
+        try:
+            target_logits, target_hidden = self._forward_pair(
+                forwards.target(verify_ids, target, n_confirmed=0),
+                "target forward",
+            )
+        finally:
+            _finalize_group(target)
+
+        outputs: list[tuple[MTPToken, ...]] = []
+        bonuses: list[int] = []
+        hidden_rows = []
+        for row, lane in enumerate(lanes):
+            token, logprobs = self._distribution(
+                lane,
+                self._prefix(lane, [lane.cur]),
+                target_logits[row, 0],
+            )
+            bonuses.append(token)
+            outputs.append((MTPToken(token, logprobs, False),))
+            hidden_rows.append(target_hidden[row : row + 1, :1])
+        target_verify_seconds = time.perf_counter() - target_verify_started
+        zeros = tuple(0 for _ in lanes)
+        return CycleComputation(
+            lane_uids=tuple(lane.uid for lane in lanes),
+            draft_depths=zeros,
+            accepted_lengths=zeros,
+            target_drops=zeros,
+            draft_drops=zeros,
+            outputs=tuple(outputs),
+            payload=_CyclePayload(
+                old_curs=tuple(lane.cur for lane in lanes),
+                old_seed_hidden=tuple(lane.seed_hidden for lane in lanes),
+                drafts=tuple(() for _ in lanes),
+                verify_hidden=tuple(hidden_rows),
+                bonuses=tuple(bonuses),
+            ),
+            draft_seconds=0.0,
+            target_verify_seconds=target_verify_seconds,
+        )
+
     def propose(
         self,
         lanes: Sequence[SelfMTPLane],
@@ -454,18 +513,22 @@ class RapidMLXSelfMTPBackend:
         target, draft_cache = _validate_pair(caches)
         if not lanes:
             raise ValueError("cannot propose an empty batch")
+        remaining = tuple(lane.max_tokens - lane.ntoks for lane in lanes)
+        if any(value <= 0 for value in remaining):
+            raise ContinuousSelfMTPUnsupported(
+                "a terminal lane with no remaining output budget cannot enter "
+                "a continuous self-MTP proposal"
+            )
         depths = tuple(
             min(
                 self.draft_depth,
                 lane.num_draft,
-                max(lane.max_tokens - lane.ntoks - 1, 0),
+                max(value - 1, 0),
             )
-            for lane in lanes
+            for lane, value in zip(lanes, remaining)
         )
         if max(depths) == 0:
-            raise ContinuousSelfMTPUnsupported(
-                "all lanes are terminal; no K=2 proposal can be formed"
-            )
+            return self._target_only_drain(lanes, target, forwards)
 
         drafts: list[list[int]] = [[] for _ in lanes]
         draft_logprobs: list[list[Any]] = [[] for _ in lanes]

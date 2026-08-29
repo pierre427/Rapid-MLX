@@ -222,12 +222,12 @@ def _runtime(*, share_qsa_indices=False, draft_cache_factory=None):
     return runtime, forward, cache_events
 
 
-def _prepare(runtime, uid, prompt):
+def _prepare(runtime, uid, prompt, *, max_tokens=12):
     return prepare_self_mtp_lane(
         SelfMTPLaneSpec(
             uid=uid,
             prompt=prompt,
-            max_tokens=12,
+            max_tokens=max_tokens,
             num_draft=2,
         ),
         runtime,
@@ -265,6 +265,84 @@ def test_k2_recursive_draft_target_verify_and_delivery_commit():
     assert [lane.cur for lane in batch.lanes] == [19, 10]
     assert [lane.pending_tokens for lane in batch.lanes] == [[3, 4], [7, 8, 9]]
     assert [lane.ntoks for lane in batch.lanes] == [3, 4]
+
+
+def test_one_token_remaining_runs_target_only_then_detaches_exact_cache() -> None:
+    runtime, forward, cache_events = _runtime()
+    detached, first = _prepare(runtime, 0, [1, 2], max_tokens=2)
+    assert first.token == 3
+    batch = attach_self_mtp_lanes(None, [detached])
+    draft_calls_before = len([call for call in forward.calls if call[0] == "draft"])
+
+    proposal = propose_batched_self_mtp(batch)
+
+    assert proposal.draft_depths == (0,)
+    assert proposal.accepted_lengths == (0,)
+    assert proposal.outputs[0][0].token == 4
+    assert proposal.outputs[0][0].from_draft is False
+    assert proposal.draft_seconds == 0.0
+    assert proposal.target_verify_seconds > 0
+    assert len([call for call in forward.calls if call[0] == "draft"]) == (
+        draft_calls_before
+    )
+    target_call = [call for call in forward.calls if call[0] == "target"][-1]
+    assert target_call[1].tolist() == [[3]]
+    assert target_call[-1] == 0
+    assert ("trim", (0,), {"verify_size": 1, "validate": False}) in cache_events
+
+    commit_batched_self_mtp(
+        batch,
+        proposal,
+        emitted_counts=[1],
+        terminal=[True],
+    )
+    _remaining, extracted = detach_self_mtp_lanes(batch, [0])
+    assert extracted[0].lane.cur == 4
+    assert extracted[0].lane.ntoks == 2
+    # Detach flushes the one owed target-hidden/token pair into the draft
+    # cache; no speculative draft forward happened before that exact flush.
+    assert len([call for call in forward.calls if call[0] == "draft"]) == (
+        draft_calls_before + 1
+    )
+
+
+def test_all_terminal_b2_rows_share_one_target_only_forward() -> None:
+    runtime, forward, _cache_events = _runtime()
+    lane0, _ = _prepare(runtime, 0, [1, 2], max_tokens=2)
+    lane1, _ = _prepare(runtime, 1, [5, 6], max_tokens=2)
+    batch = attach_self_mtp_lanes(None, [lane0, lane1])
+    draft_calls_before = len([call for call in forward.calls if call[0] == "draft"])
+
+    proposal = propose_batched_self_mtp(batch)
+
+    assert proposal.draft_depths == (0, 0)
+    assert proposal.accepted_lengths == (0, 0)
+    assert [[token.token for token in row] for row in proposal.outputs] == [[4], [8]]
+    assert all(not row[0].from_draft for row in proposal.outputs)
+    assert len([call for call in forward.calls if call[0] == "draft"]) == (
+        draft_calls_before
+    )
+    target_call = [call for call in forward.calls if call[0] == "target"][-1]
+    assert target_call[1].tolist() == [[3], [7]]
+
+    commit_batched_self_mtp(
+        batch,
+        proposal,
+        emitted_counts=[1, 1],
+        terminal=[True, True],
+    )
+    _remaining, extracted = detach_self_mtp_lanes(batch, [0, 1])
+    assert [item.lane.ntoks for item in extracted] == [2, 2]
+    assert [item.lane.cur for item in extracted] == [4, 8]
+
+
+def test_truly_terminal_lane_with_zero_budget_remains_fail_closed() -> None:
+    runtime, _forward, _cache_events = _runtime()
+    detached, _ = _prepare(runtime, 0, [1, 2], max_tokens=1)
+    batch = attach_self_mtp_lanes(None, [detached])
+
+    with pytest.raises(ContinuousSelfMTPUnsupported, match="no remaining output"):
+        propose_batched_self_mtp(batch)
 
 
 def test_next_cycle_flushes_persistent_pending_pairs_before_new_drafts():

@@ -191,6 +191,66 @@ def test_initial_tokens_are_emitted_once_and_terminal_detaches_whole_cohort():
     assert caches.calls[-1] == ("detach", (0, 1), ())
 
 
+def test_max_tokens_one_closes_on_initial_without_forming_proposal() -> None:
+    runtime, compute, _caches = _runtime()
+    batch = generation.ContinuousMTPGenerationBatch.create(
+        [_spec(1, max_tokens=1), _spec(2, max_tokens=1)], runtime
+    )
+
+    burst = batch.next_burst()
+
+    assert burst.initial is True
+    assert all(emission.finish_reason == "length" for emission in burst.emissions)
+    assert batch.closed is True
+    assert not any(call[0] == "propose" for call in compute.calls)
+
+
+def test_max_tokens_two_commits_target_only_b1_and_detaches() -> None:
+    counters = telemetry_module.ContinuousMTPCounters()
+    runtime, compute, _caches = _runtime(telemetry=counters)
+    compute.queued_outputs.append([(_target(111),)])
+    batch = generation.ContinuousMTPGenerationBatch.create(
+        [_spec(1, max_tokens=2)], runtime
+    )
+    batch.next_burst()
+
+    burst = batch.next_burst()
+
+    assert burst.emitted_counts == (1,)
+    assert burst.emissions[0].token_ids == (111,)
+    assert burst.emissions[0].finish_reason == "length"
+    assert burst.terminal_detaches[0].token_ids == (101, 111)
+    assert batch.closed is True
+    snapshot = counters.snapshot()
+    assert snapshot.proposed_draft_tokens == 0
+    assert snapshot.accepted_draft_tokens == 0
+    assert snapshot.committed_tokens == 1
+    assert snapshot.accept_ratio == 0.0
+
+
+def test_all_terminal_b2_cohort_commits_target_only_and_detaches_together() -> None:
+    runtime, compute, _caches = _runtime()
+    compute.queued_outputs.append([(_target(111),), (_target(211),)])
+    batch = generation.ContinuousMTPGenerationBatch.create(
+        [_spec(1, max_tokens=2), _spec(2, max_tokens=2)], runtime
+    )
+    batch.next_burst()
+
+    burst = batch.next_burst()
+
+    assert burst.emitted_counts == (1, 1)
+    assert [emission.finish_reason for emission in burst.emissions] == [
+        "length",
+        "length",
+    ]
+    assert [package.uid for package in burst.terminal_detaches] == [1, 2]
+    assert [package.token_ids for package in burst.terminal_detaches] == [
+        (101, 111),
+        (102, 211),
+    ]
+    assert batch.closed is True
+
+
 def test_one_proposal_burst_commits_exact_stop_prefix_then_extracts_caches():
     runtime, compute, _caches = _runtime()
     compute.queued_outputs.append([(_draft(111), _target(112)), (_target(212),)])
