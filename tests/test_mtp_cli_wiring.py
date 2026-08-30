@@ -292,13 +292,15 @@ def test_config_vetted_mtp_support_allowlist_is_qwen_only():
     assert _config_vetted_mtp_supports_spec_decode(None) is False
 
 
-def test_qwen4_native_mtp_depth_is_one_and_rejects_explicit_deeper_chain():
+def test_qwen4_native_mtp_depth_supports_validated_recursive_k2():
     from vllm_mlx.cli import _resolve_mtp_depth_for_model
 
-    assert _resolve_mtp_depth_for_model("qwen4_exp", 3, explicit=False) == 1
+    assert _resolve_mtp_depth_for_model("qwen4_exp", 3, explicit=False) == 2
+    assert _resolve_mtp_depth_for_model("qwen4_exp", 1, explicit=True) == 1
+    assert _resolve_mtp_depth_for_model("qwen4_exp", 2, explicit=True) == 2
     assert _resolve_mtp_depth_for_model("qwen3_5", 3, explicit=True) == 3
-    with pytest.raises(ValueError, match="num_speculative_tokens=1 only"):
-        _resolve_mtp_depth_for_model("qwen4_exp", 2, explicit=True)
+    with pytest.raises(ValueError, match="num_speculative_tokens=1 or 2 only"):
+        _resolve_mtp_depth_for_model("qwen4_exp", 3, explicit=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3452,7 +3454,7 @@ def test_apply_mtp_cli_model_type_reconciliation_prefers_eligibility_on_disagree
     )
 
 
-def test_apply_mtp_cli_reconciliation_caps_qwen4_default_depth():
+def test_apply_mtp_cli_reconciliation_caps_qwen4_default_depth_at_k2():
     from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
     from vllm_mlx.scheduler import SchedulerConfig
 
@@ -3466,14 +3468,26 @@ def test_apply_mtp_cli_reconciliation_caps_qwen4_default_depth():
     )
 
     assert sc.mtp_model_type == "qwen4_exp"
-    assert sc.mtp_max_k == 1
+    assert sc.mtp_max_k == 2
 
 
-def test_apply_mtp_cli_reconciliation_rejects_explicit_qwen4_depth(capsys):
+def test_apply_mtp_cli_reconciliation_accepts_k2_and_rejects_k3(capsys):
     from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
     from vllm_mlx.scheduler import SchedulerConfig
 
     sc = SchedulerConfig(spec_decode="mtp", mtp_max_k=3)
+    _apply_mtp_cli_model_type_reconciliation(
+        scheduler_config=sc,
+        hf_cfg_eligibility={
+            "model_type": "qwen4_exp",
+            "mtp_num_hidden_layers": 1,
+        },
+        logger=None,
+        requested_depth=2,
+        explicit_depth=True,
+    )
+    assert sc.mtp_max_k == 2
+
     with pytest.raises(SystemExit, match="2"):
         _apply_mtp_cli_model_type_reconciliation(
             scheduler_config=sc,
@@ -3482,11 +3496,11 @@ def test_apply_mtp_cli_reconciliation_rejects_explicit_qwen4_depth(capsys):
                 "mtp_num_hidden_layers": 1,
             },
             logger=None,
-            requested_depth=2,
+            requested_depth=3,
             explicit_depth=True,
         )
 
-    assert "num_speculative_tokens=1 only" in capsys.readouterr().err
+    assert "num_speculative_tokens=1 or 2 only" in capsys.readouterr().err
 
 
 def test_install_mtp_vendored_uid_reuse_clears_stale_state(monkeypatch):

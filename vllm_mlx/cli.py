@@ -1295,12 +1295,12 @@ def _resolve_mtp_depth_for_model(
 
     if model_type != "qwen4_exp":
         return requested
-    if explicit and requested != 1:
+    if explicit and requested not in (1, 2):
         raise ValueError(
             "Qwen3.8 Flash-Next native MTP currently supports "
-            "num_speculative_tokens=1 only"
+            "num_speculative_tokens=1 or 2 only"
         )
-    return 1
+    return min(requested, 2)
 
 
 def _check_alias_min_memory(user_typed: str) -> None:
