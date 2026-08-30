@@ -10,6 +10,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
+from vllm_mlx.scheduler import _continuous_mtp_effective_context
 from vllm_mlx.spec_decode.config import (
     SpeculativeConfigError,
     parse_speculative_config,
@@ -438,8 +439,30 @@ def test_exact_apc_sidecar_is_validated_and_carried_as_a_resume_plan():
     assert restored.spec.prompt == (999,)
     assert restored.spec.prompt_cache == "target-cache"
     assert restored.spec.mtp_cache == "mtp-cache"
+    assert restored.spec.seed_hidden == "seed-hidden"
+    assert restored.spec.cached_prefix == prefix
     assert restored.prepared_state is hit.state
     assert decision.live_token_delivery is False
+
+
+def test_apc_effective_context_does_not_count_cached_prefix_twice():
+    assert _continuous_mtp_effective_context(
+        request_prompt_tokens=403,
+        cached_tokens=381,
+        remaining_tokens=range(22),
+        history=(),
+        prompt=range(403),
+    ) == 403
+
+
+def test_effective_context_can_reconstruct_suffix_only_prompt_length():
+    assert _continuous_mtp_effective_context(
+        request_prompt_tokens=0,
+        cached_tokens=381,
+        remaining_tokens=range(22),
+        history=(),
+        prompt=range(22),
+    ) == 403
 
 
 def test_bad_apc_sidecar_routes_plain_while_other_lanes_form_cohort():

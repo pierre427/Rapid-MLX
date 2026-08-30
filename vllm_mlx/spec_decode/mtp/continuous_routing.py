@@ -477,6 +477,8 @@ def _planned_lane(
     prompt = request.prompt_tokens
     target_cache = None
     mtp_cache = None
+    seed_hidden = None
+    cached_prefix = None
     if restore is not None and restore.eligible:
         assert request.apc_hit is not None and restore.resume_at is not None
         prepared = request.apc_hit.state
@@ -484,6 +486,8 @@ def _planned_lane(
         prompt = request.prompt_tokens[resume_at:]
         target_cache = prepared.target_cache
         mtp_cache = prepared.mtp_cache
+        seed_hidden = prepared.seed_hidden
+        cached_prefix = request.prompt_tokens[:resume_at]
     return PlannedContinuousMTPLane(
         lane_id=request.lane_id,
         spec=SelfMTPLaneSpec(
@@ -498,6 +502,8 @@ def _planned_lane(
             ),
             prompt_cache=target_cache,
             mtp_cache=mtp_cache,
+            seed_hidden=seed_hidden,
+            cached_prefix=cached_prefix,
         ),
         stop_tokens=request.stop_tokens,
         prepared_state=prepared,

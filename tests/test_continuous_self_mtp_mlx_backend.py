@@ -345,6 +345,51 @@ def test_truly_terminal_lane_with_zero_budget_remains_fail_closed() -> None:
         propose_batched_self_mtp(batch)
 
 
+def test_apc_resume_pairs_saved_seed_with_first_uncached_token():
+    runtime, forward, _events = _runtime()
+    seed = np.full((1, 1, 4), 42.0)
+    target_cache = [_LayerCache("restored-target")]
+    draft_cache = [_LayerCache("restored-draft")]
+
+    detached, first = prepare_self_mtp_lane(
+        SelfMTPLaneSpec(
+            uid=7,
+            prompt=[9],
+            max_tokens=12,
+            num_draft=2,
+            prompt_cache=target_cache,
+            mtp_cache=draft_cache,
+            seed_hidden=seed,
+            cached_prefix=[1, 2, 3, 4],
+        ),
+        runtime,
+    )
+
+    assert first.token == 10
+    assert detached.caches.target[0] is target_cache[0]
+    assert detached.caches.draft[0] is draft_cache[0]
+    assert detached.lane.token_prefix.tolist() == [1, 2, 3, 4, 9]
+    draft_call = next(call for call in forward.calls if call[0] == "draft")
+    assert draft_call[1].tolist() == seed.tolist()
+    assert draft_call[2].tolist() == [[9]]
+
+
+def test_partial_apc_resume_state_fails_closed():
+    runtime, _forward, _events = _runtime()
+
+    with pytest.raises(ContinuousSelfMTPUnsupported, match="partial APC state"):
+        prepare_self_mtp_lane(
+            SelfMTPLaneSpec(
+                uid=7,
+                prompt=[9],
+                max_tokens=12,
+                num_draft=2,
+                prompt_cache=[_LayerCache("target-only")],
+            ),
+            runtime,
+        )
+
+
 def test_next_cycle_flushes_persistent_pending_pairs_before_new_drafts():
     runtime, forward, _events = _runtime()
     lane0, _ = _prepare(runtime, 0, [1, 2])

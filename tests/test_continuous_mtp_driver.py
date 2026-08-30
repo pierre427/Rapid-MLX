@@ -344,6 +344,7 @@ def test_terminal_detach_is_published_on_final_response_and_survivor_continues()
     assert terminal[0].prompt_cache == "target-cache-1"
     assert terminal[0].all_tokens == [101, 111, 112]
     assert terminal[0].mtp_state == ("draft-cache-1", "hidden-1")
+    assert terminal[0].mtp_cache_tokens == [1]
     packages = batch_driver.take_terminal_detaches()
     assert [package.uid for package in packages] == [1]
     assert batch_driver.take_resumable_detaches() == ()

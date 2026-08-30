@@ -141,6 +141,8 @@ class SelfMTPLaneSpec:
     sampling: SelfMTPSampling = SelfMTPSampling()
     prompt_cache: Any = None
     mtp_cache: Any = None
+    seed_hidden: Any = None
+    cached_prefix: Any = None
 
     def __post_init__(self) -> None:
         if isinstance(self.uid, bool) or not isinstance(self.uid, int):

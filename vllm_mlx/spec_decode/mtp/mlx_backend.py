@@ -378,12 +378,36 @@ class RapidMLXSelfMTPBackend:
 
         target = self._cache(spec.prompt_cache, self.target_cache_factory, "target")
         draft = self._cache(spec.mtp_cache, self.draft_cache_factory, "draft")
+        restored = spec.seed_hidden is not None
+        if restored and (
+            spec.prompt_cache is None
+            or spec.mtp_cache is None
+            or spec.cached_prefix is None
+        ):
+            raise ContinuousSelfMTPUnsupported(
+                "APC restore requires cached prefix, target cache, MTP cache, "
+                "and seed hidden"
+            )
+        if not restored and (
+            spec.prompt_cache is not None
+            or spec.mtp_cache is not None
+            or spec.cached_prefix is not None
+        ):
+            raise ContinuousSelfMTPUnsupported(
+                "partial APC state cannot seed continuous self-MTP"
+            )
         prompt = self.ops.uint32(spec.prompt)
         if len(prompt.shape) != 1 or int(prompt.shape[0]) < 1:
             raise ValueError("prompt must be a non-empty rank-1 token array")
+        full_prefix = prompt
+        if restored:
+            cached_prefix = self.ops.uint32(spec.cached_prefix)
+            if len(cached_prefix.shape) != 1 or int(cached_prefix.shape[0]) < 1:
+                raise ValueError("cached_prefix must be a non-empty rank-1 token array")
+            full_prefix = self.ops.concatenate([cached_prefix, prompt], axis=0)
 
         y = prompt
-        previous_hidden = None
+        previous_hidden = spec.seed_hidden
         while int(y.shape[0]) > 1:
             n = min(self.prefill_step_size, int(y.shape[0]) - 1)
             _, hidden = self._forward_pair(
@@ -428,18 +452,18 @@ class RapidMLXSelfMTPBackend:
             uid=spec.uid,
             cur=0,
             seed_hidden=hidden[:, -1:],
-            token_prefix=prompt,
+            token_prefix=full_prefix,
             ntoks=0,
             max_tokens=spec.max_tokens,
             num_draft=spec.num_draft,
             sampling=spec.sampling,
         )
-        token, logprobs = self._distribution(temporary_lane, prompt, final_logits)
+        token, logprobs = self._distribution(temporary_lane, full_prefix, final_logits)
         first = MTPToken(token, logprobs, False)
         return PreparedLaneData(
             cur=token,
             seed_hidden=hidden[:, -1:],
-            token_prefix=prompt,
+            token_prefix=full_prefix,
             caches=SelfMTPCachePair(target=target, draft=draft),
             first_token=first,
             backend_state={"forwards": forwards},

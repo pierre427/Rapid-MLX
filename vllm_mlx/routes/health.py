@@ -362,6 +362,12 @@ async def status():
             or stats.get("prefix_cache")
             or {"enabled": False}
         ),
+        # Joint target+MTP APC restore is a stricter event than an ordinary
+        # target-prefix hit. Keep its bounded, label-free counters separate so
+        # a service probe can prove the prepared-state path actually ran.
+        "continuous_mtp_apc": stats.get(
+            "continuous_mtp_apc", {"enabled": False}
+        ),
         "requests": stats.get("requests", []),
     }
 

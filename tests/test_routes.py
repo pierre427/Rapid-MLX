@@ -567,6 +567,24 @@ class TestHealthRoutes:
         finally:
             self._restore_config(orig)
 
+    def test_status_exposes_continuous_mtp_apc_receipts(self, mock_engine):
+        receipts = {
+            "entries": 1,
+            "payload_nbytes": 4096,
+            "captures_accepted": 1,
+            "restore_reasons": {"eligible": 1, "boundary_mismatch": 0},
+        }
+        mock_engine.get_stats.return_value = {
+            **mock_engine.get_stats.return_value,
+            "continuous_mtp_apc": receipts,
+        }
+        orig = self._patch_config(engine=mock_engine, model_name="test-model")
+        try:
+            data = TestClient(self._make_app()).get("/v1/status").json()
+            assert data["continuous_mtp_apc"] == receipts
+        finally:
+            self._restore_config(orig)
+
     def test_status_handles_non_dict_batch_generator(self, mock_engine):
         """Defensive: malformed batch_generator (not a dict) must not 500.
 
