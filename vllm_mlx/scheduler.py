@@ -548,6 +548,13 @@ class SchedulerConfig:
     # or request-admission accounting.
     mtp_lane_transient_gib: float = 1.76
 
+    # Context-aware operating envelope. Zero leaves the corresponding route
+    # unrestricted; measured model profiles can set independent service and
+    # serial cutoffs without transferring one architecture's sweet spot to
+    # another.
+    mtp_multi_lane_max_prompt_tokens: int = 0
+    mtp_single_lane_max_prompt_tokens: int = 0
+
     def __post_init__(self) -> None:
         if not isinstance(self.mtp_continuous_batching, bool):
             raise ValueError("mtp_continuous_batching must be a boolean")
@@ -567,6 +574,13 @@ class SchedulerConfig:
             or self.mtp_lane_transient_gib <= 0
         ):
             raise ValueError("mtp_lane_transient_gib must be positive")
+        for name in (
+            "mtp_multi_lane_max_prompt_tokens",
+            "mtp_single_lane_max_prompt_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
         if self.mtp_continuous_batching and self.spec_decode != "mtp":
             raise ValueError("mtp_continuous_batching requires spec_decode='mtp'")
         if self.mtp_allow_dynamic_membership and not self.mtp_continuous_batching:
@@ -875,6 +889,12 @@ def _install_continuous_mtp_router(
         allow_dynamic_membership=bool(
             getattr(config, "mtp_allow_dynamic_membership", False)
         ),
+        multi_lane_max_prompt_tokens=int(
+            getattr(config, "mtp_multi_lane_max_prompt_tokens", 0)
+        ),
+        single_lane_max_prompt_tokens=int(
+            getattr(config, "mtp_single_lane_max_prompt_tokens", 0)
+        ),
     )
     if not decision.admitted or decision.router is None:
         logger.warning(
@@ -1060,6 +1080,9 @@ def _install_continuous_mtp_router(
         for sequence, metadata in _queued_candidates():
             if len(joining_specs) >= room:
                 break
+            prompt_limit = router.config.multi_lane_max_prompt_tokens
+            if prompt_limit and len(metadata.prompt_tokens) > prompt_limit:
+                continue
             lane = LaneAdmission(
                 lane_id=metadata.lane_id,
                 base_bytes=metadata.base_bytes,
@@ -1176,6 +1199,7 @@ def _install_mtp_vendored(
     max_k: int = 3,
     disable_auto_k: bool = False,
     controller_key: str | None = None,
+    max_prompt_tokens: int = 0,
 ) -> bool:
     """Install the vendored PR #990 ``mtp_generate_step`` hot loop into
     ``GenerationBatch._step``.
@@ -1726,6 +1750,27 @@ def _install_mtp_vendored(
                     f"{uid}; request removal is required before this slot can "
                     "return to plain decode."
                 )
+
+        # A context policy refusal reaches this lower single-lane wrapper after
+        # the continuous router leaves the request in mlx-lm's queue. Keep it
+        # on true plain decode before any MTP state is constructed. Multi-lane
+        # fallback is already plain because this wrapper is B=1-only.
+        if max_prompt_tokens and uid not in _state:
+            req_id = uid_to_request_id.get(uid) if uid_to_request_id else None
+            req = requests.get(req_id) if requests is not None and req_id else None
+            prompt_tokens = int(
+                getattr(req, "model_prompt_tokens", 0)
+                or getattr(req, "num_prompt_tokens", 0)
+                or 0
+            )
+            if prompt_tokens > max_prompt_tokens:
+                _mark_disabled(uid)
+                _log_mtp_initial_skip_once(
+                    uid,
+                    f"prompt length {prompt_tokens} exceeds serial operating "
+                    f"limit {max_prompt_tokens}",
+                )
+                return _orig_step()
 
         # Codex round-D blocker #2 + round-E blocker #1: honour the
         # permanent-skip map BEFORE re-entering FIRST-call
@@ -4431,6 +4476,9 @@ class Scheduler:
                         or getattr(getattr(self, "model_config", None), "name", None)
                         or getattr(self.config, "model_name", None),
                         getattr(self.config, "mtp_sidecar", None),
+                    ),
+                    max_prompt_tokens=getattr(
+                        self.config, "mtp_single_lane_max_prompt_tokens", 0
                     ),
                 )
                 if mtp_installed:

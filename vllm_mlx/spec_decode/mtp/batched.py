@@ -71,6 +71,8 @@ class BatchedMTPConfig:
     hard_reserve_bytes: int = 8 * 1024**3
     allow_dynamic_membership: bool = False
     queue_on_memory_pressure: bool = True
+    multi_lane_max_prompt_tokens: int = 0
+    single_lane_max_prompt_tokens: int = 0
 
     def __post_init__(self) -> None:
         boolean_fields = (
@@ -100,6 +102,13 @@ class BatchedMTPConfig:
             raise ValueError("min_batch_lanes cannot exceed max_lanes")
         if self.hard_reserve_bytes < 0:
             raise ValueError("hard_reserve_bytes cannot be negative")
+        for name in (
+            "multi_lane_max_prompt_tokens",
+            "single_lane_max_prompt_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
 
 
 @dataclass(frozen=True)

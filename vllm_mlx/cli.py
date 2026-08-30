@@ -4221,6 +4221,12 @@ def serve_command(args):
         mtp_speculation_rollback=getattr(args, "mtp_speculation_rollback", False),
         mtp_max_lanes=getattr(args, "self_mtp_max_lanes", 16),
         mtp_lane_transient_gib=getattr(args, "self_mtp_lane_transient_gib", 1.76),
+        mtp_multi_lane_max_prompt_tokens=getattr(
+            args, "self_mtp_multi_lane_max_prompt_tokens", 0
+        ),
+        mtp_single_lane_max_prompt_tokens=getattr(
+            args, "self_mtp_single_lane_max_prompt_tokens", 0
+        ),
         # SuffixDecoding
         enable_suffix_decoding=args.suffix_decoding,
         suffix_max_draft=args.suffix_max_draft,
@@ -10521,6 +10527,26 @@ Examples:
         help=(
             "Total k=2 verify transient charged per continuous self-MTP lane "
             "(default: 1.76 GiB; dense Qwen3.8-27B measures about 3.1 GiB)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--self-mtp-multi-lane-max-prompt-tokens",
+        type=non_negative_int,
+        default=0,
+        metavar="TOKENS",
+        help=(
+            "Maximum prompt length for multi-request continuous self-MTP; "
+            "longer requests use plain decode (default: 0, unlimited)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--self-mtp-single-lane-max-prompt-tokens",
+        type=non_negative_int,
+        default=0,
+        metavar="TOKENS",
+        help=(
+            "Maximum prompt length for batched-B1 or legacy single-lane MTP; "
+            "longer requests use plain decode (default: 0, unlimited)."
         ),
     )
     # Hidden deprecated aliases. They are intentionally absent from help;

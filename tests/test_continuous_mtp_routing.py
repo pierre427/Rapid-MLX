@@ -220,6 +220,31 @@ def test_b1_is_explicit_to_continuous_integration_and_default_stays_batch_first(
     assert "cache is not ready" in " ".join(refused.reasons)
 
 
+def test_context_policy_has_independent_service_and_serial_cutoffs():
+    router = _router(
+        min_batch_lanes=1,
+        multi_lane_max_prompt_tokens=4,
+        single_lane_max_prompt_tokens=8,
+    )
+    short = _request("short", 1, prompt_tokens=(1, 2, 3, 4))
+    long = _request("long", 2, prompt_tokens=(1, 2, 3, 4, 5))
+
+    service = router.plan([short, long], free_bytes=1)
+    assert service.route is ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED
+    assert [lane.lane_id for lane in service.cohort] == ["short"]
+    assert service.plain_lane_ids == ("long",)
+    assert "operating limit 4" in " ".join(service.reasons)
+
+    serial = router.plan([long], free_bytes=1)
+    assert serial.route is ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED
+
+    too_long = _request("too-long", 3, prompt_tokens=tuple(range(9)))
+    refused = router.plan([too_long], free_bytes=1)
+    assert refused.route is ContinuousMTPIntegrationRoute.PLAIN_DECODE
+    assert refused.plain_lane_ids == ("too-long",)
+    assert "operating limit 8" in " ".join(refused.reasons)
+
+
 def test_live_integration_executes_b1_continuous_driver(monkeypatch, caplog):
     import vllm_mlx.scheduler as scheduler
     from vllm_mlx.spec_decode.mtp import continuous_driver, continuous_runtime
@@ -505,8 +530,12 @@ def test_cli_and_scheduler_config_carry_the_default_off_opt_in_by_ast():
     assert "mtp_allow_dynamic_membership=getattr(" in cli_source
     assert '"--self-mtp-max-lanes"' in cli_source
     assert '"--self-mtp-lane-transient-gib"' in cli_source
+    assert '"--self-mtp-multi-lane-max-prompt-tokens"' in cli_source
+    assert '"--self-mtp-single-lane-max-prompt-tokens"' in cli_source
     assert "mtp_max_lanes: int = 16" in scheduler_source
     assert "mtp_lane_transient_gib: float = 1.76" in scheduler_source
+    assert "mtp_multi_lane_max_prompt_tokens: int = 0" in scheduler_source
+    assert "mtp_single_lane_max_prompt_tokens: int = 0" in scheduler_source
 
 
 def test_scheduler_config_validates_continuous_mtp_admission_controls():
@@ -517,9 +546,13 @@ def test_scheduler_config_validates_continuous_mtp_admission_controls():
         mtp_continuous_batching=True,
         mtp_max_lanes=16,
         mtp_lane_transient_gib=3.1,
+        mtp_multi_lane_max_prompt_tokens=16384,
+        mtp_single_lane_max_prompt_tokens=49152,
     )
     assert config.mtp_max_lanes == 16
     assert config.mtp_lane_transient_gib == 3.1
+    assert config.mtp_multi_lane_max_prompt_tokens == 16384
+    assert config.mtp_single_lane_max_prompt_tokens == 49152
 
     with pytest.raises(ValueError, match="mtp_max_lanes"):
         SchedulerConfig(mtp_max_lanes=0)
@@ -527,6 +560,10 @@ def test_scheduler_config_validates_continuous_mtp_admission_controls():
         SchedulerConfig(mtp_lane_transient_gib=0)
     with pytest.raises(ValueError, match="mtp_lane_transient_gib"):
         SchedulerConfig(mtp_lane_transient_gib=float("inf"))
+    with pytest.raises(ValueError, match="mtp_multi_lane_max_prompt_tokens"):
+        SchedulerConfig(mtp_multi_lane_max_prompt_tokens=-1)
+    with pytest.raises(ValueError, match="mtp_single_lane_max_prompt_tokens"):
+        SchedulerConfig(mtp_single_lane_max_prompt_tokens=-1)
 
 
 def test_live_router_charges_k2_transient_and_compute_cap_by_source():

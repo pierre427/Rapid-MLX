@@ -187,7 +187,19 @@ class ContinuousMTPIntegrationRouter:
         apc_plain: list[str] = []
         apc_reasons: list[str] = []
         candidates: list[LaneAdmission] = []
+        prompt_limit = (
+            self.config.single_lane_max_prompt_tokens
+            if len(requests) == 1
+            else self.config.multi_lane_max_prompt_tokens
+        )
         for request in requests:
+            if prompt_limit and len(request.prompt_tokens) > prompt_limit:
+                apc_plain.append(request.lane_id)
+                apc_reasons.append(
+                    f"{request.lane_id}: prompt length {len(request.prompt_tokens)} "
+                    f"exceeds self-MTP operating limit {prompt_limit}"
+                )
+                continue
             if request.cache_quantized or request.cache_windowed:
                 apc_plain.append(request.lane_id)
                 apc_reasons.append(
@@ -281,6 +293,8 @@ def plan_router_install(
     min_batch_lanes: int = 2,
     hard_reserve_bytes: int = 8 * 1024**3,
     allow_dynamic_membership: bool = False,
+    multi_lane_max_prompt_tokens: int = 0,
+    single_lane_max_prompt_tokens: int = 0,
 ) -> ContinuousMTPRouterInstallDecision:
     """Feature-detect a model and return an install plan without mutation.
 
@@ -343,6 +357,8 @@ def plan_router_install(
             min_batch_lanes=min_batch_lanes,
             hard_reserve_bytes=hard_reserve_bytes,
             allow_dynamic_membership=allow_dynamic_membership,
+            multi_lane_max_prompt_tokens=multi_lane_max_prompt_tokens,
+            single_lane_max_prompt_tokens=single_lane_max_prompt_tokens,
         ),
         runtime=runtime,
     )
