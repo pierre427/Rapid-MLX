@@ -16,7 +16,6 @@ from vllm_mlx.spec_decode.mtp.prompt_lookup_capability import (
     make_prompt_lookup_capability,
 )
 
-
 _VERIFICATION = PromptLookupVerificationIdentity(
     model_id="test/qwen-hybrid",
     model_revision="weights-sha256",
