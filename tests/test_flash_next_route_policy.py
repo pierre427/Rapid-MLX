@@ -198,13 +198,30 @@ def test_ple_identity_is_orthogonal_and_pld_needs_transactional_hybrid_accept():
     )
     qualified_pld = select_flash_next_route(
         _inputs(40_000),
-        _capabilities(adaptive_pld=True, hybrid_recurrent_state_qualified=True),
+        _capabilities(
+            adaptive_pld=True,
+            hybrid_recurrent_state_qualified=True,
+            request_scoped_pld_executor=True,
+        ),
+    )
+    attested_without_executor = select_flash_next_route(
+        _inputs(40_000),
+        _capabilities(
+            adaptive_pld=True,
+            hybrid_recurrent_state_qualified=True,
+            request_scoped_pld_executor=False,
+        ),
     )
 
     assert no_ple.route is FlashNextDecodeRoute.PLAIN_DECODE
     assert no_ple.ple_enabled is False
     assert unqualified_pld.route is FlashNextDecodeRoute.PLE_ENABLED_PLAIN
     assert unqualified_pld.reason is FlashNextRouteReason.PLD_HYBRID_UNQUALIFIED
+    assert attested_without_executor.route is FlashNextDecodeRoute.PLE_ENABLED_PLAIN
+    assert (
+        attested_without_executor.reason
+        is FlashNextRouteReason.PLD_EXECUTOR_UNAVAILABLE
+    )
     assert qualified_pld.route is FlashNextDecodeRoute.ADAPTIVE_PLD
     assert qualified_pld.ple_enabled is True
     assert qualified_pld.ple_storage == "nvme"

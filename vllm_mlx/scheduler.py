@@ -1010,6 +1010,11 @@ def _install_continuous_mtp_router(
         ple_storage=ple_storage,
         adaptive_pld=prompt_lookup_qualified,
         hybrid_recurrent_state_qualified=prompt_lookup_qualified,
+        # The current generator uses a process-wide environment switch and
+        # cannot honor an immutable per-request route.  State attestation is
+        # necessary but not sufficient: keep PLD unavailable until a request-
+        # scoped executor and full logical-history side input are installed.
+        request_scoped_pld_executor=False,
     )
 
     def _response_factory(**kwargs):
@@ -1114,11 +1119,11 @@ def _install_continuous_mtp_router(
             effective_context_tokens=effective_context,
             projected_context_tokens=effective_context + requested_output,
             apc_cached_tokens=cached_tokens,
-            # Do not infer exactness from the mere presence of a draft cache.
-            # The APC restore path must explicitly attest joint identity.
-            exact_joint_mtp_state=(
-                getattr(request, "_continuous_mtp_joint_state_exact", False) is True
-            ),
+            # No producer on this branch atomically attaches and validates the
+            # full ContinuousMTPAPCHit payload.  A request boolean is not an
+            # oracle, so exact joint restore remains deliberately unreachable
+            # until the APC bridge supplies the payload and restore verdict.
+            exact_joint_mtp_state=False,
         )
 
     def _queued_candidates():

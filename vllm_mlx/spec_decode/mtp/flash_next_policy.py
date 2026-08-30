@@ -43,6 +43,7 @@ class FlashNextRouteReason(str, enum.Enum):
     APC_TARGET_ONLY_PRESERVED = "substantial_target_only_apc_preserved"
     LONG_CONTEXT = "self_mtp_context_limit"
     PLD_HYBRID_UNQUALIFIED = "adaptive_pld_hybrid_state_unqualified"
+    PLD_EXECUTOR_UNAVAILABLE = "adaptive_pld_request_executor_unavailable"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class FlashNextRouteCapabilities:
     ple_storage: str = "none"
     adaptive_pld: bool = False
     hybrid_recurrent_state_qualified: bool = False
+    request_scoped_pld_executor: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.ple_storage, str) or not self.ple_storage:
@@ -178,9 +180,13 @@ def select_flash_next_route(
 ) -> FlashNextRouteDecision:
     """Choose one route at the request boundary without mutating runtime state."""
 
-    pld_eligible = (
+    pld_state_qualified = (
         capabilities.adaptive_pld
         and capabilities.hybrid_recurrent_state_qualified
+    )
+    pld_eligible = (
+        pld_state_qualified
+        and capabilities.request_scoped_pld_executor
         and inputs.real_queue_width == 1
     )
     projected = inputs.projected_context_tokens
@@ -247,11 +253,12 @@ def select_flash_next_route(
         )
 
     if context > config.guarded_self_mtp_max_tokens:
-        reason = (
-            FlashNextRouteReason.LONG_CONTEXT
-            if pld_eligible or not capabilities.adaptive_pld
-            else FlashNextRouteReason.PLD_HYBRID_UNQUALIFIED
-        )
+        if pld_eligible or not capabilities.adaptive_pld:
+            reason = FlashNextRouteReason.LONG_CONTEXT
+        elif not pld_state_qualified:
+            reason = FlashNextRouteReason.PLD_HYBRID_UNQUALIFIED
+        else:
+            reason = FlashNextRouteReason.PLD_EXECUTOR_UNAVAILABLE
         return long_context_fallback(reason)
 
     required = inputs.memory_reserve_bytes + inputs.self_mtp_incremental_bytes
