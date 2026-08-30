@@ -66,10 +66,9 @@ def checkpoint_weight_manifest_records(
             raise CheckpointManifestError("weight_map tensor names must be strings")
         indexed_names.add(_validate_safetensors_filename(raw_filename))
 
-    if MTP_SIDECAR_FILENAME in indexed_names:
-        raise CheckpointManifestError(
-            "MTP sidecar is ambiguously both indexed and explicit"
-        )
+    # Some converted checkpoints reference the explicit MTP sidecar from the
+    # main index; others leave it as a sidecar-only file.  Both layouts bind
+    # the same filename exactly once in the canonical record set.
     expected_safetensors = indexed_names | {MTP_SIDECAR_FILENAME}
     if len({name.casefold() for name in expected_safetensors}) != len(
         expected_safetensors

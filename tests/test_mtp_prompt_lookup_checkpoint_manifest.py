@@ -175,17 +175,28 @@ def test_unindexed_safetensors_file_is_ambiguous(tmp_path: Path) -> None:
         compute_checkpoint_weight_manifest_sha256(root)
 
 
-def test_mtp_sidecar_cannot_also_be_an_index_shard(tmp_path: Path) -> None:
+def test_index_referenced_mtp_sidecar_is_included_exactly_once(
+    tmp_path: Path,
+) -> None:
     root, _ = _checkpoint(tmp_path)
     (root / "model.safetensors.index.json").write_text(
         json.dumps(
-            {"weight_map": {"mtp.weight": "model-mtp-q4.safetensors"}}
+            {
+                "weight_map": {
+                    "a.weight": "model-00001-of-00002.safetensors",
+                    "z.weight": "model-00002-of-00002.safetensors",
+                    "mtp.weight": "model-mtp-q4.safetensors",
+                }
+            }
         ),
         encoding="utf-8",
     )
 
-    with pytest.raises(CheckpointManifestError, match="ambiguously"):
-        compute_checkpoint_weight_manifest_sha256(root)
+    records = checkpoint_weight_manifest_records(root)
+
+    assert [
+        record["filename"] for record in records
+    ].count("model-mtp-q4.safetensors") == 1
 
 
 @pytest.mark.parametrize(
