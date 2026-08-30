@@ -16,6 +16,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from itertools import product
 from typing import Any
 
 from .prompt_lookup_capability import PromptLookupVerificationIdentity
@@ -177,18 +178,11 @@ class SurfaceEvidence:
 
 @dataclass(frozen=True, order=True)
 class OracleCaseKey:
-    accepted_prefix: int
-    ragged_drops: tuple[int, ...]
+    accepted_prefixes: tuple[int, ...]
     phase: OraclePhase
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.accepted_prefix, bool)
-            or not isinstance(self.accepted_prefix, int)
-            or self.accepted_prefix < 0
-        ):
-            raise ValueError("accepted_prefix must be a non-negative integer")
-        _validate_drop_vector(self.ragged_drops, "ragged_drops")
+        _validate_prefix_vector(self.accepted_prefixes, "accepted_prefixes")
         if not isinstance(self.phase, OraclePhase):
             raise TypeError("phase must be an OraclePhase")
 
@@ -211,9 +205,6 @@ class OracleCaseEvidence:
 class OracleGeometry:
     batch_size: int
     verify_width: int
-    ragged_drop_vectors: tuple[tuple[int, ...], ...]
-    ragged_domain_complete: bool
-    ragged_domain_definition: str
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -222,45 +213,30 @@ class OracleGeometry:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if not isinstance(self.ragged_drop_vectors, tuple) or not (
-            self.ragged_drop_vectors
-        ):
-            raise ValueError("ragged_drop_vectors must be a non-empty tuple")
-        if len(set(self.ragged_drop_vectors)) != len(self.ragged_drop_vectors):
-            raise ValueError("ragged_drop_vectors must be unique")
-        for drops in self.ragged_drop_vectors:
-            _validate_drop_vector(drops, "ragged_drop_vectors")
-            if len(drops) != self.batch_size:
-                raise ValueError("each drop vector must match batch_size")
-            if any(drop > self.verify_width for drop in drops):
-                raise ValueError("ragged drops cannot exceed verify_width")
-        if (0,) * self.batch_size not in self.ragged_drop_vectors:
-            raise ValueError("ragged_drop_vectors must include the all-zero case")
-        if not isinstance(self.ragged_domain_complete, bool):
-            raise TypeError("ragged_domain_complete must be a bool")
-        if (
-            not isinstance(self.ragged_domain_definition, str)
-            or not self.ragged_domain_definition.strip()
-        ):
-            raise ValueError("ragged_domain_definition must be non-empty")
 
     @property
     def fingerprint(self) -> str:
-        drops = ";".join(
-            ",".join(str(drop) for drop in vector)
-            for vector in self.ragged_drop_vectors
-        )
         return (
             f"batch={self.batch_size},width={self.verify_width},"
-            f"ragged={drops},domain={self.ragged_domain_definition}"
+            "accepted_domain=full_cartesian_0..M"
+        )
+
+    @property
+    def accepted_prefix_vectors(self) -> tuple[tuple[int, ...], ...]:
+        """Every real per-row accepted-prefix transaction in the geometry."""
+
+        return tuple(
+            tuple(vector)
+            for vector in product(
+                range(self.verify_width + 1), repeat=self.batch_size
+            )
         )
 
     @property
     def required_case_keys(self) -> frozenset[OracleCaseKey]:
         return frozenset(
-            OracleCaseKey(m, drops, phase)
-            for m in range(self.verify_width + 1)
-            for drops in self.ragged_drop_vectors
+            OracleCaseKey(prefixes, phase)
+            for prefixes in self.accepted_prefix_vectors
             for phase in OraclePhase
         )
 
@@ -376,8 +352,9 @@ class PromptLookupAttestationReceipt:
     execution_kind: OracleExecutionKind
     compiled_candidate: bool
     production_metal: bool
-    accepted_prefixes: tuple[int, ...]
-    ragged_drop_vectors: tuple[tuple[int, ...], ...]
+    batch_size: int
+    verify_width: int
+    accepted_prefix_vectors: tuple[tuple[int, ...], ...]
     continuation_covered: bool
     fallback_count: int
     post_warmup_recompile_count: int
@@ -443,8 +420,6 @@ def validate_prompt_lookup_oracle(
         reasons.append("geometry_identity_mismatch")
     if evidence.production_metal is not True:
         reasons.append("not_production_metal")
-    if evidence.geometry.ragged_domain_complete is not True:
-        reasons.append("ragged_domain_incomplete")
     if expected_route != HYBRID_TRANSACTIONAL_ACCEPT_ROUTE:
         reasons.append("unsupported_attestation_route")
     if evidence.route.route_name != expected_route:
@@ -539,8 +514,9 @@ def issue_prompt_lookup_attestation(
         execution_kind=evidence.route.execution_kind,
         compiled_candidate=evidence.route.compiled_candidate,
         production_metal=True,
-        accepted_prefixes=tuple(range(evidence.geometry.verify_width + 1)),
-        ragged_drop_vectors=evidence.geometry.ragged_drop_vectors,
+        batch_size=evidence.geometry.batch_size,
+        verify_width=evidence.geometry.verify_width,
+        accepted_prefix_vectors=evidence.geometry.accepted_prefix_vectors,
         continuation_covered=True,
         fallback_count=0,
         post_warmup_recompile_count=0,
@@ -608,8 +584,11 @@ def prompt_lookup_attestation_receipt_to_payload(
         "execution_kind": receipt.execution_kind.value,
         "compiled_candidate": receipt.compiled_candidate,
         "production_metal": receipt.production_metal,
-        "accepted_prefixes": list(receipt.accepted_prefixes),
-        "ragged_drop_vectors": [list(v) for v in receipt.ragged_drop_vectors],
+        "batch_size": receipt.batch_size,
+        "verify_width": receipt.verify_width,
+        "accepted_prefix_vectors": [
+            list(v) for v in receipt.accepted_prefix_vectors
+        ],
         "continuation_covered": receipt.continuation_covered,
         "fallback_count": receipt.fallback_count,
         "post_warmup_recompile_count": receipt.post_warmup_recompile_count,
@@ -635,8 +614,9 @@ def parse_prompt_lookup_attestation_receipt(
         "execution_kind",
         "compiled_candidate",
         "production_metal",
-        "accepted_prefixes",
-        "ragged_drop_vectors",
+        "batch_size",
+        "verify_width",
+        "accepted_prefix_vectors",
         "continuation_covered",
         "fallback_count",
         "post_warmup_recompile_count",
@@ -651,8 +631,9 @@ def parse_prompt_lookup_attestation_receipt(
     try:
         identity = PromptLookupVerificationIdentity(**dict(identity_payload))
         surfaces = tuple(payload["state_surfaces"])
-        prefixes = tuple(payload["accepted_prefixes"])
-        drops = tuple(tuple(vector) for vector in payload["ragged_drop_vectors"])
+        prefixes = tuple(
+            tuple(vector) for vector in payload["accepted_prefix_vectors"]
+        )
         receipt = PromptLookupAttestationReceipt(
             identity=identity,
             evidence_digest=payload["evidence_digest"],
@@ -663,8 +644,9 @@ def parse_prompt_lookup_attestation_receipt(
             execution_kind=OracleExecutionKind(payload["execution_kind"]),
             compiled_candidate=payload["compiled_candidate"],
             production_metal=payload["production_metal"],
-            accepted_prefixes=prefixes,
-            ragged_drop_vectors=drops,
+            batch_size=payload["batch_size"],
+            verify_width=payload["verify_width"],
+            accepted_prefix_vectors=prefixes,
             continuation_covered=payload["continuation_covered"],
             fallback_count=payload["fallback_count"],
             post_warmup_recompile_count=payload[
@@ -729,27 +711,32 @@ def _validate_receipt(receipt: PromptLookupAttestationReceipt) -> None:
             raise ValueError("compiled receipt lacks warmup compilation")
         if receipt.compile_count != receipt.warmup_compile_count:
             raise ValueError("compiled receipt records compile outside warmup")
-    prefixes = receipt.accepted_prefixes
-    if (
-        not prefixes
-        or any(
-            isinstance(prefix, bool) or not isinstance(prefix, int) or prefix < 0
-            for prefix in prefixes
+    for name in ("batch_size", "verify_width"):
+        value = getattr(receipt, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"receipt {name} must be a positive integer")
+    vectors = receipt.accepted_prefix_vectors
+    if not vectors or len(set(vectors)) != len(vectors):
+        raise ValueError("receipt accepted-prefix vectors are empty or duplicated")
+    for vector in vectors:
+        _validate_prefix_vector(vector, "receipt accepted_prefix_vectors")
+        if len(vector) != receipt.batch_size:
+            raise ValueError(
+                "receipt accepted-prefix vectors have inconsistent widths"
+            )
+        if any(prefix > receipt.verify_width for prefix in vector):
+            raise ValueError("receipt accepted prefixes exceed verify_width")
+    required_vectors = tuple(
+        tuple(vector)
+        for vector in product(
+            range(receipt.verify_width + 1), repeat=receipt.batch_size
         )
-        or prefixes != tuple(range(prefixes[-1] + 1))
-    ):
-        raise ValueError("receipt accepted prefixes must cover 0..M")
-    drops = receipt.ragged_drop_vectors
-    if not drops or len(set(drops)) != len(drops):
-        raise ValueError("receipt ragged drop vectors are empty or duplicated")
-    batch_size = len(drops[0])
-    for vector in drops:
-        _validate_drop_vector(vector, "receipt ragged_drop_vectors")
-        if len(vector) != batch_size:
-            raise ValueError("receipt ragged vectors have inconsistent widths")
-    if (0,) * batch_size not in drops:
-        raise ValueError("receipt ragged vectors omit the all-zero case")
-    if receipt.case_count != len(prefixes) * len(drops) * len(OraclePhase):
+    )
+    if vectors != required_vectors:
+        raise ValueError(
+            "receipt accepted-prefix vectors must cover the canonical domain"
+        )
+    if receipt.case_count != len(vectors) * len(OraclePhase):
         raise ValueError("receipt case count does not cover the complete matrix")
 
 
@@ -757,10 +744,7 @@ def _evidence_digest(evidence: PromptLookupOracleEvidence) -> str:
     payload = {
         "schema_version": evidence.schema_version,
         "subject": evidence.subject.__dict__,
-        "geometry": {
-            **evidence.geometry.__dict__,
-            "ragged_drop_vectors": evidence.geometry.ragged_drop_vectors,
-        },
+        "geometry": evidence.geometry.__dict__,
         "production_metal": evidence.production_metal,
         "route": {
             **evidence.route.__dict__,
@@ -768,8 +752,7 @@ def _evidence_digest(evidence: PromptLookupOracleEvidence) -> str:
         },
         "cases": [
             {
-                "accepted_prefix": case.key.accepted_prefix,
-                "ragged_drops": case.key.ragged_drops,
+                "accepted_prefixes": case.key.accepted_prefixes,
                 "phase": case.key.phase.value,
                 "surfaces": [
                     {
@@ -802,12 +785,12 @@ def _raw_value_payload(value: RawBitValue) -> dict[str, Any]:
     }
 
 
-def _validate_drop_vector(value: tuple[int, ...], name: str) -> None:
+def _validate_prefix_vector(value: tuple[int, ...], name: str) -> None:
     if not isinstance(value, tuple) or not value:
         raise ValueError(f"{name} must be a non-empty tuple")
     if any(
-        isinstance(drop, bool) or not isinstance(drop, int) or drop < 0
-        for drop in value
+        isinstance(prefix, bool) or not isinstance(prefix, int) or prefix < 0
+        for prefix in value
     ):
         raise ValueError(f"{name} must contain non-negative integers")
 

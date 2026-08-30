@@ -41,9 +41,6 @@ def _geometry(**changes) -> OracleGeometry:
     values = {
         "batch_size": 2,
         "verify_width": 2,
-        "ragged_drop_vectors": ((0, 0), (1, 0), (0, 1)),
-        "ragged_domain_complete": True,
-        "ragged_domain_definition": "all commit-path drops for B2/M2",
     }
     values.update(changes)
     return OracleGeometry(**values)
@@ -74,9 +71,7 @@ def _raw(label: str) -> RawBitValue:
 def _case(key: OracleCaseKey) -> OracleCaseEvidence:
     surfaces = []
     for surface in sorted(REQUIRED_STATE_SURFACES):
-        label = (
-            f"{key.accepted_prefix}:{key.ragged_drops}:{key.phase.value}:{surface}"
-        )
+        label = f"{key.accepted_prefixes}:{key.phase.value}:{surface}"
         value = _raw(label)
         surfaces.append(SurfaceEvidence(surface, value, value))
     return OracleCaseEvidence(key, tuple(surfaces))
@@ -224,6 +219,10 @@ def test_complete_production_metal_evidence_issues_deterministic_receipt() -> No
     assert receipt.identity.model_revision == subject.model_revision
     assert receipt.identity.verify_geometry == geometry.fingerprint
     assert receipt.case_count == len(geometry.required_case_keys)
+    assert receipt.case_count == 18
+    assert receipt.batch_size == 2
+    assert receipt.verify_width == 2
+    assert receipt.accepted_prefix_vectors == geometry.accepted_prefix_vectors
     assert set(receipt.state_surfaces) == REQUIRED_STATE_SURFACES
 
     reversed_evidence = replace(
@@ -431,7 +430,7 @@ def test_compiled_candidate_requires_warmup_compile_and_zero_recompile() -> None
 def test_identity_geometry_and_route_must_match_trusted_expectations() -> None:
     evidence, subject, geometry = _evidence()
     foreign_subject = replace(subject, model_revision="different-weights")
-    foreign_geometry = _geometry(ragged_domain_definition="different domain")
+    foreign_geometry = _geometry(verify_width=3)
 
     assert "identity_mismatch" in _validate(
         evidence, foreign_subject, geometry
@@ -454,26 +453,36 @@ def test_subject_geometry_string_must_be_canonical() -> None:
     assert "geometry_identity_mismatch" in validation.reasons
 
 
-def test_ragged_domain_must_be_declared_complete() -> None:
-    geometry = _geometry(ragged_domain_complete=False)
-    subject = _subject(geometry)
-    evidence, _, _ = _evidence(geometry=geometry, subject=subject)
+def test_required_cases_are_real_accepted_vectors_times_phases() -> None:
+    b1 = _geometry(batch_size=1)
+    b2 = _geometry(batch_size=2)
 
-    validation = _validate(evidence, subject, geometry)
-
-    assert "ragged_domain_incomplete" in validation.reasons
+    assert b1.accepted_prefix_vectors == ((0,), (1,), (2,))
+    assert len(b1.required_case_keys) == 6
+    assert b2.accepted_prefix_vectors == (
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+    )
+    assert len(b2.required_case_keys) == 18
 
 
 @pytest.mark.parametrize(
     "remove_key",
     [
-        OracleCaseKey(0, (0, 0), OraclePhase.POST_TRIM),
-        OracleCaseKey(2, (0, 0), OraclePhase.POST_TRIM),
-        OracleCaseKey(1, (1, 0), OraclePhase.POST_TRIM),
-        OracleCaseKey(1, (0, 0), OraclePhase.CONTINUATION),
+        OracleCaseKey((0, 0), OraclePhase.POST_TRIM),
+        OracleCaseKey((2, 2), OraclePhase.POST_TRIM),
+        OracleCaseKey((1, 0), OraclePhase.POST_TRIM),
+        OracleCaseKey((1, 1), OraclePhase.CONTINUATION),
     ],
 )
-def test_every_m_ragged_vector_and_continuation_case_is_required(remove_key) -> None:
+def test_every_accepted_vector_and_continuation_case_is_required(remove_key) -> None:
     evidence, subject, geometry = _evidence()
     cases = tuple(case for case in evidence.cases if case.key != remove_key)
 
