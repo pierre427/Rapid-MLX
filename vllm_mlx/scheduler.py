@@ -9620,6 +9620,20 @@ class Scheduler:
         bridge = getattr(self, "_continuous_mtp_apc_bridge", None)
         if bridge is not None:
             stats["continuous_mtp_apc"] = bridge.stats_snapshot()
+        batch_gen = self.batch_generator
+        if batch_gen is not None:
+            last_route = getattr(batch_gen, "_flash_next_last_route_decision", None)
+            route_counts = getattr(batch_gen, "_flash_next_route_counts", None)
+            if isinstance(last_route, dict) or isinstance(route_counts, dict):
+                stats["flash_next_policy"] = {
+                    "last_decision": dict(last_route) if isinstance(last_route, dict) else None,
+                    "counts": {
+                        key: dict(value) if isinstance(value, dict) else value
+                        for key, value in route_counts.items()
+                    }
+                    if isinstance(route_counts, dict)
+                    else {},
+                }
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

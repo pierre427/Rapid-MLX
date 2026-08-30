@@ -585,6 +585,26 @@ class TestHealthRoutes:
         finally:
             self._restore_config(orig)
 
+    def test_status_exposes_flash_next_policy_receipt(self, mock_engine):
+        receipt = {
+            "last_decision": {
+                "route": "linear_self_mtp",
+                "reason": "short_context",
+                "real_queue_width": 1,
+            },
+            "counts": {"routes": {"linear_self_mtp": 1}},
+        }
+        mock_engine.get_stats.return_value = {
+            **mock_engine.get_stats.return_value,
+            "flash_next_policy": receipt,
+        }
+        orig = self._patch_config(engine=mock_engine, model_name="test-model")
+        try:
+            data = TestClient(self._make_app()).get("/v1/status").json()
+            assert data["flash_next_policy"] == receipt
+        finally:
+            self._restore_config(orig)
+
     def test_status_handles_non_dict_batch_generator(self, mock_engine):
         """Defensive: malformed batch_generator (not a dict) must not 500.
 

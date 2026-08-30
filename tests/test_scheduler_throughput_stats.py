@@ -68,3 +68,23 @@ def test_prompt_throughput_aggregates_requests_in_the_same_batch():
 
     # Both requests prefetched concurrently for ~1 second: 10 + 20 tok/s.
     assert 25.0 < scheduler._last_prompt_tps < 35.0
+
+
+def test_scheduler_exports_bounded_flash_next_policy_receipt():
+    scheduler = _scheduler()
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator._flash_next_last_route_decision = {
+        "route": "ple_enabled_plain",
+        "reason": "self_mtp_context_limit",
+        "real_queue_width": 1,
+    }
+    scheduler.batch_generator._flash_next_route_counts = {
+        "routes": {"ple_enabled_plain": 2},
+        "reasons": {"self_mtp_context_limit": 2},
+        "context_buckets": {"gt_32k": 2},
+    }
+
+    receipt = scheduler.get_stats()["flash_next_policy"]
+
+    assert receipt["last_decision"]["route"] == "ple_enabled_plain"
+    assert receipt["counts"]["routes"] == {"ple_enabled_plain": 2}

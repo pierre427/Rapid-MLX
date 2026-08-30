@@ -368,6 +368,13 @@ async def status():
         "continuous_mtp_apc": stats.get(
             "continuous_mtp_apc", {"enabled": False}
         ),
+        # Bounded Flash-Next policy receipt: one last-decision snapshot plus
+        # fixed-cardinality route/reason/context counters. This lets a live
+        # qualification artifact prove the selected execution path instead of
+        # inferring it from throughput.
+        "flash_next_policy": stats.get(
+            "flash_next_policy", {"last_decision": None, "counts": {}}
+        ),
         "requests": stats.get("requests", []),
     }
 
