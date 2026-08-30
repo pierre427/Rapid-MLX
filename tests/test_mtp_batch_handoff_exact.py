@@ -66,6 +66,7 @@ def _extract_function(name: str, *, class_name: str | None = None):
             ast.ImportFrom(
                 module="__future__", names=[ast.alias("annotations")], level=0
             ),
+            ast.Import(names=[ast.alias("math")]),
             fn,
         ],
         type_ignores=[],
