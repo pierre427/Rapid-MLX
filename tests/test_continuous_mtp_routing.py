@@ -185,6 +185,23 @@ def test_install_plan_threads_dynamic_membership_descriptor_attestation():
     assert "dynamic_membership" in " ".join(refused.reasons)
 
 
+def test_install_plan_uses_native_outer_descriptor_when_inner_has_none():
+    model = _Model()
+    model.batched_mtp_capability = _descriptor("qwen4_exp")
+    model.language_model = SimpleNamespace(model_type="qwen4_exp_text")
+
+    decision = plan_router_install(
+        model,
+        enabled=True,
+        hard_reserve_bytes=0,
+        min_batch_lanes=1,
+    )
+
+    assert decision.admitted is True
+    assert decision.router is not None
+    assert decision.router.runtime.model_family == "qwen4_exp"
+
+
 def test_supported_requests_build_an_immutable_fixed_cohort_plan():
     router = _router()
 

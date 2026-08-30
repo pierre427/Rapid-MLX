@@ -304,7 +304,18 @@ def plan_router_install(
     capabilities attest dynamic membership (and the Flash-specific attestation
     for a Flash architecture), so an opt-in can never force an unsafe merge.
     """
-    candidate = getattr(model, "language_model", model)
+    # Family adapters may attach the continuous descriptor to either the text
+    # decoder (legacy injected Qwen3.5/Qwen4) or the outer native model (modern
+    # mlx-lm Qwen4, where the MTP head and rollback protocol live).  Prefer the
+    # inner owner only when it actually carries the descriptor; blindly
+    # selecting ``language_model`` turns a valid native outer adapter into an
+    # "unknown" family and silently falls back to plain decode.
+    inner = getattr(model, "language_model", None)
+    candidate = (
+        inner
+        if isinstance(getattr(inner, "batched_mtp_capability", None), Mapping)
+        else model
+    )
     descriptor = getattr(candidate, "batched_mtp_capability", None)
     descriptor_map = descriptor if isinstance(descriptor, Mapping) else {}
     family = descriptor_map.get("model_family", "unknown")
