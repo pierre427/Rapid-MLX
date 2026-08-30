@@ -1453,6 +1453,8 @@ def test_install_mtp_vendored_uses_inner_language_model_surface(monkeypatch):
     def _recording_mtp_generate_step(*args, **kwargs):
         seen["model"] = kwargs["model"]
         seen["max_k"] = kwargs["max_k"]
+        seen["prompt_lookup_enabled"] = kwargs["prompt_lookup_enabled"]
+        seen["prompt_lookup_history"] = kwargs["prompt_lookup_history"]
         return _FakeGen()
 
     monkeypatch.setattr(_gen_mod, "mtp_generate_step", _recording_mtp_generate_step)
@@ -1471,10 +1473,15 @@ def test_install_mtp_vendored_uses_inner_language_model_surface(monkeypatch):
         max_k=3,
     )
     assert ok is True
+    # The request-boundary router latches PLD by request identity. A process
+    # environment switch is neither consulted nor able to override this map.
+    batch_gen._mtp_policy_pld_requests = {42: "req-42"}
 
     gb._step()
     assert seen["model"] is inner
     assert seen["max_k"] == 1
+    assert seen["prompt_lookup_enabled"] is True
+    assert seen["prompt_lookup_history"][-1] == 500
 
 
 def _make_batch_gen_with_gb():
@@ -1714,6 +1721,13 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
     )
     assert ok is True
 
+    batch_gen._mtp_policy_pld_requests = {7: "req-7"}
+    batch_gen._mtp_policy_plain_requests = {}
+    batch_gen._flash_next_route_latches = {}
+    batch_gen._flash_next_route_counts = {
+        "latch_fallbacks": {"real_queue_width": 0}
+    }
+
     gb._next_tokens = mx.array([500], dtype=mx.uint32)
     gb._next_logprobs = [mx.array([0.0])]
 
@@ -1731,6 +1745,12 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
     # accepted drafts would return False and keep the incoming lane queued.
     prepare = batch_gen._mtp_vendored_prepare_batch_expansion
     assert prepare() is True
+    assert 7 not in batch_gen._mtp_policy_pld_requests
+    assert batch_gen._mtp_policy_plain_requests[7] == "req-7"
+    assert (
+        batch_gen._flash_next_route_counts["latch_fallbacks"]["real_queue_width"]
+        == 1
+    )
     staged = int(gb._next_tokens[0].item())
 
     # Model BatchGenerator.extend retaining uid=7 and appending uid=8.

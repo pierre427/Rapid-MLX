@@ -52,6 +52,7 @@ class FlashNextRoutePolicyConfig:
 
     preferred_self_mtp_max_tokens: int = 16_384
     guarded_self_mtp_max_tokens: int = 32_768
+    adaptive_pld_min_tokens: int = 32_768
     min_recent_speedup_ratio: float = 1.0
     min_recent_samples: int = 4
     max_recent_sample_age_seconds: float = 900.0
@@ -62,6 +63,8 @@ class FlashNextRoutePolicyConfig:
             raise ValueError("preferred_self_mtp_max_tokens must be positive")
         if self.guarded_self_mtp_max_tokens < self.preferred_self_mtp_max_tokens:
             raise ValueError("guarded self-MTP limit must not be below preferred limit")
+        if self.adaptive_pld_min_tokens < self.preferred_self_mtp_max_tokens:
+            raise ValueError("adaptive PLD limit must not be below preferred limit")
         if not math.isfinite(self.min_recent_speedup_ratio):
             raise ValueError("min_recent_speedup_ratio must be finite")
         if self.min_recent_speedup_ratio <= 0:
@@ -184,12 +187,13 @@ def select_flash_next_route(
         capabilities.adaptive_pld
         and capabilities.hybrid_recurrent_state_qualified
     )
+    projected = inputs.projected_context_tokens
     pld_eligible = (
         pld_state_qualified
         and capabilities.request_scoped_pld_executor
         and inputs.real_queue_width == 1
+        and projected >= config.adaptive_pld_min_tokens
     )
-    projected = inputs.projected_context_tokens
     if projected <= config.preferred_self_mtp_max_tokens:
         context_bucket = FlashNextContextBucket.LE_16K
     elif projected <= config.guarded_self_mtp_max_tokens:
@@ -241,6 +245,16 @@ def select_flash_next_route(
     if not capabilities.self_mtp:
         return long_context_fallback(FlashNextRouteReason.SELF_MTP_UNSUPPORTED)
 
+    # At and above the selected 32K product floor, the adaptive route owns the
+    # request. A lookup miss remains inside the generator and falls through to
+    # its self-MTP tail; recent self-MTP telemetry must not steal a retrievable
+    # request back from the default PLD latch.
+    if pld_eligible:
+        return decision(
+            FlashNextDecodeRoute.ADAPTIVE_PLD,
+            FlashNextRouteReason.LONG_CONTEXT,
+        )
+
     # Routing is immutable for this request.  Gate on the largest context the
     # request can reach so a short prompt cannot cross 32K while pinned to the
     # self-MTP data plane.  A later safe-boundary handoff can relax this.
@@ -253,7 +267,7 @@ def select_flash_next_route(
         )
 
     if context > config.guarded_self_mtp_max_tokens:
-        if pld_eligible or not capabilities.adaptive_pld:
+        if not capabilities.adaptive_pld:
             reason = FlashNextRouteReason.LONG_CONTEXT
         elif not pld_state_qualified:
             reason = FlashNextRouteReason.PLD_HYBRID_UNQUALIFIED

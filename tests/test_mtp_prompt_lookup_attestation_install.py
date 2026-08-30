@@ -259,6 +259,41 @@ def test_exact_sealed_receipt_installs_evaluator_eligible_capability(
     assert not hasattr(model, "request_scoped_pld_executor")
 
 
+def test_product_default_installs_b2_verified_qwen4_capability() -> None:
+    model = _model()
+
+    result = install.install_default_qwen4_prompt_lookup_capability(model)
+    decision = evaluate_prompt_lookup_capability(model)
+
+    assert result.installed is True
+    assert result.reason is install.PromptLookupInstallReason.INSTALLED
+    assert result.evidence_digest == (
+        "25670f0a5ece08ba0f717e9fbf66a67143846e929de416d2264019c4fac1a4fb"
+    )
+    assert decision.eligible is True
+    assert decision.reason is PromptLookupRefusal.ELIGIBLE
+    assert (
+        model.mtp_prompt_lookup_runtime_identity
+        is install.QWEN4_FLASH_NEXT_DEFAULT_VERIFICATION
+    )
+
+
+def test_product_default_cannot_enable_non_qwen4_or_override_disable() -> None:
+    unsupported = SimpleNamespace(model_type="qwen3_5")
+    unsupported_result = install.install_default_qwen4_prompt_lookup_capability(
+        unsupported
+    )
+    assert unsupported_result.reason is install.PromptLookupInstallReason.UNSUPPORTED_MODEL
+    assert unsupported.mtp_prompt_lookup_supported is False
+
+    model = _model()
+    disabled_result = install.install_default_qwen4_prompt_lookup_capability(
+        model, disabled=True
+    )
+    assert disabled_result.reason is install.PromptLookupInstallReason.OPERATOR_DISABLED
+    assert model.mtp_prompt_lookup_supported is False
+
+
 def test_duplicate_exact_authority_fails_closed(monkeypatch) -> None:
     authority = _trusted_receipt()
     monkeypatch.setattr(

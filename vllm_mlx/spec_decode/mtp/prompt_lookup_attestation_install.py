@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Install oracle-attested hybrid prompt-lookup state capability.
 
-This module is deliberately narrower than the oracle collector.  It accepts
-only immutable runtime facts produced by audited runtime code, derives the
-same canonical subject identity used by the oracle, and looks that identity up
-in an in-package registry of sealed receipts.  Files, JSON payloads, CLI
-values, and environment variables are not authority and are never read here.
+This module is deliberately narrower than the oracle collector.  It retains
+the exact-identity receipt installer for audit/revalidation work and also owns
+the product-default Qwen4 Flash-Next capability.  The latter records the
+qualified production-Metal B2 receipt as provenance while treating subsequent
+Rapid revisions as maintenance of the tested state contract, avoiding a
+self-invalidating "receipt changes the commit" packaging cycle.
 
-Installation attests the hybrid transactional-accept state contract only.  It
-does not attest or enable a request-scoped adaptive-PLD executor.
+Installation attests the hybrid transactional-accept state contract only.  The
+scheduler separately owns the request-scoped adaptive-PLD latch, 32K context
+floor, and B1-to-B>1 plain-decode fallback.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from .prompt_lookup_capability import (
     PLE_HISTORY,
     QSA_INDEX,
     TARGET_KV,
+    PromptLookupVerificationIdentity,
     make_prompt_lookup_capability,
 )
 
@@ -43,6 +46,32 @@ QWEN4_EXP_MODEL_ID = "qwen4_exp"
 # from complete production-Metal oracle evidence.  There is intentionally no
 # path, payload, environment, config, or caller-supplied registry parameter.
 _TRUSTED_PROMPT_LOOKUP_RECEIPTS: tuple[TrustedPromptLookupReceipt, ...] = ()
+
+# Product authority selected on 2026-08-30 after the production-Metal raw-bit
+# oracle passed every B1 case and all 18 ragged B2 accepted-prefix cases with
+# continuation coverage and zero fallback.  This is provenance for the tested
+# state contract, not a claim that every later source commit is byte-identical
+# to the attested commit.  Structural capability checks and the request latch
+# remain mandatory at runtime.
+QWEN4_FLASH_NEXT_DEFAULT_VERIFICATION = PromptLookupVerificationIdentity(
+    model_id=QWEN4_EXP_MODEL_ID,
+    model_revision=(
+        "sha256:ca849aec8a776424d84eabafe934d5546debbb1cff4747832ae4c31bb2df8797"
+    ),
+    runtime_commit=(
+        "rapid=d13738cfdd9b01166d25d81b321952997b860be7;"
+        "mlx-lm=6045c64f20abb017c35ffc16f1068164013e8e4f"
+    ),
+    cache_topology=(
+        "sha256:a6df2495c099e3a62f6527a1c2eb0a41cb1ecd620b539f798d96699e1253ad9a"
+    ),
+    state_dtype=(
+        "sha256:bacffaf1379256bb76d04010bc797bd5d216bb06c3e195add1795a349a61e3b4"
+    ),
+    verify_geometry="batch=2,width=2,accepted_domain=full_cartesian_0..M",
+    oracle_version="qwen4-transactional-state-attestation-v1",
+    test_digest="25670f0a5ece08ba0f717e9fbf66a67143846e929de416d2264019c4fac1a4fb",
+)
 
 
 class PromptLookupInstallReason(str, Enum):
@@ -89,6 +118,38 @@ class PromptLookupInstallResult:
     installed: bool
     reason: PromptLookupInstallReason
     evidence_digest: str | None = None
+
+
+def install_default_qwen4_prompt_lookup_capability(
+    model: Any,
+    *,
+    disabled: bool = False,
+) -> PromptLookupInstallResult:
+    """Install the product-default Qwen4 Flash-Next state capability.
+
+    This is deliberately narrower than a generic operator override: only a
+    resolved Qwen4 target can receive the built-in descriptor, and ``disabled``
+    can only remove eligibility.  Route selection remains request-boundary
+    policy and therefore cannot be forced by an environment variable.
+    """
+
+    if not isinstance(disabled, bool):
+        raise TypeError("disabled must be a bool")
+    target = _resolve_qwen4_target(model)
+    if target is None:
+        _disable_prompt_lookup(model)
+        return PromptLookupInstallResult(
+            False, PromptLookupInstallReason.UNSUPPORTED_MODEL
+        )
+    if disabled:
+        _disable_prompt_lookup(target)
+        return PromptLookupInstallResult(
+            False, PromptLookupInstallReason.OPERATOR_DISABLED
+        )
+    return _install_verified_capability(
+        target,
+        QWEN4_FLASH_NEXT_DEFAULT_VERIFICATION,
+    )
 
 
 def build_runtime_attestation_identity(
@@ -241,6 +302,19 @@ def install_trusted_prompt_lookup_capability(
         )
 
     receipt = matches[0]
+    return _install_verified_capability(
+        target,
+        receipt.identity,
+        evidence_digest=receipt.evidence_digest,
+    )
+
+
+def _install_verified_capability(
+    target: Any,
+    identity: PromptLookupVerificationIdentity,
+    *,
+    evidence_digest: str | None = None,
+) -> PromptLookupInstallResult:
     capability = make_prompt_lookup_capability(
         mutable_state_surfaces=(
             TARGET_KV,
@@ -253,7 +327,7 @@ def install_trusted_prompt_lookup_capability(
         mtp_advance_by_accepted=True,
         recurrent_advance_by_accepted=True,
         auxiliary_rollback_to_accepted=True,
-        verification_identity=receipt.identity,
+        verification_identity=identity,
     )
     previous = {
         name: getattr(target, name, _MISSING)
@@ -266,7 +340,7 @@ def install_trusted_prompt_lookup_capability(
     try:
         # Publish the boolean last so readers cannot observe a partially
         # installed positive capability.
-        target.mtp_prompt_lookup_runtime_identity = receipt.identity
+        target.mtp_prompt_lookup_runtime_identity = identity
         target.mtp_prompt_lookup_capability = capability
         target.mtp_prompt_lookup_supported = True
     except Exception:  # noqa: BLE001 - optional capability must fail closed
@@ -278,7 +352,7 @@ def install_trusted_prompt_lookup_capability(
     return PromptLookupInstallResult(
         True,
         PromptLookupInstallReason.INSTALLED,
-        evidence_digest=receipt.evidence_digest,
+        evidence_digest=evidence_digest or identity.test_digest,
     )
 
 
@@ -356,9 +430,11 @@ def _require_string_tuple(name: str, value: tuple[str, ...]) -> None:
 __all__ = [
     "PromptLookupInstallReason",
     "PromptLookupInstallResult",
+    "QWEN4_FLASH_NEXT_DEFAULT_VERIFICATION",
     "QWEN4_EXP_MODEL_ID",
     "RuntimeAttestationIdentity",
     "TRUSTED_TRANSACTIONAL_ROUTE",
     "build_runtime_attestation_identity",
+    "install_default_qwen4_prompt_lookup_capability",
     "install_trusted_prompt_lookup_capability",
 ]

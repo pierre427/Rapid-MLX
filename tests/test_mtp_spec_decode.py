@@ -2984,6 +2984,11 @@ def test_prompt_lookup_requires_an_audited_model_capability(monkeypatch):
     assert _prompt_lookup_is_enabled(audited)
 
     monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "off")
+    assert _prompt_lookup_is_enabled(audited, requested=True)
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "1")
+    assert not _prompt_lookup_is_enabled(audited, requested=False)
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "off")
     assert not _prompt_lookup_is_enabled(audited)
 
 

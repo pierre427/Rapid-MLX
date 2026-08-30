@@ -41,6 +41,22 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
 )
 
 
+def _install_default_prompt_lookup_capability(model: Any) -> bool:
+    """Publish the audited Flash-Next state contract after MTP attachment."""
+
+    from .prompt_lookup_attestation_install import (
+        install_default_qwen4_prompt_lookup_capability,
+    )
+
+    result = install_default_qwen4_prompt_lookup_capability(model)
+    if not result.installed:
+        logger.error(
+            "[mtp.qwen4] adaptive PLD default capability was not installed: %s",
+            result.reason.value,
+        )
+    return result.installed
+
+
 def _mtp_batch_forward(self, hidden_states, next_token_ids, mtp_cache):
     """Batch seam: recursive drafting always needs the returned hidden state."""
 
@@ -275,6 +291,7 @@ def inject_qwen4_exp_mtp_support(
     # Prefer the MTP head already loaded by modern mlx-lm.  The legacy branch
     # below remains for Rapid's vendored decoder and older dependencies.
     if _attach_native_qwen4_exp_mtp_support(model):
+        _install_default_prompt_lookup_capability(model)
         return True
 
     import mlx.core as mx
@@ -360,6 +377,7 @@ def inject_qwen4_exp_mtp_support(
         model.mtp_recursive_draft_depth = 2
         if model is not inner:
             model.mtp_batch_forward = inner.mtp_batch_forward
+        _install_default_prompt_lookup_capability(model)
         return True
     except Exception:
         logger.exception("[mtp.qwen4] native MTP attachment failed")

@@ -1177,11 +1177,10 @@ def _install_continuous_mtp_router(
         ple_storage=ple_storage,
         adaptive_pld=prompt_lookup_qualified,
         hybrid_recurrent_state_qualified=prompt_lookup_qualified,
-        # The current generator uses a process-wide environment switch and
-        # cannot honor an immutable per-request route.  State attestation is
-        # necessary but not sufficient: keep PLD unavailable until a request-
-        # scoped executor and full logical-history side input are installed.
-        request_scoped_pld_executor=False,
+        # The vendored generator accepts an explicit per-request enable bit and
+        # full logical history. The request-boundary route map below owns that
+        # immutable latch; environment state cannot override it.
+        request_scoped_pld_executor=prompt_lookup_qualified,
     )
 
     def _response_factory(**kwargs):
@@ -1372,9 +1371,17 @@ def _install_continuous_mtp_router(
                 selected_route.ple_enabled,
                 selected_route.ple_storage,
             )
+            for item in metadata:
+                batch_gen._flash_next_route_latches[item.uid] = (
+                    item.lane_id,
+                    selected_route.route,
+                )
             if selected_route.route is not FlashNextDecodeRoute.LINEAR_SELF_MTP:
                 for item in metadata:
-                    batch_gen._mtp_policy_plain_requests[item.uid] = item.lane_id
+                    if selected_route.route is FlashNextDecodeRoute.ADAPTIVE_PLD:
+                        batch_gen._mtp_policy_pld_requests[item.uid] = item.lane_id
+                    else:
+                        batch_gen._mtp_policy_plain_requests[item.uid] = item.lane_id
                 return
         routed = router.plan(metadata, free_bytes=_free_bytes())
         if routed.route is not ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED:
@@ -1504,6 +1511,8 @@ def _install_continuous_mtp_router(
         removed_packages = ()
         for uid in uids:
             batch_gen._mtp_policy_plain_requests.pop(int(uid), None)
+            batch_gen._mtp_policy_pld_requests.pop(int(uid), None)
+            batch_gen._flash_next_route_latches.pop(int(uid), None)
         if driver is not None:
             removed_packages = driver.remove_uids(uids)
         base = {}
@@ -1529,11 +1538,14 @@ def _install_continuous_mtp_router(
     batch_gen._continuous_mtp_driver = None
     batch_gen._continuous_mtp_removed_states = {}
     batch_gen._mtp_policy_plain_requests = {}
+    batch_gen._mtp_policy_pld_requests = {}
+    batch_gen._flash_next_route_latches = {}
     batch_gen._flash_next_last_route_decision = None
     batch_gen._flash_next_route_counts = {
         "routes": {route.value: 0 for route in FlashNextDecodeRoute},
         "reasons": {reason.value: 0 for reason in FlashNextRouteReason},
         "context_buckets": {bucket.value: 0 for bucket in FlashNextContextBucket},
+        "latch_fallbacks": {"real_queue_width": 0},
     }
     logger.info(
         "[MTP-continuous] BatchGenerator.next coordinator installed "
@@ -1788,6 +1800,8 @@ def _install_mtp_vendored(
 
     def _prepare_batch_expansion() -> bool:
         """Prepare an exact B=1 -> B>1 handoff before scheduler admission."""
+        from .spec_decode.mtp.flash_next_policy import FlashNextDecodeRoute
+
         active_uids = [uid for uid in gb.uids if uid in _state]
         if not active_uids:
             return True
@@ -1823,6 +1837,27 @@ def _install_mtp_vendored(
         # exactly the input/return invariant baseline _step requires.
         state["handoff_ready"] = True
         _stage_handoff_input(int(tok_int), lp_arr)
+        # A newly admitted real request ends the B1-only PLD operating point.
+        # Downgrade the immutable request latch exactly once at this cache-safe
+        # target-token boundary. The request may not re-enter PLD until a new
+        # turn receives a new request id and a fresh admission decision.
+        pld_latches = getattr(batch_gen, "_mtp_policy_pld_requests", {})
+        latched_request_id = pld_latches.pop(uid, None)
+        if latched_request_id is not None:
+            batch_gen._mtp_policy_plain_requests[uid] = latched_request_id
+            batch_gen._flash_next_route_latches[uid] = (
+                latched_request_id,
+                FlashNextDecodeRoute.PLAIN_CONTINUOUS_BATCHING,
+            )
+            counts = getattr(batch_gen, "_flash_next_route_counts", {})
+            fallbacks = counts.get("latch_fallbacks", {})
+            fallbacks["real_queue_width"] = fallbacks.get("real_queue_width", 0) + 1
+            logger.info(
+                "[MTP-policy] uid=%s request=%s adaptive-PLD latch downgraded "
+                "to plain at a state-exact B1->B>1 boundary",
+                uid,
+                latched_request_id,
+            )
         return True
 
     def _sampling_options_for_uid(uid: int) -> tuple[dict[str, Any] | None, str]:
@@ -2134,6 +2169,22 @@ def _install_mtp_vendored(
                 return _orig_step()
             policy_plain.pop(uid, None)
 
+        # Adaptive PLD is an immutable request/turn admission decision. The
+        # explicit generator kwarg below bypasses the historical process-wide
+        # environment switch, and the request-id check prevents uid reuse from
+        # inheriting a prior turn's latch.
+        policy_pld = getattr(batch_gen, "_mtp_policy_pld_requests", {})
+        policy_pld_request_id = policy_pld.get(uid)
+        current_request_id = (
+            uid_to_request_id.get(uid) if uid_to_request_id is not None else None
+        )
+        pld_latched = (
+            policy_pld_request_id is not None
+            and current_request_id == policy_pld_request_id
+        )
+        if policy_pld_request_id is not None and not pld_latched:
+            policy_pld.pop(uid, None)
+
         # A context policy refusal reaches this lower single-lane wrapper after
         # the continuous router leaves the request in mlx-lm's queue. Keep it
         # on true plain decode before any MTP state is constructed. Multi-lane
@@ -2367,6 +2418,11 @@ def _install_mtp_vendored(
                     # priming token. Both owners run on this generation
                     # thread; never re-derive from the public seed.
                     lane_rng=sampling_options["lane_rng"],
+                    prompt_lookup_enabled=pld_latched,
+                    # ``gb.tokens[0]`` is the full logical prompt at this seam;
+                    # append the already sampled first generated token so PLD
+                    # sees exactly the history visible to this request.
+                    prompt_lookup_history=list(gb.tokens[0]) + [first_tok],
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(

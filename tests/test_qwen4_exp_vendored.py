@@ -1700,6 +1700,12 @@ def test_qwen4_native_mtp_dispatch_attaches_synthetic_head(monkeypatch):
     assert dispatch_mtp_validate(model, "qwen4_exp") is True
     assert model.mtp_max_speculative_tokens == 1
 
+    from vllm_mlx.spec_decode.mtp.prompt_lookup_capability import (
+        evaluate_prompt_lookup_capability,
+    )
+
+    assert evaluate_prompt_lookup_capability(model).eligible is True
+
     inner = model.language_model
     cache = inner.make_mtp_cache()
     logits, hidden = inner(

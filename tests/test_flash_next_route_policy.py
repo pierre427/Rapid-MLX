@@ -227,6 +227,31 @@ def test_ple_identity_is_orthogonal_and_pld_needs_transactional_hybrid_accept():
     assert qualified_pld.ple_storage == "nvme"
 
 
+def test_adaptive_pld_has_a_conservative_32k_admission_floor():
+    capabilities = _capabilities(
+        adaptive_pld=True,
+        hybrid_recurrent_state_qualified=True,
+        request_scoped_pld_executor=True,
+    )
+    below = select_flash_next_route(_inputs(32_767), capabilities)
+    boundary = select_flash_next_route(
+        _inputs(
+            32_768,
+            recent_performance=RecentSelfMTPPerformance(
+                speedup_ratio=2.0,
+                samples=20,
+                age_seconds=1.0,
+            ),
+        ),
+        capabilities,
+    )
+
+    assert below.route is FlashNextDecodeRoute.PLE_ENABLED_PLAIN
+    assert below.adaptive_pld_eligible is False
+    assert boundary.route is FlashNextDecodeRoute.ADAPTIVE_PLD
+    assert boundary.adaptive_pld_eligible is True
+
+
 def test_decision_payload_has_fixed_observability_keys():
     payload = select_flash_next_route(_inputs(1_000), _capabilities()).to_dict()
     assert set(payload) == {

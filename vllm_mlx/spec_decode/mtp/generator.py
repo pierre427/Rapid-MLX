@@ -56,10 +56,12 @@ from .prompt_lookup import PromptLookupIndex
 from .prompt_lookup_capability import evaluate_prompt_lookup_capability
 
 
-def _prompt_lookup_is_enabled(model) -> bool:
+def _prompt_lookup_is_enabled(model, requested: bool | None = None) -> bool:
     """Return whether this model may use audited prompt-copy speculation."""
     if not evaluate_prompt_lookup_capability(model).eligible:
         return False
+    if requested is not None:
+        return requested
     # Explicit opt-in until Qwen's hybrid SSM target path is proven
     # token-lossless across the different verification chunk boundaries.
     return os.environ.get("RAPID_MLX_MTP_PROMPT_LOOKUP", "0").strip().lower() not in {
@@ -241,6 +243,8 @@ def mtp_generate_step(
     stop_tokens: set[int] | None = None,
     timing_stats: dict[str, float] | None = None,
     lane_rng: Any | None = None,
+    prompt_lookup_enabled: bool | None = None,
+    prompt_lookup_history: list[int] | mx.array | None = None,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Generator that uses the model's native MTP head for spec decode.
 
@@ -336,13 +340,24 @@ def mtp_generate_step(
     _mtp_supports_fused_greedy = callable(getattr(model, "mtp_greedy", None))
 
     y = prompt.astype(mx.uint32)
-    _prompt_lookup_enabled = _prompt_lookup_is_enabled(model)
+    _prompt_lookup_enabled = _prompt_lookup_is_enabled(
+        model, requested=prompt_lookup_enabled
+    )
     # Avoid copying a potentially long prompt back to the CPU for every other
     # MTP backend. Prompt lookup is opt-in per model because its cache-history
     # synchronization contract must be audited for that architecture first.
-    prompt_token_ids = (
-        [int(token) for token in y.tolist()] if _prompt_lookup_enabled else []
-    )
+    if _prompt_lookup_enabled:
+        if prompt_lookup_history is None:
+            prompt_token_ids = [int(token) for token in y.tolist()]
+        else:
+            history = (
+                prompt_lookup_history.tolist()
+                if isinstance(prompt_lookup_history, mx.array)
+                else prompt_lookup_history
+            )
+            prompt_token_ids = [int(token) for token in history]
+    else:
+        prompt_token_ids = []
     generated_token_ids: list[int] = []
 
     def _remember_generated(token_id: int) -> None:
