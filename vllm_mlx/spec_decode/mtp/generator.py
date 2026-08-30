@@ -53,11 +53,12 @@ from .accept_counter import get_global_counter
 from .cache_patch import patch_arrays_cache_rollback_state
 from .draft_k_controller_v2 import DepthController, get_or_create_controller
 from .prompt_lookup import PromptLookupIndex
+from .prompt_lookup_capability import evaluate_prompt_lookup_capability
 
 
 def _prompt_lookup_is_enabled(model) -> bool:
     """Return whether this model may use audited prompt-copy speculation."""
-    if not getattr(model, "mtp_prompt_lookup_supported", False):
+    if not evaluate_prompt_lookup_capability(model).eligible:
         return False
     # Explicit opt-in until Qwen's hybrid SSM target path is proven
     # token-lossless across the different verification chunk boundaries.

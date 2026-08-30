@@ -2383,6 +2383,32 @@ class _CacheAdvancingQwen35Model(_MockedQwen35Model):
     """Mock that advances supplied cache doubles on each forward."""
 
     mtp_prompt_lookup_supported = True
+    from vllm_mlx.spec_decode.mtp.prompt_lookup_capability import (
+        GDN_RECURRENT,
+        MTP_KV,
+        TARGET_KV,
+        PromptLookupVerificationIdentity,
+        make_prompt_lookup_capability,
+    )
+
+    mtp_prompt_lookup_runtime_identity = PromptLookupVerificationIdentity(
+        model_id="test/qwen3.5",
+        model_revision="test-weights",
+        runtime_commit="test-runtime",
+        cache_topology="target-kv+mtp-kv+gdn",
+        state_dtype="bf16+fp32",
+        verify_geometry="batch=1,width=2",
+        oracle_version="test-raw-bit-v1",
+        test_digest="b" * 64,
+    )
+    mtp_prompt_lookup_capability = make_prompt_lookup_capability(
+        mutable_state_surfaces=(TARGET_KV, MTP_KV, GDN_RECURRENT),
+        target_rollback_to_accepted=True,
+        mtp_advance_by_accepted=True,
+        recurrent_advance_by_accepted=True,
+        auxiliary_rollback_to_accepted=True,
+        verification_identity=mtp_prompt_lookup_runtime_identity,
+    )
 
     def __init__(self, backbone_outputs: list[int], mtp_outputs: list[int]):
         super().__init__(backbone_outputs, mtp_outputs)
@@ -2943,12 +2969,22 @@ def test_prompt_lookup_requires_an_audited_model_capability(monkeypatch):
     assert not _prompt_lookup_is_enabled(
         SimpleNamespace(mtp_prompt_lookup_supported=False)
     )
-    assert _prompt_lookup_is_enabled(SimpleNamespace(mtp_prompt_lookup_supported=True))
-
-    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "off")
     assert not _prompt_lookup_is_enabled(
         SimpleNamespace(mtp_prompt_lookup_supported=True)
     )
+    audited = SimpleNamespace(
+        mtp_prompt_lookup_supported=True,
+        mtp_prompt_lookup_capability=(
+            _CacheAdvancingQwen35Model.mtp_prompt_lookup_capability
+        ),
+        mtp_prompt_lookup_runtime_identity=(
+            _CacheAdvancingQwen35Model.mtp_prompt_lookup_runtime_identity
+        ),
+    )
+    assert _prompt_lookup_is_enabled(audited)
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP", "off")
+    assert not _prompt_lookup_is_enabled(audited)
 
 
 def test_generator_prompt_lookup_partial_reject_keeps_mtp_cache_aligned(

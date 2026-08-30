@@ -3,8 +3,9 @@
 
 Automatic prefix caching owns target-cache storage.  Persistent self-MTP owns
 an additional draft cache and the trunk hidden state that seeds the first pair
-after a restored prefix.  Those three objects are reusable only when they were
-captured together at one exact token boundary::
+after a restored prefix.  Hybrid models also carry recurrent GDN state, PLE
+history/rollback state, and QSA index state.  Those objects are reusable only
+when they were captured together at one exact token boundary::
 
     target tokens == covered tokens
     MTP pairs     == covered tokens - 1
@@ -27,8 +28,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-PREPARED_STATE_SCHEMA_VERSION = 1
+PREPARED_STATE_SCHEMA_VERSION = 2
 DEFAULT_MIN_USEFUL_PREFIX_TOKENS = 64
+ABSENT_STATE_LAYOUT = "absent"
 
 
 class RestoreReason(str, Enum):
@@ -49,9 +51,11 @@ class PreparedStateIdentity:
 
     ``model_id`` alone is not sufficient: an alias can be repointed, an
     adapter can change the target distribution, or a speculative configuration
-    can change the draft-cache meaning.  Cache and seed-hidden layout strings
-    are caller-provided stable fingerprints (for example, topology + dtype +
-    hidden width), keeping this module independent of MLX objects.
+    can change the draft-cache meaning.  Cache and state layout strings are
+    caller-provided stable fingerprints (for example, topology + dtype + hidden
+    width), keeping this module independent of MLX objects.  A model without
+    one of the optional mutable surfaces must identify it explicitly with
+    :data:`ABSENT_STATE_LAYOUT`.
     """
 
     model_id: str
@@ -60,6 +64,9 @@ class PreparedStateIdentity:
     target_cache_layout: str
     mtp_cache_layout: str
     seed_hidden_layout: str
+    gdn_state_layout: str
+    ple_state_layout: str
+    qsa_state_layout: str
     adapter_id: str | None = None
     tokenizer_fingerprint: str | None = None
 
@@ -71,6 +78,9 @@ class PreparedStateIdentity:
             "target_cache_layout": self.target_cache_layout,
             "mtp_cache_layout": self.mtp_cache_layout,
             "seed_hidden_layout": self.seed_hidden_layout,
+            "gdn_state_layout": self.gdn_state_layout,
+            "ple_state_layout": self.ple_state_layout,
+            "qsa_state_layout": self.qsa_state_layout,
         }
         for name, value in required.items():
             if not isinstance(value, str) or not value.strip():
@@ -92,6 +102,9 @@ class PreparedStateIdentity:
         target_cache_layout: str,
         mtp_cache_layout: str,
         seed_hidden_layout: str,
+        gdn_state_layout: str,
+        ple_state_layout: str,
+        qsa_state_layout: str,
         adapter_id: str | None = None,
         tokenizer_fingerprint: str | None = None,
     ) -> PreparedStateIdentity:
@@ -104,6 +117,9 @@ class PreparedStateIdentity:
             target_cache_layout=target_cache_layout,
             mtp_cache_layout=mtp_cache_layout,
             seed_hidden_layout=seed_hidden_layout,
+            gdn_state_layout=gdn_state_layout,
+            ple_state_layout=ple_state_layout,
+            qsa_state_layout=qsa_state_layout,
             adapter_id=adapter_id,
             tokenizer_fingerprint=tokenizer_fingerprint,
         )
@@ -111,7 +127,12 @@ class PreparedStateIdentity:
 
 @dataclass(frozen=True)
 class PreparedStateMetadata:
-    """Serializable metadata paired with the three opaque runtime objects."""
+    """Serializable metadata for one full logical-context boundary.
+
+    ``covered_tokens`` is the total prefix length represented by the restored
+    state, not the length of the uncached request suffix.  Routing and memory
+    policy must continue to use that full logical length after restoration.
+    """
 
     identity: PreparedStateIdentity
     covered_tokens: int
@@ -120,15 +141,32 @@ class PreparedStateMetadata:
     captured_at: float
     schema_version: int = PREPARED_STATE_SCHEMA_VERSION
 
+    @property
+    def logical_context_tokens(self) -> int:
+        """Total logical context represented by the captured boundary."""
+
+        return self.covered_tokens
+
 
 @dataclass(frozen=True)
 class PreparedMTPState:
-    """Target cache, draft cache, and seed hidden captured as one unit."""
+    """Every mutable target/draft surface captured as one atomic unit.
+
+    Optional architecture surfaces use ``None`` only when the matching
+    identity layout is exactly :data:`ABSENT_STATE_LAYOUT`.  ``gdn_state``
+    includes conv/matrix state plus host metadata and rollback records;
+    ``ple_state`` includes conv/history plus the staged atomic rollback half;
+    ``qsa_state`` includes KV, raw/pooled index ledgers, offset, and shared-top-k
+    lifecycle state.  The contract keeps them opaque but never conflates them.
+    """
 
     metadata: PreparedStateMetadata
     target_cache: Any
     mtp_cache: Any
     seed_hidden: Any
+    gdn_state: Any
+    ple_state: Any
+    qsa_state: Any
 
 
 @dataclass(frozen=True)
@@ -188,6 +226,9 @@ def prepare_mtp_state(
     mtp_cache: Any,
     mtp_cache_pairs: int,
     seed_hidden: Any,
+    gdn_state: Any,
+    ple_state: Any,
+    qsa_state: Any,
     captured_at: float | None = None,
 ) -> PreparedMTPState:
     """Validate and capture one exact target/MTP/hidden boundary.
@@ -214,6 +255,9 @@ def prepare_mtp_state(
         raise ValueError("mtp_cache must be present")
     if seed_hidden is None:
         raise ValueError("seed_hidden must cover the final prefix token")
+    _validate_optional_surface("gdn_state", identity.gdn_state_layout, gdn_state)
+    _validate_optional_surface("ple_state", identity.ple_state_layout, ple_state)
+    _validate_optional_surface("qsa_state", identity.qsa_state_layout, qsa_state)
     timestamp = time.time() if captured_at is None else float(captured_at)
     if not math.isfinite(timestamp) or timestamp < 0:
         raise ValueError("captured_at must be a finite non-negative timestamp")
@@ -225,7 +269,15 @@ def prepare_mtp_state(
         boundary_fingerprint=fingerprint_tokens(prefix),
         captured_at=timestamp,
     )
-    return PreparedMTPState(metadata, target_cache, mtp_cache, seed_hidden)
+    return PreparedMTPState(
+        metadata=metadata,
+        target_cache=target_cache,
+        mtp_cache=mtp_cache,
+        seed_hidden=seed_hidden,
+        gdn_state=gdn_state,
+        ple_state=ple_state,
+        qsa_state=qsa_state,
+    )
 
 
 def evaluate_restore(
@@ -295,6 +347,7 @@ def evaluate_restore(
         getattr(state, "target_cache", None) is not None
         and getattr(state, "mtp_cache", None) is not None
         and getattr(state, "seed_hidden", None) is not None
+        and _optional_surfaces_match_identity(state, metadata.identity)
         and metadata.mtp_covered_pairs == covered - 1
         and live_target == covered
         and live_mtp == covered - 1
@@ -323,6 +376,31 @@ def _validated_count(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return value
+
+
+def _validate_optional_surface(name: str, layout: str, state: Any) -> None:
+    expected = layout != ABSENT_STATE_LAYOUT
+    if expected and state is None:
+        raise ValueError(f"{name} must be present for layout {layout!r}")
+    if not expected and state is not None:
+        raise ValueError(
+            f"{name} must be None when its layout is {ABSENT_STATE_LAYOUT!r}"
+        )
+
+
+def _optional_surfaces_match_identity(
+    state: PreparedMTPState,
+    identity: PreparedStateIdentity,
+) -> bool:
+    for name, layout in (
+        ("gdn_state", identity.gdn_state_layout),
+        ("ple_state", identity.ple_state_layout),
+        ("qsa_state", identity.qsa_state_layout),
+    ):
+        expected = layout != ABSENT_STATE_LAYOUT
+        if (getattr(state, name, None) is not None) is not expected:
+            return False
+    return True
 
 
 def _metadata_is_well_formed(metadata: Any) -> bool:
@@ -381,12 +459,18 @@ def _identity_mismatch(
         actual.target_cache_layout,
         actual.mtp_cache_layout,
         actual.seed_hidden_layout,
+        actual.gdn_state_layout,
+        actual.ple_state_layout,
+        actual.qsa_state_layout,
     )
     config_expected = (
         expected.speculative_config_fingerprint,
         expected.target_cache_layout,
         expected.mtp_cache_layout,
         expected.seed_hidden_layout,
+        expected.gdn_state_layout,
+        expected.ple_state_layout,
+        expected.qsa_state_layout,
     )
     if config_actual != config_expected:
         return RestoreReason.CONFIG_MISMATCH
@@ -401,6 +485,7 @@ def _refusal(
 
 
 __all__ = [
+    "ABSENT_STATE_LAYOUT",
     "DEFAULT_MIN_USEFUL_PREFIX_TOKENS",
     "PREPARED_STATE_SCHEMA_VERSION",
     "PreparedMTPState",

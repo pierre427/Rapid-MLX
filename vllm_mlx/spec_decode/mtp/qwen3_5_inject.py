@@ -57,6 +57,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from .prompt_lookup_capability import (
+    GDN_RECURRENT,
+    MTP_KV,
+    TARGET_KV,
+    make_prompt_lookup_capability,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +86,19 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
         "windowed_cache": False,
         "xtc": False,
     }
+)
+
+# Mechanism inventory only.  ``verification_identity=None`` is deliberate:
+# the generic family injector cannot attest a checkpoint revision, runtime
+# commit, topology/dtype geometry, and raw-bit oracle digest.  Prompt lookup
+# therefore remains fail-closed until an audited loader binds an immutable
+# verification identity to both this descriptor and the loaded runtime.
+PROMPT_LOOKUP_CAPABILITY = make_prompt_lookup_capability(
+    mutable_state_surfaces=(TARGET_KV, MTP_KV, GDN_RECURRENT),
+    target_rollback_to_accepted=True,
+    mtp_advance_by_accepted=True,
+    recurrent_advance_by_accepted=True,
+    auxiliary_rollback_to_accepted=True,
 )
 
 
@@ -1037,6 +1057,7 @@ def inject_mtp_support(
         # backends whose MTP cache-history synchronization has been audited.
         # This injector covers the Qwen 3.5/3.6/3.8 family.
         mtp_prompt_lookup_supported = True
+        mtp_prompt_lookup_capability = PROMPT_LOOKUP_CAPABILITY
         batched_mtp_capability = BATCHED_MTP_CAPABILITY
         mtp_recursive_draft_depth = 2
         mtp_batch_forward = _mtp_batch_forward
@@ -1177,6 +1198,7 @@ def inject_mtp_support(
     # regardless of which supported shape reaches the generator.
     if model is not inner:
         model.mtp_prompt_lookup_supported = True
+        model.mtp_prompt_lookup_capability = PROMPT_LOOKUP_CAPABILITY
         model.mtp_batch_forward = inner.mtp_batch_forward
     model.batched_mtp_capability = BATCHED_MTP_CAPABILITY
     model.mtp_recursive_draft_depth = 2

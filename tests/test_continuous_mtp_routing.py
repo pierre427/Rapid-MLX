@@ -90,6 +90,9 @@ def _identity():
         target_cache_layout="qwen4-batch-kv:bf16",
         mtp_cache_layout="qwen4-mtp-batch-kv:bf16",
         seed_hidden_layout="bf16[1,1,2048]",
+        gdn_state_layout="qwen4:gdn:conv+matrix",
+        ple_state_layout="qwen4:ple:conv+history+atomic-rollback",
+        qsa_state_layout="qwen4:qsa:kv+index+pooled+shared-topk",
     )
 
 
@@ -103,6 +106,9 @@ def _apc_hit(prefix, *, identity=None):
         mtp_cache="mtp-cache",
         mtp_cache_pairs=len(prefix) - 1,
         seed_hidden="seed-hidden",
+        gdn_state="gdn-state",
+        ple_state="ple-state",
+        qsa_state="qsa-state",
         captured_at=10.0,
     )
     return ContinuousMTPAPCHit(
@@ -422,6 +428,9 @@ def test_bad_apc_sidecar_routes_plain_while_other_lanes_form_cohort():
         target_cache_layout="qwen4-batch-kv:bf16",
         mtp_cache_layout="qwen4-mtp-batch-kv:bf16",
         seed_hidden_layout="bf16[1,1,2048]",
+        gdn_state_layout="qwen4:gdn:conv+matrix",
+        ple_state_layout="qwen4:ple:conv+history+atomic-rollback",
+        qsa_state_layout="qwen4:qsa:kv+index+pooled+shared-topk",
     )
     requests = [
         _request(
