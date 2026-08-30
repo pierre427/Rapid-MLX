@@ -104,3 +104,89 @@ def test_flash_and_qwen35_join_claims_remain_intentionally_asymmetric():
 def test_qsa_selection_sharing_is_attested_only_for_qwen4():
     assert qwen4_exp_inject.BATCHED_MTP_CAPABILITY["share_qsa_indices"] is True
     assert qwen3_5_inject.BATCHED_MTP_CAPABILITY["share_qsa_indices"] is False
+
+
+def test_native_qwen4_adapter_preserves_model_and_exposes_rapid_abi():
+    calls = []
+
+    class NativeQwen4:
+        model_type = "qwen4_exp"
+        supports_speculative_rollback = True
+
+        def __init__(self):
+            self.mtp = object()
+
+        def __call__(self, inputs, cache=None, input_embeddings=None):
+            calls.append(("plain", inputs, cache, input_embeddings))
+            return "plain-logits"
+
+        def mtp_backbone(self, inputs, cache=None):
+            calls.append(("backbone", inputs, cache))
+            return "logit-hidden", "mtp-hidden"
+
+        def logits(self, hidden):
+            calls.append(("logits", hidden))
+            return "hidden-logits"
+
+        def mtp_step(self, hidden, tokens, cache):
+            calls.append(("mtp", hidden, tokens, cache))
+            return "draft-logits", "next-hidden"
+
+        def make_mtp_cache(self):
+            return ["native-cache"]
+
+    model = NativeQwen4()
+    original_mtp = model.mtp
+    assert qwen4_exp_inject._attach_native_qwen4_exp_mtp_support(model) is True
+
+    assert model.mtp is original_mtp
+    assert model("ids", cache="target-cache") == "plain-logits"
+    assert model(
+        "ids", cache="target-cache", return_hidden=True, n_confirmed=2
+    ) == ("hidden-logits", "mtp-hidden")
+    assert model.mtp_forward(
+        "hidden", "tokens", "draft-cache", return_hidden=True
+    ) == ("draft-logits", "next-hidden")
+    assert model.mtp_batch_forward("hidden", "tokens", "draft-cache") == (
+        "draft-logits",
+        "next-hidden",
+    )
+    assert model.make_mtp_cache() == ["native-cache"]
+    assert model.mtp_max_speculative_tokens == 2
+    assert qwen4_exp_inject._resolve_inner(model) is model
+    assert qwen4_exp_inject.validate_qwen4_exp_mtp_support(model) is True
+    assert calls == [
+        ("plain", "ids", "target-cache", None),
+        ("backbone", "ids", "target-cache"),
+        ("logits", "logit-hidden"),
+        ("mtp", "hidden", "tokens", "draft-cache"),
+        ("mtp", "hidden", "tokens", "draft-cache"),
+    ]
+
+
+@pytest.mark.parametrize("value,error", [(True, TypeError), (-1, ValueError)])
+def test_native_qwen4_adapter_validates_confirmed_count(value, error):
+    class NativeQwen4:
+        model_type = "qwen4_exp"
+        supports_speculative_rollback = True
+        mtp = object()
+
+        def __call__(self, inputs, cache=None, input_embeddings=None):
+            return inputs
+
+        def mtp_backbone(self, inputs, cache=None):
+            return inputs, inputs
+
+        def logits(self, hidden):
+            return hidden
+
+        def mtp_step(self, hidden, tokens, cache):
+            return tokens, hidden
+
+        def make_mtp_cache(self):
+            return []
+
+    model = NativeQwen4()
+    assert qwen4_exp_inject._attach_native_qwen4_exp_mtp_support(model) is True
+    with pytest.raises(error):
+        model("ids", return_hidden=True, n_confirmed=value)

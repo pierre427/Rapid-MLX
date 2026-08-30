@@ -53,12 +53,92 @@ def _mtp_batch_forward(self, hidden_states, next_token_ids, mtp_cache):
 
 
 def _resolve_inner(model: Any) -> Any | None:
+    # Current mlx-lm Qwen4 checkpoints expose the complete native MTP head on
+    # the outer model (``mtp_backbone``/``mtp_step``).  Keep that object as the
+    # target seam after the adapter below is installed; resolving its
+    # ``language_model`` instead would discard both the native head and the
+    # exact speculative-rollback cache contract.
+    if (
+        getattr(model, "model_type", None) == "qwen4_exp"
+        and callable(getattr(model, "mtp_backbone", None))
+        and callable(getattr(model, "mtp_step", None))
+    ):
+        return model
     inner = getattr(model, "language_model", None)
     if inner is not None and getattr(inner, "model_type", None) == "qwen4_exp_text":
         return inner
     if getattr(model, "model_type", None) == "qwen4_exp_text":
         return model
     return None
+
+
+def _attach_native_qwen4_exp_mtp_support(model: Any) -> bool:
+    """Adapt mlx-lm's native Qwen4 MTP protocol to Rapid's forward seams.
+
+    The pinned common runtime already loads the production MTP head and owns
+    exact PLE/GDN/QSA rollback.  Rebuilding a second head here is both wasteful
+    and wrong: the native outer model deliberately exposes ``mtp_backbone``
+    and ``mtp_step`` rather than Rapid's historical ``return_hidden`` and
+    ``mtp_forward`` spellings.  This class-only adapter adds those spellings;
+    it does not replace weights, caches, PLE tables, or model math.
+    """
+
+    required = (
+        getattr(model, "model_type", None) == "qwen4_exp",
+        getattr(model, "mtp", None) is not None,
+        callable(getattr(model, "mtp_backbone", None)),
+        callable(getattr(model, "mtp_step", None)),
+        callable(getattr(model, "make_mtp_cache", None)),
+        callable(getattr(model, "logits", None)),
+        getattr(model, "supports_speculative_rollback", False) is True,
+    )
+    if not all(required):
+        return False
+
+    original_class = type(model)
+
+    class _Qwen4ExpNativeMTPAdapter(original_class):  # type: ignore[valid-type, misc]
+        batched_mtp_capability = BATCHED_MTP_CAPABILITY
+        mtp_recursive_draft_depth = 2
+        mtp_batch_forward = _mtp_batch_forward
+
+        def __call__(
+            self,
+            inputs,
+            cache=None,
+            input_embeddings=None,
+            return_hidden: bool = False,
+            n_confirmed: int = 0,
+        ):
+            # Native Qwen4 caches record exact per-forward rollback whenever
+            # the continuous backend arms speculation.  ``n_confirmed`` is an
+            # ABI input for the older injected model; native rollback trims
+            # the rejected suffix after verification, so no model-side
+            # confirmed-boundary mutation is needed here.
+            if isinstance(n_confirmed, bool) or not isinstance(n_confirmed, int):
+                raise TypeError("n_confirmed must be an integer")
+            if n_confirmed < 0:
+                raise ValueError("n_confirmed cannot be negative")
+            if not return_hidden:
+                return super().__call__(inputs, cache, input_embeddings)
+            logit_hidden, mtp_hidden = self.mtp_backbone(inputs, cache=cache)
+            return self.logits(logit_hidden), mtp_hidden
+
+        def mtp_forward(
+            self,
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            return_hidden: bool = False,
+        ):
+            logits, multi_hidden = self.mtp_step(
+                hidden_states, next_token_ids, mtp_cache
+            )
+            return (logits, multi_hidden) if return_hidden else logits
+
+    model.__class__ = _Qwen4ExpNativeMTPAdapter
+    model.mtp_max_speculative_tokens = 2
+    return True
 
 
 def _mtp_weight_files(source: str | Path) -> list[Path]:
@@ -191,6 +271,11 @@ def inject_qwen4_exp_mtp_support(
     allow_random_init: bool = False,
 ) -> bool:
     """Attach native Qwen4 MTP surfaces after complete tensor validation."""
+
+    # Prefer the MTP head already loaded by modern mlx-lm.  The legacy branch
+    # below remains for Rapid's vendored decoder and older dependencies.
+    if _attach_native_qwen4_exp_mtp_support(model):
+        return True
 
     import mlx.core as mx
     from mlx.utils import tree_flatten
