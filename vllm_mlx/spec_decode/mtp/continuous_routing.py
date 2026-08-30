@@ -75,6 +75,13 @@ class ContinuousMTPRequestMetadata:
     cache_windowed: bool = False
     terminal: bool = False
     apc_hit: ContinuousMTPAPCHit | None = None
+    # Full logical attention length, never merely the uncached suffix.  The
+    # projected value includes this request's output budget so immutable
+    # request-boundary routing cannot cross a context cutoff mid-generation.
+    effective_context_tokens: int | None = None
+    projected_context_tokens: int | None = None
+    apc_cached_tokens: int = 0
+    exact_joint_mtp_state: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.uid, int) or isinstance(self.uid, bool):
@@ -88,6 +95,29 @@ class ContinuousMTPRequestMetadata:
             raise ValueError("max_tokens must be an integer")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be positive")
+        effective = (
+            len(self.prompt_tokens)
+            if self.effective_context_tokens is None
+            else self.effective_context_tokens
+        )
+        projected = (
+            effective + self.max_tokens
+            if self.projected_context_tokens is None
+            else self.projected_context_tokens
+        )
+        for name, value in (
+            ("effective_context_tokens", effective),
+            ("projected_context_tokens", projected),
+            ("apc_cached_tokens", self.apc_cached_tokens),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if projected < effective:
+            raise ValueError("projected context must include effective context")
+        if not isinstance(self.exact_joint_mtp_state, bool):
+            raise ValueError("exact_joint_mtp_state must be a boolean")
+        object.__setattr__(self, "effective_context_tokens", effective)
+        object.__setattr__(self, "projected_context_tokens", projected)
         if any(
             not isinstance(token, int) or isinstance(token, bool)
             for token in self.stop_tokens

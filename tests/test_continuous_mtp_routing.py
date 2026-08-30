@@ -368,10 +368,13 @@ def test_live_integration_executes_b1_continuous_driver(monkeypatch, caplog):
         mtp_lane_transient_gib=1.76,
     )
 
+    flash_model = _Model()
+    flash_model.batched_mtp_capability = _descriptor("qwen4_exp")
+
     with caplog.at_level(logging.INFO, logger="vllm_mlx.scheduler"):
         installed = scheduler._install_continuous_mtp_router(
             batch_gen,
-            _Model(),
+            flash_model,
             config,
             requests={"req-1": request},
             uid_to_request_id={1: "req-1"},
@@ -379,13 +382,34 @@ def test_live_integration_executes_b1_continuous_driver(monkeypatch, caplog):
         )
         assert installed is True
         assert batch_gen.next() == ([], [])
+        # A second real request arriving while B=1 self-MTP is active stays in
+        # the prompt queue.  The wrapper must not overlap original_next with
+        # the pinned single-user driver.
+        batch_gen._unprocessed_sequences.append(
+            (2, ((21, 22),), 8, [_Cache()], [], None, [], None)
+        )
         assert batch_gen.next() == ([], ["continuous-b1"])
 
     assert len(created) == 1
     assert [spec.uid for spec in created[0][0]] == [1]
     assert created[0][1] is runtime
     assert driver.next_calls == 1
-    assert not batch_gen._unprocessed_sequences
+    assert [item[0] for item in batch_gen._unprocessed_sequences] == [2]
+    assert batch_gen.fallback_calls == 1
+    assert batch_gen._flash_next_last_route_decision == {
+        "route": "linear_self_mtp",
+        "reason": "short_context",
+        "effective_context_tokens": 2,
+        "projected_context_tokens": 10,
+        "real_queue_width": 1,
+        "ple_enabled": False,
+        "ple_storage": "none",
+        "self_mtp_eligible": True,
+        "adaptive_pld_eligible": False,
+        "policy_version": "flash-next-b1-v1",
+        "context_bucket": "le_16k",
+    }
+    assert batch_gen._flash_next_route_counts["routes"]["linear_self_mtp"] == 1
     assert (
         "[MTP-continuous] admitted continuous cohort "
         "route=continuous_planned lanes=1 draft_depth=2"
@@ -512,6 +536,11 @@ def test_scheduler_wiring_diverts_next_and_refusal_precedes_mutation():
     assert "continuous_responses + list(fallback_responses)" in source
     assert "scheduler_owned_termination" in source
     assert "bool(params.stop) or bool(request.has_tools)" in source
+    assert "_mtp_policy_plain_requests" in source
+    assert "had_active_driver" in source
+    assert (
+        "if had_active_driver:\n            return [], continuous_responses" in source
+    )
     assert source.index("_remove_queued(selected)") < source.index(
         "raw = original_next()"
     )
@@ -597,3 +626,5 @@ def test_live_router_charges_k2_transient_and_compute_cap_by_source():
     assert 'getattr(config, "mtp_max_lanes", 16)' in scheduler_source
     assert 'getattr(config, "mtp_lane_transient_gib", 1.76)' in scheduler_source
     assert "bytes_per_draft_token=int(" in scheduler_source
+    assert "projected_context = prompt_tokens + requested_output" in scheduler_source
+    assert "request-boundary Flash policy selected plain decode" in scheduler_source

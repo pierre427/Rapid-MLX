@@ -18,6 +18,7 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -806,6 +807,23 @@ def _mtp_controller_key(model_name: str | None, sidecar: str | None) -> str | No
     return f"{len(model_name)}:{model_name}+mtp:{sidecar}"
 
 
+def _resolved_mtp_single_lane_limit(model: Any, config: Any) -> int:
+    """Return the explicit limit, or Flash-Next's frozen 32K default."""
+
+    configured = int(getattr(config, "mtp_single_lane_max_prompt_tokens", 0))
+    if configured:
+        return configured
+    candidates = (model, getattr(model, "language_model", None))
+    for candidate in candidates:
+        descriptor = getattr(candidate, "batched_mtp_capability", None)
+        if (
+            isinstance(descriptor, Mapping)
+            and descriptor.get("model_family") == "qwen4_exp"
+        ):
+            return 32_768
+    return 0
+
+
 def _install_continuous_mtp_router(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -845,6 +863,14 @@ def _install_continuous_mtp_router(
     )
     from .spec_decode.mtp.continuous_runtime import (
         assemble_continuous_self_mtp_runtime,
+    )
+    from .spec_decode.mtp.flash_next_policy import (
+        FlashNextContextBucket,
+        FlashNextDecodeRoute,
+        FlashNextRouteCapabilities,
+        FlashNextRouteInputs,
+        FlashNextRouteReason,
+        select_flash_next_route,
     )
 
     # The next-level diversion depends on mlx-lm 0.31's explicit prompt queue.
@@ -893,7 +919,7 @@ def _install_continuous_mtp_router(
             getattr(config, "mtp_multi_lane_max_prompt_tokens", 0)
         ),
         single_lane_max_prompt_tokens=int(
-            getattr(config, "mtp_single_lane_max_prompt_tokens", 0)
+            _resolved_mtp_single_lane_limit(model, config)
         ),
     )
     if not decision.admitted or decision.router is None:
@@ -934,6 +960,57 @@ def _install_continuous_mtp_router(
             "retaining vendored MTP/plain decode"
         )
         return False
+
+    def _ple_runtime_identity() -> tuple[bool, str]:
+        """Return target PLE presence/storage without treating it as a drafter."""
+
+        candidates = [model]
+        for value in (
+            getattr(model, "language_model", None),
+            getattr(model, "model", None),
+            getattr(getattr(model, "language_model", None), "model", None),
+        ):
+            if value is not None:
+                candidates.append(value)
+        enabled = any(
+            bool(getattr(getattr(value, "args", None), "ple_layer_ids", ()))
+            for value in candidates
+        )
+        if not enabled:
+            return False, "none"
+        return True, "nvme" if os.environ.get("MLX_QWEN4_PLE_NVME") else "resident"
+
+    def _hybrid_transactional_accept_qualified() -> bool:
+        """Accept only the state-contract module's immutable model proof.
+
+        An operator flag, CLI option, or environment variable cannot earn this
+        capability.  The optional import keeps this commit independently
+        cherry-pickable; without the state-contract dependency PLD is refused.
+        """
+
+        try:
+            from .spec_decode.mtp.prompt_lookup_capability import (
+                evaluate_prompt_lookup_capability,
+            )
+        except ImportError:
+            return False
+        for candidate in (model, getattr(model, "language_model", None)):
+            if (
+                candidate is not None
+                and evaluate_prompt_lookup_capability(candidate).eligible
+            ):
+                return True
+        return False
+
+    ple_enabled, ple_storage = _ple_runtime_identity()
+    prompt_lookup_qualified = _hybrid_transactional_accept_qualified()
+    flash_capabilities = FlashNextRouteCapabilities(
+        self_mtp=True,
+        ple_enabled=ple_enabled,
+        ple_storage=ple_storage,
+        adaptive_pld=prompt_lookup_qualified,
+        hybrid_recurrent_state_qualified=prompt_lookup_qualified,
+    )
 
     def _response_factory(**kwargs):
         # mlx-lm's Response grew MTP fields in the unified source.  Preserve
@@ -996,6 +1073,21 @@ def _install_continuous_mtp_router(
         cache_windowed = any(
             marker in capability.lower() for marker in ("rotating", "window", "sink")
         )
+        cached_tokens = max(0, int(getattr(request, "cached_tokens", 0) or 0))
+        request_prompt_tokens = int(
+            getattr(request, "model_prompt_tokens", 0)
+            or getattr(request, "num_prompt_tokens", 0)
+            or 0
+        )
+        # ``history`` is the generator's already-materialized logical prefix;
+        # the public request count is authoritative when APC reduced segments
+        # to an uncached suffix.
+        effective_context = max(
+            request_prompt_tokens,
+            len(history) + len(prompt),
+            cached_tokens + len(prompt),
+        )
+        requested_output = int(getattr(params, "max_tokens", maximum) or maximum)
         return ContinuousMTPRequestMetadata(
             lane_id=request_id,
             uid=int(uid),
@@ -1019,6 +1111,14 @@ def _install_continuous_mtp_router(
             cache_ready=cache_ready,
             cache_quantized=cache_quantized,
             cache_windowed=cache_windowed,
+            effective_context_tokens=effective_context,
+            projected_context_tokens=effective_context + requested_output,
+            apc_cached_tokens=cached_tokens,
+            # Do not infer exactness from the mere presence of a draft cache.
+            # The APC restore path must explicitly attest joint identity.
+            exact_joint_mtp_state=(
+                getattr(request, "_continuous_mtp_joint_state_exact", False) is True
+            ),
         )
 
     def _queued_candidates():
@@ -1046,6 +1146,56 @@ def _install_continuous_mtp_router(
         if not candidates:
             return
         metadata = [item[1] for item in candidates]
+        if router.runtime.model_family == "qwen4_exp":
+            active_uids = tuple(getattr(batch_gen._generation_batch, "uids", ()) or ())
+            # Count real scheduler requests, including a queued request that
+            # could not produce self-MTP metadata.  Speculative lanes and
+            # configured capacity never enter this width.
+            real_queue_width = len(active_uids) + len(
+                tuple(batch_gen._unprocessed_sequences)
+            )
+            request = metadata[0]
+            incremental = int(request.bytes_per_draft_token) * 2
+            selected_route = select_flash_next_route(
+                FlashNextRouteInputs(
+                    effective_context_tokens=int(request.effective_context_tokens or 0),
+                    projected_context_tokens=int(request.projected_context_tokens or 0),
+                    real_queue_width=max(1, real_queue_width),
+                    free_bytes=_free_bytes(),
+                    memory_reserve_bytes=int(router.config.hard_reserve_bytes),
+                    self_mtp_incremental_bytes=incremental,
+                    apc_cached_tokens=request.apc_cached_tokens,
+                    exact_joint_mtp_state=request.exact_joint_mtp_state,
+                    recent_performance=getattr(
+                        batch_gen, "_flash_next_recent_self_mtp_performance", None
+                    ),
+                ),
+                flash_capabilities,
+            )
+            # One bounded snapshot, not a per-request/cardinality-growing map.
+            batch_gen._flash_next_last_route_decision = selected_route.to_dict()
+            policy_counts = batch_gen._flash_next_route_counts
+            policy_counts["routes"][selected_route.route.value] += 1
+            policy_counts["reasons"][selected_route.reason.value] += 1
+            policy_counts["context_buckets"][selected_route.context_bucket.value] += 1
+            logger.info(
+                "[MTP-policy] version=%s route=%s reason=%s "
+                "context_bucket=%s effective_context=%d projected_context=%d "
+                "real_queue_width=%d ple_enabled=%s ple_storage=%s",
+                selected_route.policy_version,
+                selected_route.route.value,
+                selected_route.reason.value,
+                selected_route.context_bucket.value,
+                selected_route.effective_context_tokens,
+                selected_route.projected_context_tokens,
+                selected_route.real_queue_width,
+                selected_route.ple_enabled,
+                selected_route.ple_storage,
+            )
+            if selected_route.route is not FlashNextDecodeRoute.LINEAR_SELF_MTP:
+                for item in metadata:
+                    batch_gen._mtp_policy_plain_requests[item.uid] = item.lane_id
+                return
         routed = router.plan(metadata, free_bytes=_free_bytes())
         if routed.route is not ContinuousMTPIntegrationRoute.CONTINUOUS_PLANNED:
             return
@@ -1115,7 +1265,8 @@ def _install_continuous_mtp_router(
     def _continuous_next(self):
         nonlocal driver
         continuous_responses = []
-        if driver is not None and driver.has_work:
+        had_active_driver = driver is not None and driver.has_work
+        if had_active_driver:
             continuous_responses = driver.next()
             # Completed lanes deliver their KV/MTP caches by value on the
             # response above; the driver's terminal-detach retention is then
@@ -1140,6 +1291,13 @@ def _install_continuous_mtp_router(
         else:
             _stage_joins()
 
+        # A B=1 self-MTP route is pinned for one request.  Never call the
+        # ordinary batch generator in the same cycle: a newly arrived real
+        # request stays queued until the pinned request reaches its terminal
+        # transaction boundary.  This prevents accidental B1 + user overlap.
+        if had_active_driver:
+            return [], continuous_responses
+
         raw = original_next()
         if isinstance(raw, tuple):
             prompt_responses, fallback_responses = raw
@@ -1159,6 +1317,8 @@ def _install_continuous_mtp_router(
 
     def _continuous_remove(self, uids, *args, **kwargs):
         removed_packages = ()
+        for uid in uids:
+            batch_gen._mtp_policy_plain_requests.pop(int(uid), None)
         if driver is not None:
             removed_packages = driver.remove_uids(uids)
         base = {}
@@ -1183,6 +1343,13 @@ def _install_continuous_mtp_router(
     batch_gen._continuous_mtp_runtime = runtime
     batch_gen._continuous_mtp_driver = None
     batch_gen._continuous_mtp_removed_states = {}
+    batch_gen._mtp_policy_plain_requests = {}
+    batch_gen._flash_next_last_route_decision = None
+    batch_gen._flash_next_route_counts = {
+        "routes": {route.value: 0 for route in FlashNextDecodeRoute},
+        "reasons": {reason.value: 0 for reason in FlashNextRouteReason},
+        "context_buckets": {bucket.value: 0 for bucket in FlashNextContextBucket},
+    }
     logger.info(
         "[MTP-continuous] BatchGenerator.next coordinator installed "
         "(multi-uid burst delivery; cycle-boundary joins; per-lane detach)."
@@ -1751,6 +1918,23 @@ def _install_mtp_vendored(
                     "return to plain decode."
                 )
 
+        # The request-boundary Flash policy is authoritative over this lower
+        # compatibility wrapper.  It records request identity, not a bare uid,
+        # so mlx-lm uid reuse cannot leak a plain-route decision forward.
+        policy_plain = getattr(batch_gen, "_mtp_policy_plain_requests", {})
+        policy_request_id = policy_plain.get(uid)
+        if policy_request_id is not None:
+            current_request_id = (
+                uid_to_request_id.get(uid) if uid_to_request_id is not None else None
+            )
+            if current_request_id == policy_request_id:
+                _mark_disabled(uid)
+                _log_mtp_initial_skip_once(
+                    uid, "request-boundary Flash policy selected plain decode"
+                )
+                return _orig_step()
+            policy_plain.pop(uid, None)
+
         # A context policy refusal reaches this lower single-lane wrapper after
         # the continuous router leaves the request in mlx-lm's queue. Keep it
         # on true plain decode before any MTP state is constructed. Multi-lane
@@ -1763,12 +1947,17 @@ def _install_mtp_vendored(
                 or getattr(req, "num_prompt_tokens", 0)
                 or 0
             )
-            if prompt_tokens > max_prompt_tokens:
+            requested_output = int(
+                getattr(getattr(req, "sampling_params", None), "max_tokens", 0) or 0
+            )
+            projected_context = prompt_tokens + requested_output
+            if projected_context > max_prompt_tokens:
                 _mark_disabled(uid)
                 _log_mtp_initial_skip_once(
                     uid,
-                    f"prompt length {prompt_tokens} exceeds serial operating "
-                    f"limit {max_prompt_tokens}",
+                    f"projected context {projected_context} "
+                    f"(prompt={prompt_tokens}, max_tokens={requested_output}) "
+                    f"exceeds serial operating limit {max_prompt_tokens}",
                 )
                 return _orig_step()
 
@@ -4477,8 +4666,8 @@ class Scheduler:
                         or getattr(self.config, "model_name", None),
                         getattr(self.config, "mtp_sidecar", None),
                     ),
-                    max_prompt_tokens=getattr(
-                        self.config, "mtp_single_lane_max_prompt_tokens", 0
+                    max_prompt_tokens=_resolved_mtp_single_lane_limit(
+                        self.model, self.config
                     ),
                 )
                 if mtp_installed:
