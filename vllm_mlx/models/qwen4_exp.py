@@ -50,12 +50,80 @@ from ..kernels.qwen4_fused_moe import (  # noqa: E402
 )
 from .qwen4_exp_cache import QSAIndexCache, Qwen4ExpStateCache  # noqa: E402
 
-
 _QWEN4_FUSED_EXPERT_MODES = ("stock", "auto", "scalar", "tile4")
+_ZERO_CENTERED_NORM_SUFFIXES = (
+    ".hc_norm.weight",
+    ".norm_key.weight",
+    ".norm_query.weight",
+    ".norm_conv.weight",
+    ".q_layernorm.weight",
+    ".k_layernorm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+_NORM_CONVENTION_ENV = "RAPID_MLX_QWEN4_NORM_CONVENTION"
+_NORM_CONVENTION_VALUES = ("one_centered", "zero_centered")
+_NORM_CONVENTION_MARGIN = 0.25
 # MLX #4437: Metal's column reducer launches 256 threads per 32 output
 # columns and silently truncates a grid wider than UINT32_MAX. 2**28 columns
 # keep each dispatch at half that limit while leaving ordinary QSA unchanged.
 _QSA_REDUCTION_CHUNK_COLUMNS = 1 << 28
+
+
+def _detect_norm_convention(
+    weights: dict[str, mx.array],
+    declared: bool | None = None,
+) -> bool:
+    """Return whether stored Qwen4 gains are one-centered, or fail closed."""
+    override = os.environ.get(_NORM_CONVENTION_ENV)
+    if override:
+        if override not in _NORM_CONVENTION_VALUES:
+            raise ValueError(
+                f"{_NORM_CONVENTION_ENV} must be one of "
+                f"{' or '.join(_NORM_CONVENTION_VALUES)}, got {override!r}"
+            )
+        return override == "one_centered"
+
+    families: dict[str, list[float]] = {}
+    for key, value in weights.items():
+        for suffix in _ZERO_CENTERED_NORM_SUFFIXES:
+            if key.endswith(suffix):
+                families.setdefault(suffix, []).append(
+                    value.astype(mx.float32).mean().item()
+                )
+                break
+    if not families:
+        return bool(declared)
+
+    total = sum(len(means) for means in families.values())
+    one_score = sum(
+        len(means) * abs(sum(means) / len(means) - 1.0)
+        for means in families.values()
+    ) / total
+    zero_score = sum(
+        len(means) * abs(sum(means) / len(means))
+        for means in families.values()
+    ) / total
+    if one_score + _NORM_CONVENTION_MARGIN < zero_score:
+        detected = True
+    elif zero_score + _NORM_CONVENTION_MARGIN < one_score:
+        detected = False
+    else:
+        raise ValueError(
+            "ambiguous Qwen4 norm-weight convention: stored gains fit the "
+            f"one-centered hypothesis ({one_score:.3f}) and zero-centered "
+            f"hypothesis ({zero_score:.3f}) within the "
+            f"{_NORM_CONVENTION_MARGIN:.2f} margin; set "
+            f"{_NORM_CONVENTION_ENV}=one_centered|zero_centered to force it"
+        )
+    if declared is not None and bool(declared) != detected:
+        raise ValueError(
+            "Qwen4 norm-weight convention metadata contradicts the stored "
+            f"gains (declared one_centered={bool(declared)}, detected "
+            f"one_centered={detected}); set {_NORM_CONVENTION_ENV}="
+            "one_centered|zero_centered to force it"
+        )
+    return detected
 
 
 def _sum_qsa_heads(scores: mx.array) -> mx.array:
@@ -210,6 +278,7 @@ class TextModelArgs(BaseModelArgs):
     seed: int = 1234
     eos_token_id: int | list[int] | None = None
     mtp_num_hidden_layers: int = 0
+    mlx_norm_weights_are_one_centered: bool | None = None
 
     def __post_init__(self):
         rope = dict(self.rope_parameters or {})
@@ -1748,6 +1817,15 @@ class TextModel(nn.Module):
                 shard, leaf = suffix.split(".", 1)
                 key = f"{prefix}.ngram_embedding.shards.{int(shard)}.{leaf}"
             sanitized[key] = value
+        if _detect_norm_convention(
+            sanitized,
+            declared=self.args.mlx_norm_weights_are_one_centered,
+        ):
+            for key, value in sanitized.items():
+                if any(
+                    key.endswith(suffix) for suffix in _ZERO_CENTERED_NORM_SUFFIXES
+                ):
+                    sanitized[key] = value - 1.0
         return sanitized
 
     @property

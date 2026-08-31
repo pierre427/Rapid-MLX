@@ -2006,6 +2006,44 @@ def test_sanitize_preserves_ple_shards_and_maps_experts_without_concat():
     assert all("visual" not in key and not key.startswith("mtp") for key in sanitized)
 
 
+def test_sanitize_converts_one_centered_qwen4_norm_gains():
+    model = Model(ModelArgs(model_type="qwen4_exp", text_config=asdict(_ple_args())))
+    key = "language_model.model.layers.0.attn_hyper_connection.hc_norm.weight"
+
+    sanitized = model.sanitize({key: mx.array([0.8, 1.2], dtype=mx.float32)})
+
+    np.testing.assert_allclose(np.array(sanitized[key]), [-0.2, 0.2], atol=1e-6)
+
+
+def test_sanitize_preserves_zero_centered_qwen4_norm_gains():
+    model = Model(ModelArgs(model_type="qwen4_exp", text_config=asdict(_ple_args())))
+    key = "language_model.model.layers.0.self_attn.q_norm.weight"
+    gains = mx.array([-0.2, 0.2], dtype=mx.float32)
+
+    sanitized = model.sanitize({key: gains})
+
+    np.testing.assert_allclose(np.array(sanitized[key]), np.array(gains), atol=1e-6)
+
+
+def test_qwen4_norm_convention_fails_closed_on_ambiguous_gains():
+    key = "language_model.model.layers.0.self_attn.k_norm.weight"
+
+    with pytest.raises(ValueError, match="ambiguous Qwen4 norm-weight convention"):
+        qwen4_exp._detect_norm_convention(
+            {key: mx.array([0.4, 0.6], dtype=mx.float32)}
+        )
+
+
+def test_qwen4_norm_convention_rejects_conflicting_metadata():
+    key = "language_model.model.layers.0.self_attn.q_norm.weight"
+
+    with pytest.raises(ValueError, match="metadata contradicts"):
+        qwen4_exp._detect_norm_convention(
+            {key: mx.array([0.8, 1.2], dtype=mx.float32)},
+            declared=False,
+        )
+
+
 def test_converter_quantized_keys_match_loader_sanitizer_contract():
     model = Model(ModelArgs(model_type="qwen4_exp", text_config=asdict(_ple_args())))
     ordinary = "model.language_model.layers.0.self_attn.q_proj.weight"
@@ -2344,6 +2382,61 @@ def test_qwen4_registration_probes_native_and_fails_closed(monkeypatch, caplog):
     tokenizer._register_vendored_archs()
     assert "qwen4_exp" not in tokenizer._VENDORED_MODEL_TYPES
     assert "failed to register" in caplog.text
+
+
+def test_qwen4_quantization_paths_follow_sanitized_ple_shards(tmp_path):
+    from vllm_mlx.utils.tokenizer import _qwen4_exp_quantization_override
+
+    original_path = (
+        "language_model.model.layers.1.ple.ple_embedding."
+        "ngram_embedding.shard_007"
+    )
+    unchanged_path = "language_model.model.layers.1.mlp.gate"
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    original_path: {"group_size": 32, "bits": 4},
+                    unchanged_path: {"group_size": 64, "bits": 8},
+                },
+            }
+        )
+    )
+
+    override = _qwen4_exp_quantization_override(tmp_path)
+
+    assert override is not None
+    quantization = override["quantization"]
+    assert original_path not in quantization
+    assert quantization[
+        "language_model.model.layers.1.ple.ple_embedding."
+        "ngram_embedding.shards.7"
+    ] == {"group_size": 32, "bits": 4}
+    assert quantization[unchanged_path] == {"group_size": 64, "bits": 8}
+    assert quantization["group_size"] == 64
+
+
+def test_qwen4_quantization_override_is_family_scoped(tmp_path):
+    from vllm_mlx.utils.tokenizer import _qwen4_exp_quantization_override
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "quantization": {
+                    "model.ngram_embedding.shard_0": {
+                        "group_size": 32,
+                        "bits": 4,
+                    }
+                },
+            }
+        )
+    )
+
+    assert _qwen4_exp_quantization_override(tmp_path) is None
 
 
 def test_qwen4_gdn_verify_single_step_initializes_state_and_empty_boundaries():

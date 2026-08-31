@@ -1768,7 +1768,7 @@ def _load_with_tokenizer_fallback(model_name: str, *, enable_dspark: bool = Fals
     # MXFP8 attention tensors and reject their packed shapes.
     model_config = _deepseek_v4_quantization_override(
         model_path, enable_dspark=enable_dspark
-    )
+    ) or _qwen4_exp_quantization_override(model_path)
 
     # DeepSeek-style fp8 block checkpoints (Ling 3.0 fp8): mlx has no fp8
     # dtype, so ``mx.load`` cannot open the shards at all. Repack the
@@ -1907,3 +1907,35 @@ def _deepseek_v4_quantization_override(
             }
         )
     return overlay
+
+
+def _qwen4_exp_quantization_override(model_path: Path) -> dict | None:
+    """Keep converted Qwen4 PLE quantization paths aligned with ``sanitize``.
+
+    The streaming converter writes each PLE table as ``shard_N`` so the
+    checkpoint remains compatible with the source layout.  The vendored text
+    model sanitizes those weights into the ``ShardedEmbedding.shards`` list,
+    but mlx-lm 0.31 applies the config's per-module quantization map *after*
+    that rename.  Without the matching metadata translation it misses the
+    group-32 override and applies global group-64 to the 160-wide PLE tables.
+    """
+    config_path = model_path / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if config.get("model_type") != "qwen4_exp":
+        return None
+    quantization = config.get("quantization")
+    if not isinstance(quantization, dict):
+        return None
+
+    marker = ".ngram_embedding.shard_"
+    translated = {}
+    for path, value in quantization.items():
+        if marker in path:
+            prefix, shard = path.rsplit(marker, 1)
+            if shard.isdigit():
+                path = f"{prefix}.ngram_embedding.shards.{int(shard)}"
+        translated[path] = value
+    return {"quantization": translated}
