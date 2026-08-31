@@ -1463,7 +1463,10 @@ def test_install_mtp_vendored_uses_inner_language_model_surface(monkeypatch):
     gb.uids = [42]
     gb._next_tokens = mx.array([500], dtype=mx.uint32)
     gb._next_logprobs = [mx.array([0.0])]
-    request_stub = SimpleNamespace(sampling_params=SimpleNamespace(temperature=0.0))
+    request_stub = SimpleNamespace(
+        model_prompt_tokens=32_768,
+        sampling_params=SimpleNamespace(temperature=0.0, max_tokens=128),
+    )
 
     ok = _install_mtp_vendored(
         batch_gen,
@@ -1471,6 +1474,7 @@ def test_install_mtp_vendored_uses_inner_language_model_surface(monkeypatch):
         requests={"req-42": request_stub},
         uid_to_request_id={42: "req-42"},
         max_k=3,
+        max_prompt_tokens=32_768,
     )
     assert ok is True
     # The request-boundary router latches PLD by request identity. A process

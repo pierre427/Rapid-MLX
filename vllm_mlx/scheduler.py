@@ -2214,7 +2214,12 @@ def _install_mtp_vendored(
         # the continuous router leaves the request in mlx-lm's queue. Keep it
         # on true plain decode before any MTP state is constructed. Multi-lane
         # fallback is already plain because this wrapper is B=1-only.
-        if max_prompt_tokens and uid not in _state:
+        # ``max_prompt_tokens`` bounds self-MTP, not the independently
+        # qualified adaptive-PLD route.  Applying it after the request router
+        # latched PLD made the status receipt claim ``adaptive_pld`` while the
+        # lower wrapper silently forced plain decode at exactly the 32K+
+        # operating point PLD owns.
+        if max_prompt_tokens and not pld_latched and uid not in _state:
             req_id = uid_to_request_id.get(uid) if uid_to_request_id else None
             req = requests.get(req_id) if requests is not None and req_id else None
             prompt_tokens = int(
