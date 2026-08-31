@@ -36,6 +36,7 @@ def _descriptor(family: str = "qwen3_5", **changes):
     }
     if family == "qwen4_exp":
         values["target_verify_mode"] = "tokenwise_exact"
+        values["max_exact_fixed_lanes"] = 2
     values.update(changes)
     return values
 
@@ -238,6 +239,20 @@ def test_qwen4_refuses_nonexact_target_verify_mode():
     inner.model_type = "qwen4_exp_text"
 
     with pytest.raises(ContinuousSelfMTPUnsupportedError, match="target_verify_mode"):
+        runtime_module.assemble_continuous_self_mtp_runtime(
+            inner,
+            array_ops=_ArrayOpsStub(),
+        )
+
+
+def test_qwen4_refuses_unattested_fixed_lane_width():
+    descriptor = _descriptor("qwen4_exp", max_exact_fixed_lanes=4)
+    inner = _InjectedTextModel(descriptor)
+    inner.model_type = "qwen4_exp_text"
+
+    with pytest.raises(
+        ContinuousSelfMTPUnsupportedError, match="max_exact_fixed_lanes"
+    ):
         runtime_module.assemble_continuous_self_mtp_runtime(
             inner,
             array_ops=_ArrayOpsStub(),

@@ -26,6 +26,7 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
         "batch_forward": "mtp_batch_forward",
         "recursive_draft_depth": 2,
         "fixed_membership": True,
+        "max_exact_fixed_lanes": 2,
         "target_return_hidden": True,
         "mtp_return_hidden": True,
         "confirmed_target_forward": True,

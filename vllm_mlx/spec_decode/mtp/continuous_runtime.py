@@ -106,6 +106,10 @@ def _require_descriptor(
             "Qwen4 capability descriptor requires target_verify_mode="
             "'tokenwise_exact'"
         )
+    if family == "qwen4_exp" and descriptor.get("max_exact_fixed_lanes") != 2:
+        raise _unsupported(
+            "Qwen4 capability descriptor requires max_exact_fixed_lanes=2"
+        )
 
     batch_forward_name = descriptor.get("batch_forward")
     if not isinstance(batch_forward_name, str) or not batch_forward_name:

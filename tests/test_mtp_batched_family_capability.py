@@ -44,6 +44,7 @@ def test_capability_descriptor_is_explicit_immutable_and_conservative(
     }
     if family == "qwen4_exp":
         expected["target_verify_mode"] = "tokenwise_exact"
+        expected["max_exact_fixed_lanes"] = 2
     assert dict(capability) == expected
     with pytest.raises(TypeError):
         capability["dynamic_join"] = not dynamic_join

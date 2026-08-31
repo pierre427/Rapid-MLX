@@ -331,10 +331,22 @@ def plan_router_install(
         cache_quantized=cache_quantized,
         cache_windowed=cache_windowed,
     )
+    exact_lane_cap = descriptor_map.get("max_exact_fixed_lanes")
+    if family == "qwen4_exp" and (
+        not isinstance(exact_lane_cap, int)
+        or isinstance(exact_lane_cap, bool)
+        or exact_lane_cap < 1
+    ):
+        exact_lane_cap = 0
+    effective_max_lanes = (
+        min(max_lanes, exact_lane_cap)
+        if family == "qwen4_exp" and exact_lane_cap
+        else max_lanes
+    )
     router = ContinuousMTPIntegrationRouter(
         config=BatchedMTPConfig(
             enabled=enabled,
-            max_lanes=max_lanes,
+            max_lanes=effective_max_lanes,
             min_batch_lanes=min_batch_lanes,
             hard_reserve_bytes=hard_reserve_bytes,
             allow_dynamic_membership=allow_dynamic_membership,
@@ -382,6 +394,10 @@ def _runtime_refusals(
             reasons.append(f"capability descriptor mismatch: {name}")
     if not isinstance(descriptor.get("dynamic_join"), bool):
         reasons.append("capability descriptor mismatch: dynamic_join")
+    if runtime.model_family == "qwen4_exp" and descriptor.get(
+        "max_exact_fixed_lanes"
+    ) != 2:
+        reasons.append("capability descriptor mismatch: max_exact_fixed_lanes")
     if runtime.cache_quantized:
         reasons.append("quantized cache is unsupported")
     if runtime.cache_windowed:
