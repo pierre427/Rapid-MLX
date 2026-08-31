@@ -107,6 +107,51 @@ def _plain_greedy(language, prompt: list[int], max_tokens: int) -> dict[str, Any
     }
 
 
+def _plain_batched(
+    language,
+    prompts: list[list[int]],
+    max_tokens: int,
+    cache_merge,
+) -> dict[str, Any]:
+    from mlx_lm.models.cache import make_prompt_cache
+
+    caches = []
+    current = []
+    prefill_started = time.monotonic()
+    for prompt in prompts:
+        cache = make_prompt_cache(language)
+        remaining = mx.array(prompt, dtype=mx.uint32)
+        while int(remaining.shape[0]) > 1:
+            width = min(512, int(remaining.shape[0]) - 1)
+            output = language(remaining[:width][None], cache=cache)
+            mx.eval(output, [item.state for item in cache])
+            remaining = remaining[width:]
+        output = language(remaining[None], cache=cache)
+        current.append(int(mx.argmax(output[:, -1, :], axis=-1).item()))
+        caches.append(cache)
+    merged = cache_merge(caches, "plain target")
+    mx.synchronize()
+    prefill_s = time.monotonic() - prefill_started
+
+    generated = [[token] for token in current]
+    decode_started = time.monotonic()
+    for _ in range(max_tokens - 1):
+        output = language(mx.array(current, dtype=mx.uint32)[:, None], cache=merged)
+        current = mx.argmax(output[:, -1, :], axis=-1).tolist()
+        for row, token in enumerate(current):
+            generated[row].append(int(token))
+    mx.synchronize()
+    decode_s = time.monotonic() - decode_started
+    del output, merged, caches
+    _release_temporary_state()
+    return {
+        "tokens": generated,
+        "prefill_s": prefill_s,
+        "decode_s": decode_s,
+        "decode_tps": (len(prompts) * max_tokens) / decode_s,
+    }
+
+
 def _continuous(
     runtime,
     prompts: list[list[int]],
@@ -259,6 +304,16 @@ def main() -> int:
     result["status"] = "injected"
     _write(output, result)
 
+    plain_batch = _plain_batched(
+        language,
+        prompt_tokens,
+        args.max_tokens,
+        runtime.caches._merge,
+    )
+    result["arms"][f"plain_b{args.batch_size}"] = plain_batch
+    result["status"] = f"plain-b{args.batch_size}-complete"
+    _write(output, result)
+
     seq_a = _sequential_arm(runtime, prompt_tokens, args.max_tokens)
     result["arms"]["mtp_b1_sequential_a"] = seq_a
     result["status"] = "b1-a-complete"
@@ -292,9 +347,14 @@ def main() -> int:
         "b1_a_equals_plain": b1_a_tokens == plain_tokens,
         "b1_b_equals_plain": b1_b_tokens == plain_tokens,
         "batch_repeat_exact": batch_a_tokens == batch_b_tokens,
-        "batch_equals_plain": batch_a_tokens == plain_tokens,
+        "batch_equals_plain_matched_shape": batch_a_tokens
+        == plain_batch["tokens"],
     }
     result["checks"] = checks
+    result["comparisons"] = {
+        "plain_batch_equals_plain_b1": plain_batch["tokens"] == plain_tokens,
+        "mtp_batch_equals_plain_b1": batch_a_tokens == plain_tokens,
+    }
     result["performance"] = {
         "b1_bracket_decode_tps": [seq_a["decode_tps"], seq_b["decode_tps"]],
         "batch_repeat_decode_tps": [
@@ -303,9 +363,15 @@ def main() -> int:
         ],
         "batch_over_b1_a": batch_a["decode_tps"] / seq_a["decode_tps"],
         "batch_over_b1_b": batch_b["decode_tps"] / seq_b["decode_tps"],
+        "plain_batch_decode_tps": plain_batch["decode_tps"],
+        "batch_over_plain_matched_shape": batch_a["decode_tps"]
+        / plain_batch["decode_tps"],
     }
     result["decoded"] = {
         "plain": [tokenizer.decode(tokens) for tokens in plain_tokens],
+        "plain_batch": [
+            tokenizer.decode(tokens) for tokens in plain_batch["tokens"]
+        ],
         "batch": [tokenizer.decode(tokens) for tokens in batch_a_tokens],
     }
     result["status"] = "passed" if all(checks.values()) else "failed"
