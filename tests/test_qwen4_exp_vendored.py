@@ -675,18 +675,27 @@ def test_qsa_cache_rewinds_recoverable_group_and_recomputes_divergence(length):
     np.testing.assert_array_equal(np.array(original.raw_ring), np.array(cold.raw_ring))
 
 
-def test_qsa_cache_refuses_rewind_beyond_retained_raw_group():
+def test_qsa_cache_history_rewinds_across_raw_group_boundary_exactly():
     cache = QSAIndexCache(compress_ratio=4)
     cache.update(
         mx.arange(9, dtype=mx.float32).reshape(1, 9, 1),
         lambda group, start: group + start,
     )
-    assert cache.trim(2) == 0
-    assert cache.offset == 9
+    assert cache.trim(2) == 2
+    cache.update(mx.array([[[91.0], [92.0]]]), lambda group, start: group + start)
+
+    cold = QSAIndexCache(compress_ratio=4)
+    cold.update(
+        mx.array([list(range(7)) + [91.0, 92.0]]).reshape(1, 9, 1),
+        lambda group, start: group + start,
+    )
+    mx.eval(cache.state, cold.state)
+    assert cache.offset == cold.offset == 9
+    np.testing.assert_array_equal(np.array(cache.raw_ring), np.array(cold.raw_ring))
+    np.testing.assert_array_equal(np.array(cache.state[1]), np.array(cold.state[1]))
 
 
-def test_scheduler_rollback_preflights_qsa_cachelist_for_full_rejection():
-    """A multi-token rejection cannot trim KV before QSA refuses it."""
+def test_scheduler_rollback_trims_qsa_history_and_kv_atomically():
     from vllm_mlx.cache_rollback import can_trim, trim_all
 
     kv = KVCache()
@@ -700,16 +709,12 @@ def test_scheduler_rollback_preflights_qsa_cachelist_for_full_rejection():
     cache = CacheList(kv, qsa)
 
     assert cache.is_trimmable()
-    assert not can_trim(cache, 2)
-    assert not trim_all([cache], 2)
-    assert kv.offset == qsa.offset == 9
-
-    assert can_trim(cache, 1)
-    assert trim_all([cache], 1)
-    assert kv.offset == qsa.offset == 8
+    assert can_trim(cache, 2)
+    assert trim_all([cache], 2)
+    assert kv.offset == qsa.offset == 7
 
 
-def test_suffix_scheduler_falls_through_before_qsa_multitoken_verify():
+def test_suffix_scheduler_qsa_history_admits_multitoken_verify():
     from vllm_mlx.scheduler import _install_suffix_decoding
 
     kv = KVCache()
@@ -771,7 +776,9 @@ def test_suffix_scheduler_falls_through_before_qsa_multitoken_verify():
 
     assert generation_batch._step() == ([7], [])
     assert generation_batch.original_calls == 1
-    assert generation_batch._suffix_stats["ft_non_trimmable_cache"] == 1
+    assert generation_batch._suffix_stats["verify_steps"] == 1
+    assert generation_batch._suffix_stats["ft_non_trimmable_cache"] == 0
+    assert generation_batch._suffix_stats["ft_error"] == 1
     assert kv.offset == qsa.offset == 9
 
 

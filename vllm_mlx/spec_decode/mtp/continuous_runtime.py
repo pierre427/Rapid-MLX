@@ -99,10 +99,91 @@ def _require_descriptor(
                 f"capability descriptor mismatch: {name} must be {expected!r}"
             )
 
+    if family == "qwen4_exp" and descriptor.get("target_verify_mode") != (
+        "tokenwise_exact"
+    ):
+        raise _unsupported(
+            "Qwen4 capability descriptor requires target_verify_mode="
+            "'tokenwise_exact'"
+        )
+
     batch_forward_name = descriptor.get("batch_forward")
     if not isinstance(batch_forward_name, str) or not batch_forward_name:
         raise _unsupported("capability descriptor has no batch_forward method")
     return family, batch_forward_name
+
+
+def _qwen4_state_caches(cache: Any) -> list[Any]:
+    from vllm_mlx.models.qwen4_exp_cache import Qwen4ExpStateCache
+
+    found = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Qwen4ExpStateCache):
+            found.append(value)
+            return
+        children = getattr(value, "caches", None)
+        if isinstance(children, (list, tuple)):
+            for child in children:
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    visit(cache)
+    return found
+
+
+def _qwen4_exact_target_forward(
+    inner: Any,
+    inputs: Any,
+    *,
+    cache: Any,
+    return_hidden: bool,
+    n_confirmed: int,
+):
+    """Verify Qwen4 drafts with the exact tokenwise greedy target path.
+
+    Qwen4's block-shaped GDN, PLE, QSA, and quantized matmuls are close but not
+    bit-exact to ordinary one-token decode and can change a real checkpoint's
+    argmax.  Sequential target calls preserve distributional identity while
+    still batching independent lanes.  State-cache snapshots retain the exact
+    per-token rollback boundaries expected by the ragged transaction adapter.
+    """
+
+    if n_confirmed <= 0 or int(inputs.shape[1]) <= 1:
+        return inner(
+            inputs,
+            cache=cache,
+            return_hidden=return_hidden,
+            n_confirmed=n_confirmed,
+        )
+    if return_hidden is not True:
+        raise _unsupported("Qwen4 exact target verification must return hidden state")
+
+    import mlx.core as mx
+
+    state_caches = _qwen4_state_caches(cache)
+    snapshots: dict[int, list[list[Any]]] = {id(item): [] for item in state_caches}
+    logits = []
+    hidden = []
+    for position in range(int(inputs.shape[1])):
+        step_logits, step_hidden = inner(
+            inputs[:, position : position + 1],
+            cache=cache,
+            return_hidden=True,
+            n_confirmed=0,
+        )
+        logits.append(step_logits)
+        hidden.append(step_hidden)
+        for item in state_caches:
+            if any(value is None for value in item.cache):
+                raise _unsupported("Qwen4 target state cache is incomplete")
+            snapshots[id(item)].append([mx.array(value) for value in item.cache])
+    for item in state_caches:
+        item.rollback_state = snapshots[id(item)]
+        item._rollback_slots = None
+    return mx.concatenate(logits, axis=1), mx.concatenate(hidden, axis=1)
 
 
 def _require_target_abi(inner: Any) -> None:
@@ -187,6 +268,24 @@ def assemble_continuous_self_mtp_runtime(
     if missing:  # Defensive: future capability additions remain fail-closed.
         raise _unsupported("missing fixed-core capability: " + ", ".join(missing))
 
+    target_forward = inner
+    if family == "qwen4_exp":
+
+        def target_forward(
+            inputs: Any,
+            *,
+            cache: Any,
+            return_hidden: bool,
+            n_confirmed: int,
+        ):
+            return _qwen4_exact_target_forward(
+                inner,
+                inputs,
+                cache=cache,
+                return_hidden=return_hidden,
+                n_confirmed=n_confirmed,
+            )
+
     return ContinuousSelfMTPRuntime(
         config=ContinuousSelfMTPConfig(
             enabled=True,
@@ -194,7 +293,7 @@ def assemble_continuous_self_mtp_runtime(
             architecture=family,
         ),
         capabilities=capabilities,
-        forwards=RapidForwardSeams(inner, mtp_forward),
+        forwards=RapidForwardSeams(target_forward, mtp_forward),
         compute=RapidMLXSelfMTPBackend(
             target_cache_factory=lambda: _make_prompt_cache(inner),
             draft_cache_factory=make_mtp_cache,

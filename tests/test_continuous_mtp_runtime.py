@@ -34,6 +34,8 @@ def _descriptor(family: str = "qwen3_5", **changes):
         "windowed_cache": False,
         "xtc": False,
     }
+    if family == "qwen4_exp":
+        values["target_verify_mode"] = "tokenwise_exact"
     values.update(changes)
     return values
 
@@ -178,6 +180,45 @@ def test_qwen4_assembles_fixed_membership_with_qwen4_cache_install(monkeypatch):
     assert installs == [{}]
 
 
+def test_qwen4_exact_target_verify_records_tokenwise_state_boundaries():
+    import mlx.core as mx
+
+    from vllm_mlx.models.qwen4_exp_cache import Qwen4ExpStateCache
+
+    state = Qwen4ExpStateCache(1)
+    state.cache[0] = mx.zeros((1, 1), dtype=mx.float32)
+    calls = []
+
+    class Inner:
+        def __call__(
+            self,
+            inputs,
+            *,
+            cache,
+            return_hidden,
+            n_confirmed,
+        ):
+            calls.append((inputs.tolist(), return_hidden, n_confirmed))
+            state.cache[0] = state.cache[0] + inputs[:, :1].astype(mx.float32)
+            return inputs[..., None].astype(mx.float32), inputs[..., None].astype(
+                mx.float32
+            )
+
+    logits, hidden = runtime_module._qwen4_exact_target_forward(
+        Inner(),
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        cache=[state],
+        return_hidden=True,
+        n_confirmed=2,
+    )
+    mx.eval(logits, hidden, state.rollback_state)
+
+    assert calls == [([[token]], True, 0) for token in (1, 2, 3)]
+    assert logits.reshape(-1).tolist() == [1.0, 2.0, 3.0]
+    assert hidden.reshape(-1).tolist() == [1.0, 2.0, 3.0]
+    assert [snapshot[0].item() for snapshot in state.rollback_state] == [1, 3, 6]
+
+
 def test_qwen4_dynamic_attestation_cannot_be_manufactured_by_caller():
     descriptor = _descriptor("qwen4_exp", dynamic_join=False)
     inner = _InjectedTextModel(descriptor)
@@ -189,6 +230,18 @@ def test_qwen4_dynamic_attestation_cannot_be_manufactured_by_caller():
         array_ops=_ArrayOpsStub(),
     )
     assert assembled.capabilities.dynamic_membership is False
+
+
+def test_qwen4_refuses_nonexact_target_verify_mode():
+    descriptor = _descriptor("qwen4_exp", target_verify_mode="block_approximate")
+    inner = _InjectedTextModel(descriptor)
+    inner.model_type = "qwen4_exp_text"
+
+    with pytest.raises(ContinuousSelfMTPUnsupportedError, match="target_verify_mode"):
+        runtime_module.assemble_continuous_self_mtp_runtime(
+            inner,
+            array_ops=_ArrayOpsStub(),
+        )
 
 
 @pytest.mark.parametrize(

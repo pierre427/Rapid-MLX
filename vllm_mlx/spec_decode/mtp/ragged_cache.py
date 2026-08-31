@@ -285,8 +285,12 @@ def _qsa_preflight(self, n, *, verify_size=None, validate: bool = True):
         )
     refused = [
         row
-        for row, (offset, drop) in enumerate(zip(self._offsets, drops))
-        if not self._can_trim_row(offset, drop)
+        for row, drop in enumerate(drops)
+        if not (
+            self.can_trim_row(row, drop)
+            if callable(getattr(self, "can_trim_row", None))
+            else self._can_trim_row(self._offsets[row], drop)
+        )
     ]
     if refused:
         raise RaggedCacheUnsupportedError(
@@ -297,10 +301,14 @@ def _qsa_preflight(self, n, *, verify_size=None, validate: bool = True):
 
 def _qsa_trim(self, n, *, verify_size=None, validate: bool = True):
     drops = self.preflight_ragged_trim(n, verify_size=verify_size, validate=validate)
-    self._offsets = [offset - drop for offset, drop in zip(self._offsets, drops)]
-    self._compressed_counts = [
-        offset // self.compress_ratio for offset in self._offsets
-    ]
+    restore = getattr(self, "restore_ragged_rows", None)
+    if callable(restore):
+        restore(drops)
+    else:
+        self._offsets = [offset - drop for offset, drop in zip(self._offsets, drops)]
+        self._compressed_counts = [
+            offset // self.compress_ratio for offset in self._offsets
+        ]
     return drops
 
 

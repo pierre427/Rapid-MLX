@@ -115,6 +115,9 @@ class QSAIndexCache(ArraysCache):
         self._valid_until: list[int] | None = None
         self._right_padding: list[int] | None = None
         self._pending_left_padding = [int(item) for item in (left_padding or [0])]
+        self._trim_history: list[list[tuple[int, mx.array]]] = [
+            [] for _ in range(batch)
+        ]
 
     def _ensure_batch(self, batch: int):
         """Adopt mlx-lm's fresh-batch size before state is committed."""
@@ -127,6 +130,79 @@ class QSAIndexCache(ArraysCache):
         self._offsets = [0] * batch
         self._compressed_counts = [0] * batch
         self._pending_left_padding = [int(item) for item in self.left_padding.tolist()]
+        self._trim_history = [[] for _ in range(batch)]
+
+    def _record_trim_state(self, row: int, offset: int) -> None:
+        """Retain the small raw-ring suffix needed for an exact K=2 rewind."""
+        if self.raw_ring is None:
+            return
+        history = self._trim_history[row]
+        history[:] = [item for item in history if item[0] < offset]
+        history.append((offset, mx.array(self.raw_ring[row : row + 1])))
+        del history[: max(0, len(history) - (self.compress_ratio + 2))]
+
+    def _reset_trim_history(self) -> None:
+        self._trim_history = [[] for _ in self._offsets]
+        if self.raw_ring is not None:
+            for row, offset in enumerate(self._offsets):
+                self._record_trim_state(row, offset)
+
+    def _restore_trim_row(self, row: int, offset: int) -> None:
+        match = next(
+            (ring for recorded, ring in self._trim_history[row] if recorded == offset),
+            None,
+        )
+        if match is None or self.raw_ring is None:
+            raise ValueError(f"QSA raw-ring boundary {offset} is unavailable")
+        self.raw_ring[row : row + 1] = match
+        self._trim_history[row] = [
+            item for item in self._trim_history[row] if item[0] <= offset
+        ]
+
+    def restore_ragged_rows(self, drops: Sequence[int]) -> None:
+        if len(drops) != len(self._offsets):
+            raise ValueError("QSA ragged rewind count does not match batch size")
+        offsets = [offset - int(drop) for offset, drop in zip(self._offsets, drops)]
+        for row, (old, new) in enumerate(zip(self._offsets, offsets)):
+            if new != old:
+                self._restore_trim_row(row, new)
+        self._offsets = offsets
+        self._compressed_counts = [
+            offset // self.compress_ratio for offset in self._offsets
+        ]
+
+    def transaction_checkpoint(self):
+        """Capture mutable QSA state before a transactional proposal."""
+        return {
+            "raw_ring": None if self.raw_ring is None else mx.array(self.raw_ring),
+            "compressed_keys": self.compressed_keys,
+            "offsets": list(self._offsets),
+            "compressed_counts": list(self._compressed_counts),
+            "trim_history": [list(row) for row in self._trim_history],
+            "left_padding": (
+                None if self.left_padding is None else mx.array(self.left_padding)
+            ),
+            "lengths": None if self.lengths is None else mx.array(self.lengths),
+            "valid_until": (
+                None if self._valid_until is None else list(self._valid_until)
+            ),
+            "right_padding": (
+                None if self._right_padding is None else list(self._right_padding)
+            ),
+            "pending_left_padding": list(self._pending_left_padding),
+        }
+
+    def restore_transaction_checkpoint(self, checkpoint) -> None:
+        self.raw_ring = checkpoint["raw_ring"]
+        self.compressed_keys = checkpoint["compressed_keys"]
+        self._offsets = list(checkpoint["offsets"])
+        self._compressed_counts = list(checkpoint["compressed_counts"])
+        self._trim_history = [list(row) for row in checkpoint["trim_history"]]
+        self.left_padding = checkpoint["left_padding"]
+        self.lengths = checkpoint["lengths"]
+        self._valid_until = checkpoint["valid_until"]
+        self._right_padding = checkpoint["right_padding"]
+        self._pending_left_padding = list(checkpoint["pending_left_padding"])
 
     @property
     def raw_ring(self):
@@ -230,6 +306,7 @@ class QSAIndexCache(ArraysCache):
 
         completed: list[list[mx.array]] = [[] for _ in range(batch)]
         for row, (input_start, valid_length) in enumerate(valid_spans):
+            self._record_trim_state(row, self._offsets[row])
             for token in range(valid_length):
                 position = self._offsets[row] + token
                 self.raw_ring[row, position % self.compress_ratio, :] = raw_keys[
@@ -242,6 +319,7 @@ class QSAIndexCache(ArraysCache):
                     completed[row].append(
                         transform_group(pooled, position + 1 - self.compress_ratio)[0]
                     )
+                self._record_trim_state(row, position + 1)
             self._offsets[row] += valid_length
             self._pending_left_padding[row] -= input_start
 
@@ -321,6 +399,7 @@ class QSAIndexCache(ArraysCache):
         self._offsets[0] += length
         self._pending_left_padding[0] = 0
         self._compressed_counts[0] = new_count
+        self._reset_trim_history()
         return self.compressed_keys[:, :new_count, :]
 
     def keys_for_blocks(self, row: int, block_count: int) -> mx.array:
@@ -342,6 +421,8 @@ class QSAIndexCache(ArraysCache):
     @state.setter
     def state(self, value):
         self.raw_ring, self.compressed_keys = value
+        if hasattr(self, "_offsets"):
+            self._reset_trim_history()
 
     @property
     def meta_state(self):
@@ -369,6 +450,7 @@ class QSAIndexCache(ArraysCache):
             else mx.zeros(len(self._offsets), dtype=mx.int32)
         )
         self.lengths = None
+        self._trim_history = [[] for _ in self._offsets]
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -383,7 +465,7 @@ class QSAIndexCache(ArraysCache):
 
     def can_trim(self, n: int) -> bool:
         """Amount-aware preflight consumed by composite cache rollback."""
-        return all(self._can_trim_row(offset, n) for offset in self._offsets)
+        return all(self.can_trim_row(row, n) for row in range(len(self._offsets)))
 
     def trim_checkpoint(self):
         return list(self._offsets), list(self._compressed_counts)
@@ -391,14 +473,19 @@ class QSAIndexCache(ArraysCache):
     def restore_trim_checkpoint(self, state):
         self._offsets, self._compressed_counts = state
 
-    def _can_trim_row(self, offset: int, n: int) -> bool:
+    def can_trim_row(self, row: int, n: int) -> bool:
+        offset = self._offsets[row]
         if n < 0 or n > offset:
             return False
         if n == 0:
             return True
-        remainder = offset % self.compress_ratio
-        available = remainder if remainder else min(self.compress_ratio, offset)
-        return n <= available
+        return any(
+            recorded == offset - n for recorded, _ring in self._trim_history[row]
+        )
+
+    def _can_trim_row(self, offset: int, n: int) -> bool:
+        rows = [row for row, current in enumerate(self._offsets) if current == offset]
+        return bool(rows) and all(self.can_trim_row(row, n) for row in rows)
 
     def trim(self, n):
         # The raw ring retains exactly the current partial group, or the most
@@ -407,10 +494,7 @@ class QSAIndexCache(ArraysCache):
         # deterministically recomputes a removed compressed block.
         if not all(self._can_trim_row(offset, n) for offset in self._offsets):
             return 0
-        self._offsets = [offset - n for offset in self._offsets]
-        self._compressed_counts = [
-            offset // self.compress_ratio for offset in self._offsets
-        ]
+        self.restore_ragged_rows([n] * len(self._offsets))
         return n
 
     def size(self):
@@ -437,6 +521,7 @@ class QSAIndexCache(ArraysCache):
         ]
         if self._valid_until is not None:
             self._valid_until = [self._valid_until[index] for index in indices]
+        self._reset_trim_history()
         # ArraysCache.filter already selected the matching physical-padding
         # rows. Preserve those values: they describe where each request's
         # logical token zero sits in the still-padded KV tensors. Recomputing
@@ -454,6 +539,7 @@ class QSAIndexCache(ArraysCache):
         self._compressed_counts = merged._compressed_counts
         self._pending_left_padding = merged._pending_left_padding
         self._valid_until = self._right_padding = None
+        self._reset_trim_history()
 
     def extract(self, idx):
         cache = QSAIndexCache(self.compress_ratio)
@@ -467,6 +553,7 @@ class QSAIndexCache(ArraysCache):
         cache._offsets = [self._offsets[idx]]
         cache._compressed_counts = [count]
         cache._pending_left_padding = [0]
+        cache._reset_trim_history()
         return cache
 
     @classmethod
@@ -516,4 +603,5 @@ class QSAIndexCache(ArraysCache):
                     merged.compressed_keys[row, :count] = cache.compressed_keys[
                         0, :count
                     ]
+        merged._reset_trim_history()
         return merged

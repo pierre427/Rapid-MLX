@@ -25,7 +25,7 @@ def test_capability_descriptor_is_explicit_immutable_and_conservative(
     module, family, dynamic_join
 ):
     capability = module.BATCHED_MTP_CAPABILITY
-    assert dict(capability) == {
+    expected = {
         "protocol_version": 1,
         "model_family": family,
         "batch_forward": "mtp_batch_forward",
@@ -42,6 +42,9 @@ def test_capability_descriptor_is_explicit_immutable_and_conservative(
         "windowed_cache": False,
         "xtc": False,
     }
+    if family == "qwen4_exp":
+        expected["target_verify_mode"] = "tokenwise_exact"
+    assert dict(capability) == expected
     with pytest.raises(TypeError):
         capability["dynamic_join"] = not dynamic_join
 

@@ -29,6 +29,7 @@ BATCHED_MTP_CAPABILITY = MappingProxyType(
         "target_return_hidden": True,
         "mtp_return_hidden": True,
         "confirmed_target_forward": True,
+        "target_verify_mode": "tokenwise_exact",
         "ragged_rollback": True,
         "atomic_cache_commit": True,
         "dynamic_join": False,

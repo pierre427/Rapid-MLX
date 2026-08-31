@@ -97,6 +97,7 @@ class _CacheBoundary:
     cache: Any
     attributes: tuple[tuple[str, Any], ...]
     children: tuple[_CacheBoundary, ...]
+    custom_checkpoint: Any = _MISSING
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,7 @@ def _freeze_cache_attribute(name: str, value: Any) -> Any:
 
 def _cache_boundary(cache: Any) -> _CacheBoundary:
     children = _cache_children(cache)
+    checkpoint = getattr(cache, "transaction_checkpoint", None)
     attributes = tuple(
         (
             name,
@@ -171,6 +173,7 @@ def _cache_boundary(cache: Any) -> _CacheBoundary:
         cache=cache,
         attributes=attributes,
         children=tuple(_cache_boundary(child) for child in children),
+        custom_checkpoint=checkpoint() if callable(checkpoint) else _MISSING,
     )
 
 
@@ -185,6 +188,14 @@ def _plain_vector(value: Any) -> Any:
 
 def _restore_cache_boundary(boundary: _CacheBoundary) -> None:
     cache = boundary.cache
+    if boundary.custom_checkpoint is not _MISSING:
+        restore = getattr(cache, "restore_transaction_checkpoint", None)
+        if not callable(restore):
+            raise ContinuousSelfMTPUnsupported(
+                f"cache {type(cache).__name__} cannot restore its transaction checkpoint"
+            )
+        restore(boundary.custom_checkpoint)
+        return
     saved = dict(boundary.attributes)
     # A non-uniform ragged rewind shifts cache rows in-place. Restoring only
     # cursors would then certify a layout that no longer exists. Refuse that
