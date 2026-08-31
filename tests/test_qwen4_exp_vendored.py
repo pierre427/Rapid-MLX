@@ -1473,6 +1473,42 @@ def test_qwen4_mtp_checkpoint_file_discovery_and_weight_sanitize(tmp_path):
     )
 
 
+def test_qwen4_mtp_sanitize_converts_one_centered_norms_and_preserves_deltas():
+    from vllm_mlx.spec_decode.mtp import qwen4_exp_inject as inject
+
+    suffixes = (
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.attn_hyper_connection.hc_norm.weight",
+    )
+    one_centered = inject._sanitize_mtp_weights(
+        {key: mx.ones((16,)) for key in suffixes}
+    )
+    zero_centered = inject._sanitize_mtp_weights(
+        {key: mx.zeros((16,)) for key in suffixes}
+    )
+
+    assert set(one_centered) == {key.removeprefix("mtp.") for key in suffixes}
+    for values in (one_centered, zero_centered):
+        for value in values.values():
+            np.testing.assert_array_equal(np.asarray(value), np.zeros((16,)))
+
+
+def test_qwen4_mtp_sanitize_refuses_declared_norm_contradiction():
+    from vllm_mlx.spec_decode.mtp import qwen4_exp_inject as inject
+
+    with pytest.raises(ValueError, match="metadata contradicts"):
+        inject._sanitize_mtp_weights(
+            {
+                "mtp.pre_fc_norm_embedding.weight": mx.ones((16,)),
+                "mtp.pre_fc_norm_hidden.weight": mx.ones((16,)),
+            },
+            declared_norm_convention=False,
+        )
+
+
 def test_qwen4_mtp_quantization_predicate_delegates_only_quantizable_modules(
     monkeypatch,
 ):

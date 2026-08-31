@@ -38,7 +38,6 @@ from mlx_lm.models.switch_layers import SwitchGLU  # noqa: E402
 
 from .qwen4_exp_cache import QSAIndexCache, Qwen4ExpStateCache  # noqa: E402
 
-
 _ZERO_CENTERED_NORM_SUFFIXES = (
     ".hc_norm.weight",
     ".norm_key.weight",
@@ -48,6 +47,8 @@ _ZERO_CENTERED_NORM_SUFFIXES = (
     ".k_layernorm.weight",
     ".q_norm.weight",
     ".k_norm.weight",
+    "pre_fc_norm_embedding.weight",
+    "pre_fc_norm_hidden.weight",
 )
 _NORM_CONVENTION_ENV = "RAPID_MLX_QWEN4_NORM_CONVENTION"
 _NORM_CONVENTION_VALUES = ("one_centered", "zero_centered")

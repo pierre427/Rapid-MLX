@@ -82,7 +82,11 @@ def _mtp_weight_files(source: str | Path) -> list[Path]:
     raise FileNotFoundError(f"No safetensors containing mtp.* found under {path}")
 
 
-def _sanitize_mtp_weights(raw: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_mtp_weights(
+    raw: dict[str, Any],
+    *,
+    declared_norm_convention: bool | None = None,
+) -> dict[str, Any]:
     """Map checkpoint expert packing into the vendored MLX module tree."""
 
     sanitized: dict[str, Any] = {}
@@ -107,6 +111,21 @@ def _sanitize_mtp_weights(raw: dict[str, Any]) -> dict[str, Any]:
             if leaf is not None:
                 key = f"{prefix}switch_mlp.down_proj.{leaf}"
         sanitized[key] = value
+
+    from vllm_mlx.models.qwen4_exp import (
+        _ZERO_CENTERED_NORM_SUFFIXES,
+        _detect_norm_convention,
+    )
+
+    if _detect_norm_convention(
+        sanitized,
+        declared=declared_norm_convention,
+    ):
+        for key, value in sanitized.items():
+            if any(
+                key.endswith(suffix) for suffix in _ZERO_CENTERED_NORM_SUFFIXES
+            ):
+                sanitized[key] = value - 1.0
     return sanitized
 
 
@@ -209,7 +228,16 @@ def inject_qwen4_exp_mtp_support(
         weights: dict[str, Any] = {}
         if mtp_sidecar is not None:
             for file in _mtp_weight_files(mtp_sidecar):
-                weights.update(_sanitize_mtp_weights(mx.load(str(file))))
+                weights.update(
+                    _sanitize_mtp_weights(
+                        mx.load(str(file)),
+                        declared_norm_convention=getattr(
+                            inner.args,
+                            "mlx_norm_weights_are_one_centered",
+                            None,
+                        ),
+                    )
+                )
 
             expected = dict(tree_flatten(mtp.parameters()))
             missing = set(expected) - set(weights)
