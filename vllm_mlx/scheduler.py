@@ -1748,6 +1748,7 @@ def _install_mtp_vendored(
         "gen_exhausted": 0,
         "gen_raised": 0,
         "invariant_violations": 0,
+        "ft_mid_stream_handoff": 0,
     }
 
     _initial_skip_logged: set[tuple[int, str]] = set()
@@ -5589,9 +5590,14 @@ class Scheduler:
                         for nested_state, name, nested_m in zip(
                             state, names, nested_meta
                         ):
+                            # Newer mlx-lm serializes non-core cache names as
+                            # ``module.path:ClassName``. The vendored registry
+                            # is intentionally keyed by class name so it stays
+                            # independent of import aliases across installs.
+                            short_name = str(name).rsplit(":", 1)[-1]
                             nested_cls = getattr(
-                                _mlx_cache, name, None
-                            ) or vendored.get(name)
+                                _mlx_cache, short_name, None
+                            ) or vendored.get(short_name)
                             if nested_cls is None:
                                 raise ValueError(f"Unknown nested cache class {name!r}")
                             nested.append(nested_cls.from_state(nested_state, nested_m))
@@ -9749,6 +9755,14 @@ class Scheduler:
                     if isinstance(route_counts, dict)
                     else {},
                 }
+        try:
+            from .models.qwen4_exp import qwen4_fused_expert_status
+
+            fused_status = qwen4_fused_expert_status(self.model)
+            if sum(fused_status["mode_counts"].values()):
+                stats["qwen4_fused_expert"] = fused_status
+        except Exception:  # pragma: no cover - non-Qwen4 model or wrapper
+            pass
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

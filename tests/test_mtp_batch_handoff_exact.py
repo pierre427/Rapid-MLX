@@ -119,6 +119,7 @@ def _install_with_yields(yields):
         return current, logprobs
 
     gb._step = baseline_step
+    gb.next = lambda *args, **kwargs: []
     batch_gen = types.SimpleNamespace(
         _generation_batch=gb,
         stop_tokens=set(),
@@ -208,6 +209,7 @@ def test_scheduler_defers_waiting_request_until_mtp_hook_is_ready():
         config=types.SimpleNamespace(max_num_seqs=2),
         batch_generator=batch_gen,
         _ensure_batch_generator=lambda _params: True,
+        _max_running_sequences=lambda: 2,
     )
 
     assert schedule_waiting(scheduler) == []

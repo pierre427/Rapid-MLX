@@ -13,6 +13,7 @@ milestones have independent numerical and lifecycle coverage.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, cast
@@ -33,14 +34,95 @@ from mlx_lm.models.base import (  # noqa: E402
 from mlx_lm.models.cache import CacheList, KVCache  # noqa: E402
 from mlx_lm.models.gated_delta import gated_delta_update  # noqa: E402
 from mlx_lm.models.rope_utils import initialize_rope  # noqa: E402
-from mlx_lm.models.switch_layers import SwitchGLU  # noqa: E402
+from mlx_lm.models.switch_layers import (  # noqa: E402
+    QuantizedSwitchLinear,
+    SwitchGLU,
+)
 
 from ..kernels.qsa_block_sparse import (  # noqa: E402
     block_sparse_attention,
     block_sparse_layout_supported,
     should_use_block_sparse,
 )
+from ..kernels.qwen4_fused_moe import (  # noqa: E402
+    admit_qwen4_fused_down,
+    qwen4_fused_down,
+)
 from .qwen4_exp_cache import QSAIndexCache, Qwen4ExpStateCache  # noqa: E402
+
+
+_QWEN4_FUSED_EXPERT_MODES = ("stock", "auto", "scalar", "tile4")
+
+
+def _qwen4_fused_expert_mode_from_env() -> str:
+    """Resolve the guarded fused-down policy once at model construction."""
+    raw = os.environ.get("MLX_QWEN4_FUSED_EXPERT_KERNEL")
+    if raw is None or not raw.strip():
+        return "auto"
+    value = raw.strip().lower()
+    if value in {"0", "false", "off", "no", "stock"}:
+        return "stock"
+    if value in {"1", "true", "on", "yes", "auto"}:
+        return "auto"
+    if value in {"scalar", "tile4"}:
+        return value
+    return "auto"
+
+
+def _try_qwen4_fused_expert_down(
+    hidden: mx.array,
+    indices: mx.array,
+    scores: mx.array,
+    down_proj: Any,
+    mode: str,
+) -> tuple[mx.array | None, str]:
+    """Return the routed/reduced tensor or a structural fallback reason."""
+    if mode == "stock":
+        return None, "disabled"
+    if (
+        getattr(down_proj, "training", False)
+        or not isinstance(down_proj, QuantizedSwitchLinear)
+        or "bias" in down_proj
+    ):
+        return None, "projection_layout"
+    if hidden.ndim < 3 or hidden.shape[-2] != 1:
+        return None, "hidden_layout"
+
+    compact_hidden = hidden.squeeze(-2)
+    biases = getattr(down_proj, "biases", None)
+    admission = admit_qwen4_fused_down(
+        compact_hidden,
+        indices,
+        scores,
+        down_proj["weight"],
+        down_proj["scales"],
+        biases,
+        num_experts=down_proj.num_experts,
+        group_size=down_proj.group_size,
+        bits=down_proj.bits,
+        mode=down_proj.mode,
+    )
+    if not admission.accepted:
+        return None, admission.reason
+    variant = mode
+    if variant == "auto":
+        variant = "tile4" if admission.tokens == 1 else "scalar"
+    return (
+        qwen4_fused_down(
+            compact_hidden,
+            indices,
+            scores,
+            down_proj["weight"],
+            down_proj["scales"],
+            biases,
+            num_experts=down_proj.num_experts,
+            group_size=down_proj.group_size,
+            bits=down_proj.bits,
+            mode=down_proj.mode,
+            variant=variant,
+        ),
+        variant,
+    )
 
 
 @dataclass
@@ -321,6 +403,9 @@ class SparseMoeBlock(nn.Module):
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(args.hidden_size, 1, bias=False)
         self.sharding_group = None
+        self.fused_expert_kernel_mode = _qwen4_fused_expert_mode_from_env()
+        self.fused_expert_dispatches = {"scalar": 0, "tile4": 0}
+        self.fused_expert_fallbacks = 0
 
     def __call__(self, x: mx.array, *, target_verify: bool = False) -> mx.array:
         gates = mx.softmax(self.gate(x), axis=-1, precise=True)
@@ -328,7 +413,38 @@ class SparseMoeBlock(nn.Module):
         scores = mx.take_along_axis(gates, indices, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
-        if target_verify and x.ndim == 3 and x.shape[1] > 1:
+        routed_is_reduced = False
+        fused_shape = x.ndim == 3 and x.shape[0] * x.shape[1] in (1, 3)
+        if self.fused_expert_kernel_mode != "stock" and fused_shape:
+            expanded = mx.expand_dims(x, (-2, -3))
+            gate_up_proj = getattr(self.switch_mlp, "gate_up_proj", None)
+            if gate_up_proj is not None:
+                gate_up = gate_up_proj(expanded, indices, sorted_indices=False)
+                gate, up = mx.split(gate_up, 2, axis=-1)
+            else:
+                up = self.switch_mlp.up_proj(
+                    expanded, indices, sorted_indices=False
+                )
+                gate = self.switch_mlp.gate_proj(
+                    expanded, indices, sorted_indices=False
+                )
+            hidden = self.switch_mlp.activation(up, gate)
+            routed, outcome = _try_qwen4_fused_expert_down(
+                hidden,
+                indices,
+                scores,
+                self.switch_mlp.down_proj,
+                self.fused_expert_kernel_mode,
+            )
+            if routed is not None:
+                self.fused_expert_dispatches[outcome] += 1
+                routed_is_reduced = True
+            else:
+                self.fused_expert_fallbacks += 1
+                routed = self.switch_mlp.down_proj(
+                    hidden, indices, sorted_indices=False
+                ).squeeze(-2)
+        elif target_verify and x.ndim == 3 and x.shape[1] > 1:
             batch, steps, width = x.shape
             experts_per_token = indices.shape[-1]
             flat_x = x.reshape(batch * steps, width)
@@ -351,10 +467,32 @@ class SparseMoeBlock(nn.Module):
             routed = routed.squeeze(-2).reshape(batch, steps, experts_per_token, -1)
         else:
             routed = self.switch_mlp(x, indices)
-        routed = (routed * scores[..., None]).sum(axis=-2)
+        if not routed_is_reduced:
+            routed = (routed * scores[..., None]).sum(axis=-2)
         shared = self.shared_expert(x)
         shared = mx.sigmoid(self.shared_expert_gate(x)) * shared
         return routed + shared
+
+
+def qwen4_fused_expert_status(model: nn.Module) -> dict[str, Any]:
+    """Return bounded fused-down mode and reached-path counters."""
+    modes = {mode: 0 for mode in _QWEN4_FUSED_EXPERT_MODES}
+    dispatches = {"scalar": 0, "tile4": 0}
+    fallbacks = 0
+    for _name, module in model.named_modules():
+        if not isinstance(module, SparseMoeBlock):
+            continue
+        modes[module.fused_expert_kernel_mode] += 1
+        for variant in dispatches:
+            dispatches[variant] += int(
+                module.fused_expert_dispatches.get(variant, 0)
+            )
+        fallbacks += int(module.fused_expert_fallbacks)
+    return {
+        "mode_counts": modes,
+        "dispatches": dispatches,
+        "fallbacks": fallbacks,
+    }
 
 
 class GatedDeltaNet(nn.Module):

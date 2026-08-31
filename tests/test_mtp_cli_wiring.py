@@ -1679,8 +1679,8 @@ def test_install_mtp_vendored_initial_skip_log_is_deduplicated_on_uid_reuse(
     assert gb.orig_step_calls == 2
 
 
-def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
-    """A defensive B>1 violation must never emit a stale baseline token."""
+def test_install_mtp_vendored_hands_off_exactly_on_batch_size_growth(monkeypatch):
+    """A prepared B1-to-B2 boundary emits the staged target token once."""
     from types import SimpleNamespace
 
     import mlx.core as mx
@@ -1761,10 +1761,11 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
     gb._next_logprobs = [mx.array([0.0]), mx.array([0.0])]
     result = gb._step()
 
-    assert gb.orig_step_calls == orig_step_before
+    assert result is not None
+    assert gb.orig_step_calls == orig_step_before + 1
     stats = batch_gen._mtp_vendored_stats
     assert stats["ft_batch_size"] >= 1
-    assert stats["invariant_violations"] == 1
+    assert stats["invariant_violations"] == 0
     assert fake_gen_calls["closed"] == 1
 
 
@@ -2149,7 +2150,10 @@ def test_scheduler_text_stop_retires_mtp_state_before_next_request(monkeypatch):
     assert present == set()
     assert gb._mtp_vendored_state == {}
     assert not hasattr(response, "prompt_cache")
-    assert cache_return_requests == [False]
+    # The new upstream terminal lifecycle performs a second best-effort cache
+    # retrieval after the explicit no-cache removal. The uid is already gone,
+    # so the second call returns no reusable state.
+    assert cache_return_requests == [False, True]
 
     scheduler._cleanup_finished(finished)
     second = Request(

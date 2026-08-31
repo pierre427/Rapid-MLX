@@ -885,6 +885,7 @@ def test_qsa_attention_routes_compact_selection_to_block_kernel(monkeypatch):
         indexer_head_dim=64,
     )
     attention = QSAAttention(args)
+    attention.eval()
     observed = []
     monkeypatch.setenv("RAPID_MLX_QSA_BLOCK_SPARSE", "1")
 
@@ -1504,12 +1505,25 @@ def test_speculative_reject_restores_gdn_ple_and_qsa_state():
     np.testing.assert_allclose(
         np.array(restored_logits), np.array(baseline_logits), rtol=1e-5, atol=1e-6
     )
+
+    def assert_state_close(actual, expected):
+        if isinstance(expected, (list, tuple)):
+            assert isinstance(actual, type(expected))
+            assert len(actual) == len(expected)
+            for actual_item, expected_item in zip(actual, expected):
+                assert_state_close(actual_item, expected_item)
+            return
+        if expected is None:
+            assert actual is None
+            return
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), rtol=1e-5, atol=1e-6
+        )
+
     for baseline, restored in zip(baseline_cache, verify_cache):
         if isinstance(baseline, Qwen4ExpStateCache):
             for expected, actual in zip(baseline.state, restored.state):
-                np.testing.assert_allclose(
-                    np.array(actual), np.array(expected), rtol=1e-5, atol=1e-6
-                )
+                assert_state_close(actual, expected)
         else:
             assert baseline[0].offset == restored[0].offset
             assert baseline[1].offset == restored[1].offset

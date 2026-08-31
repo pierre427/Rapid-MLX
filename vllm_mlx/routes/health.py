@@ -375,6 +375,14 @@ async def status():
         "flash_next_policy": stats.get(
             "flash_next_policy", {"last_decision": None, "counts": {}}
         ),
+        "qwen4_fused_expert": stats.get(
+            "qwen4_fused_expert",
+            {
+                "mode_counts": {},
+                "dispatches": {"scalar": 0, "tile4": 0},
+                "fallbacks": 0,
+            },
+        ),
         "requests": stats.get("requests", []),
     }
 
