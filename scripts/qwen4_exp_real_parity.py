@@ -67,10 +67,17 @@ def _load(checkpoint: Path, backend: str):
     if backend == "rapid":
         from mlx_lm.utils import load_model
 
-        from vllm_mlx.utils.tokenizer import _register_vendored_archs
+        from vllm_mlx.utils.tokenizer import (
+            _qwen4_exp_quantization_override,
+            _register_vendored_archs,
+        )
 
         _register_vendored_archs()
-        model, _ = load_model(checkpoint, strict=True)
+        model, _ = load_model(
+            checkpoint,
+            strict=True,
+            model_config=_qwen4_exp_quantization_override(checkpoint),
+        )
         return model, model.model.layers, model
 
     _patch_upstream_fused_quantized_sanitizer()
