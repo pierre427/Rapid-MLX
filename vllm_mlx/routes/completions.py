@@ -409,6 +409,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         total_cached_tokens = 0
 
         extended_kwargs = build_extended_sampling_kwargs(request)
+        extended_kwargs["return_logprobs"] = request.logprobs is not None
 
         # F-152/F-153: ``logprobs`` is an integer (top-k count). When
         # non-None we route through ``stream_generate`` to accumulate
@@ -722,6 +723,7 @@ async def stream_completion(
             stored raw. Sampled + consent-gated, so a no-op when off.
     """
     extended_kwargs = build_extended_sampling_kwargs(request)
+    extended_kwargs["return_logprobs"] = request.logprobs is not None
     # C-01: pass the holder through so the engine can publish the
     # scheduler request id without changing every engine signature.
     if request_id_holder is not None:

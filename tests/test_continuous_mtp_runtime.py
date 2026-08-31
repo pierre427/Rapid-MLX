@@ -115,6 +115,30 @@ def test_prompt_cache_factory_quantizes_immediately_via_dependency(monkeypatch):
     ]
 
 
+@pytest.mark.requires_mlx
+@pytest.mark.parametrize("bits", (4, 8))
+def test_qwen4_prompt_cache_factory_quantizes_nested_qsa_kv_only(bits):
+    from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache
+
+    from vllm_mlx.models.qwen4_exp_cache import QSAIndexCache
+
+    class _Qwen4CacheOwner:
+        def make_cache(self):
+            return [CacheList(KVCache(), QSAIndexCache(compress_ratio=4))]
+
+    prompt_cache = runtime_module._make_prompt_cache(
+        _Qwen4CacheOwner(), (32, bits)
+    )
+
+    assert isinstance(prompt_cache[0], CacheList)
+    assert isinstance(prompt_cache[0].caches[0], QuantizedKVCache)
+    assert prompt_cache[0].caches[0].group_size == 32
+    assert prompt_cache[0].caches[0].bits == bits
+    # The QSA selection ledger is persistent model state, not attention K/V;
+    # it keeps its concrete owner and native precision.
+    assert isinstance(prompt_cache[0].caches[1], QSAIndexCache)
+
+
 def test_assembler_resolves_inner_model_and_wires_forward_and_cache_seams(
     monkeypatch,
 ):

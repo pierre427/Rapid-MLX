@@ -4268,6 +4268,10 @@ async def _create_chat_completion_impl(
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
         "stop": request.stop,
+        # The engine uses this private transport hint to materialize the
+        # requested distributions on its MLX worker thread. Raw mx.arrays are
+        # thread-stream-bound and cannot safely be converted by this route.
+        "return_logprobs": bool(request.logprobs),
     }
 
     # Extended sampling params — resolve through the request → CLI →

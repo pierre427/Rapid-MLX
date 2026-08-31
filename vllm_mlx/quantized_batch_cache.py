@@ -581,12 +581,23 @@ def _install_batched_mask_safe_quantized_sdpa() -> None:
         return
 
     _orig = _mlx_base.quantized_scaled_dot_product_attention
+    import inspect
+
+    _orig_accepts_side_bits = "key_bits" in inspect.signature(_orig).parameters
 
     # ``mask=None`` default: upstream 0.31.3 declares mask as positional
     # (no default), but a defaulted parameter is a strict superset — any
     # caller relying on either shape keeps working (codex r5).
     def _batched_mask_safe(
-        queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8
+        queries,
+        q_keys,
+        q_values,
+        scale,
+        mask=None,
+        group_size=64,
+        bits=8,
+        key_bits=None,
+        value_bits=None,
     ):
         n_q_heads = queries.shape[1]
         n_kv_heads = q_keys[0].shape[-3]
@@ -604,13 +615,35 @@ def _install_batched_mask_safe_quantized_sdpa() -> None:
         # already broadcasts correctly — inserting an axis there would
         # CREATE the misalignment this wrapper prevents.
         if (
-            n_q_heads // n_kv_heads > 1
+            not _orig_accepts_side_bits
+            and n_q_heads // n_kv_heads > 1
             and isinstance(mask, mx.array)
             and mask.ndim == 4
             and mask.shape[0] == queries.shape[0]
             and mask.shape[1] == 1
         ):
             mask = mask[:, None]
+        key_bits = bits if key_bits is None else key_bits
+        value_bits = bits if value_bits is None else value_bits
+        # mlx-lm's current ABI accepts independent K/V widths; Rapid's older
+        # pinned ABI accepted only ``bits``. Keep the wrapper callable by both
+        # without masking a genuinely unsupported asymmetric request.
+        if _orig_accepts_side_bits:
+            return _orig(
+                queries,
+                q_keys,
+                q_values,
+                scale=scale,
+                mask=mask,
+                group_size=group_size,
+                bits=bits,
+                key_bits=key_bits,
+                value_bits=value_bits,
+            )
+        if key_bits != value_bits:
+            raise NotImplementedError(
+                "This mlx-lm quantized SDPA ABI does not support asymmetric K/V bits."
+            )
         return _orig(
             queries,
             q_keys,
@@ -618,7 +651,7 @@ def _install_batched_mask_safe_quantized_sdpa() -> None:
             scale=scale,
             mask=mask,
             group_size=group_size,
-            bits=bits,
+            bits=key_bits,
         )
 
     _mlx_base.quantized_scaled_dot_product_attention = _batched_mask_safe

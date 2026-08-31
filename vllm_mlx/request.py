@@ -111,6 +111,11 @@ class SamplingParams:
     # ``CompletionRequest.seed``; out-of-range values are rejected at
     # the API layer with a 422 before they reach SamplingParams.
     seed: int | None = None
+    # Internal transport hint. When true, the scheduler snapshots each
+    # per-token distribution to host memory on the MLX worker thread before
+    # handing it to the asyncio/HTTP thread. Keeping this false avoids a full
+    # vocabulary device-to-host copy for ordinary requests.
+    return_logprobs: bool = False
 
     def __post_init__(self):
         if self.stop is None:
@@ -329,7 +334,8 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    # Per-token log-probabilities (mx.array of shape [vocab_size] for current token)
+    # Per-token log-probabilities (device array, or requested host snapshot,
+    # shape [vocab_size] for the current token).
     logprobs: Any = None
     # Set when the engine aborts the request before completion (e.g. Metal
     # runtime error caught in the engine loop). HTTP layer converts this to

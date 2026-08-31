@@ -2632,13 +2632,15 @@ def _extract_streaming_token_logprobs(
 def _extract_token_logprob(
     logprobs_array, token_id: int, tokenizer, top_k: int
 ) -> TokenLogProb:
-    """Convert an mx.array of log-probabilities to a TokenLogProb with top-k alternatives."""
+    """Convert a host snapshot (or legacy mx.array) to OpenAI logprobs."""
     import mlx.core as mx
     import numpy as np
 
-    if hasattr(logprobs_array, "astype"):
+    if isinstance(logprobs_array, np.ndarray):
+        probs = np.asarray(logprobs_array, dtype=np.float32).flatten()
+    else:
         logprobs_array = logprobs_array.astype(mx.float32)
-    probs = np.array(logprobs_array).flatten()
+        probs = np.array(logprobs_array).flatten()
     top_k = min(top_k, len(probs))
     top_indices = np.argpartition(probs, -top_k)[-top_k:]
     top_indices = top_indices[np.argsort(probs[top_indices])][::-1]

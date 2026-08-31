@@ -1053,7 +1053,15 @@ def test_mask_patch_is_superset_for_stock_shapes():
     mask = mx.ones((1, S), dtype=mx.bool_)
     assert mask.shape[-1] == qk[0].shape[-2]
     out = mlx_base.quantized_scaled_dot_product_attention(
-        queries, qk, qv, scale=1.0, mask=mask, group_size=32, bits=8
+        queries,
+        qk,
+        qv,
+        scale=1.0,
+        mask=mask,
+        group_size=32,
+        bits=8,
+        key_bits=8,
+        value_bits=8,
     )
     ref = _ref_attention_fp32(
         queries,
@@ -1062,6 +1070,38 @@ def test_mask_patch_is_superset_for_stock_shapes():
         mask[None, None] * mx.ones((1, 1, 1, S), dtype=mx.bool_),
     )
     assert _max_abs(out, ref) < 5e-2
+
+
+def test_mask_patch_keeps_rank4_for_current_flash_prefill_path():
+    """Current mlx-lm's large-L fused path rejects the legacy rank-5 mask."""
+    from vllm_mlx.quantized_batch_cache import (
+        _install_batched_mask_safe_quantized_sdpa,
+    )
+
+    _install_batched_mask_safe_quantized_sdpa()
+    import mlx_lm.models.base as mlx_base
+
+    mx.random.seed(1752)
+    n_kv, n_q, length, dim = 2, 4, 192, 64
+    keys = mx.random.normal((1, n_kv, length, dim)).astype(mx.bfloat16)
+    values = mx.random.normal((1, n_kv, length, dim)).astype(mx.bfloat16)
+    q_keys = tuple(_quantize(keys, 32, 8))
+    q_values = tuple(_quantize(values, 32, 8))
+    queries = mx.random.normal((1, n_q, length, dim)).astype(mx.bfloat16)
+    causal = mx.tril(mx.ones((length, length), dtype=mx.bool_))[None, None]
+    output = mlx_base.quantized_scaled_dot_product_attention(
+        queries,
+        q_keys,
+        q_values,
+        scale=1.0,
+        mask=causal,
+        group_size=32,
+        bits=8,
+        key_bits=8,
+        value_bits=8,
+    )
+    mx.eval(output)
+    assert output.shape == queries.shape
 
 
 def test_install_wires_the_mask_patch(monkeypatch):

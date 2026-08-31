@@ -248,12 +248,33 @@ def _load_prompt_cache_compat(path: str) -> list[Any]:
                 )
             ]
             return obj
-        upstream = getattr(mlx_cache, name, None)
+        module_name, separator, bare_name = name.rpartition(":")
+        if not separator:
+            bare_name = name
+        # Current mlx-lm serializes model-local cache owners with a qualified
+        # ``module:Class`` token. Preserve Rapid's vendored allowlist for its
+        # own owners, and delegate mlx-lm-owned tokens to its constrained
+        # resolver (which only imports inside the mlx_lm package).
+        if separator and module_name.split(".")[0] == "mlx_lm":
+            return mlx_cache._resolve_cache_class(name).from_state(
+                state, meta_state
+            )
+        upstream = getattr(mlx_cache, bare_name, None)
         cls = (
-            registry[name]
-            if name in registry and (name in declared_vendored or upstream is None)
+            registry[bare_name]
+            if bare_name in registry
+            and (bare_name in declared_vendored or upstream is None)
             else upstream
         )
+        if cls is None:
+            # Older mlx-lm cache files stored model-local owners by bare class
+            # name.  The current constrained resolver still knows those
+            # registrations once their model module has been imported, so use
+            # it as the final compatibility path before failing closed.
+            try:
+                cls = mlx_cache._resolve_cache_class(bare_name)
+            except ValueError:
+                cls = None
         if cls is None:
             raise ValueError(f"unknown prompt-cache class {name!r}")
         return cls.from_state(state, meta_state)
@@ -918,6 +939,13 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(arr)
             for arr in layer_cache.values:
                 total_bytes += _array_memory(arr)
+            # Model-local packed owners can retain non-KV state beside the
+            # triples. Qwen4 QSA's raw index-key ledger is authoritative and
+            # often larger than the packed attention KV, so omitting it would
+            # make APC's memory admission materially unsafe.
+            total_bytes += _array_memory(
+                getattr(layer_cache, "index_keys", None)
+            )
             continue
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
             # Cache with a ``state`` property: ``(keys, values)`` for KV
@@ -1318,6 +1346,17 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any] | None:
             tc.group_size = layer_cache.group_size
             tc.bits = layer_cache.bits
             trimmed.append(tc)
+        elif isinstance(getattr(layer_cache, "keys", None), (list, tuple)):
+            # Model-local quantized cache twins (notably Qwen4 QSA) carry
+            # auxiliary state beside the packed K/V triple. Rebuilding them as
+            # a plain QuantizedKVCache would drop that ledger, while leaving a
+            # deep copy untrimmed would leak the divergent suffix. Delegate to
+            # the owner's exact trim contract on an isolated copy.
+            tc = copy.deepcopy(layer_cache)
+            trim = getattr(tc, "trim", None)
+            if not callable(trim) or trim(trim_by) != trim_by:
+                return None
+            trimmed.append(tc)
         elif hasattr(layer_cache, "values_compressed"):
             # TurboQuantKVCache — use its trim method on a copy
             tc = copy.copy(layer_cache)
@@ -1607,7 +1646,11 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
     trimmed = []
     eval_targets = []
     for layer in cache:
-        if isinstance(layer, KVCache) and layer.keys is not None:
+        if (
+            isinstance(layer, KVCache)
+            and layer.keys is not None
+            and not isinstance(layer.keys, (list, tuple))
+        ):
             offset = layer.offset
             if offset <= 0 or offset >= layer.keys.shape[2]:
                 trimmed.append(layer)
@@ -1648,6 +1691,12 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
     quantized = []
     for layer in cache:
         if layer is None:
+            quantized.append(layer)
+            continue
+        if isinstance(getattr(layer, "keys", None), (list, tuple)):
+            # Already packed. This also covers model-local quantized twins
+            # such as QSAQuantizedKVCache, whose native auxiliary ledger must
+            # remain attached to the cache owner.
             quantized.append(layer)
             continue
         if isinstance(layer, KVCache) and layer.keys is not None:

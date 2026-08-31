@@ -244,28 +244,62 @@ def _extract_prepared_surfaces(target_cache: Any) -> _PreparedSurfaces:
     qsa: list[Any] = []
     for node in _cache_nodes(target_cache):
         name = _node_name(node)
+        module = type(node).__module__.lower()
         state = (
             node.get("state")
             if isinstance(node, Mapping)
             else getattr(node, "state", None)
+        )
+        # The production Qwen4 recurrent cache is named
+        # ``Qwen4ExpStateCache``.  The original bridge fixtures used the older
+        # ``Qwen4ArraysCache`` spelling, so matching only ``arrayscache`` made
+        # every real Qwen4 capture fail closed even though the live GDN/PLE
+        # state was present.  Bind the concrete vendored owner as well as the
+        # compatibility spellings; slot count distinguishes GDN-only (2) from
+        # GDN+PLE (4) layers.
+        is_qwen4_state = (
+            "qwen4expstatecache" in name
+            or "qwen4arrays" in name
+            or (
+                module == "vllm_mlx.models.qwen4_exp_cache"
+                and name.endswith("statecache")
+            )
+        )
+        owned_slots = getattr(node, "cache", None)
+        if not isinstance(owned_slots, (list, tuple)):
+            # ArraysCache.state is ``(cache_slots, left_padding, lengths)`` in
+            # current mlx-lm, while older/fake owners expose the slots
+            # directly.  Project only the first component when it is the
+            # nested slot list.
+            owned_slots = (
+                state[0]
+                if isinstance(state, (list, tuple))
+                and state
+                and isinstance(state[0], (list, tuple))
+                else state
+            )
+        slot_count = (
+            len(owned_slots) if isinstance(owned_slots, (list, tuple)) else 0
         )
         is_qsa = "qsa" in name or any(
             hasattr(node, attribute)
             for attribute in ("index_keys", "pooled_keys", "_mtp_shared_topk")
         )
         is_ple = (
-            "qwen4arrays" in name
-            or hasattr(node, "_ple_rollback")
+            is_qwen4_state
+            and slot_count >= 4
+        ) or (
+            hasattr(node, "_ple_rollback")
             or (
                 "arrayscache" in name
-                and isinstance(state, (list, tuple))
-                and len(state) >= 4
+                and slot_count >= 4
             )
         )
         is_gdn = (
             "arrayscache" in name
             or "mambacache" in name
             or "gateddelta" in name
+            or is_qwen4_state
             or is_ple
         ) and not is_qsa
         if is_gdn:

@@ -124,7 +124,7 @@ _LANE_PARITY_SAMPLING_KEYS = (
     "presence_penalty",
     "frequency_penalty",
 )
-_TEXT_ONLY_SAMPLING_KEYS = ("top_k", "min_p", "seed")
+_TEXT_ONLY_SAMPLING_KEYS = ("top_k", "min_p", "seed", "return_logprobs")
 _LANE_PARITY_PROCESSOR_KEYS = (
     "grammar_logits_processor",
     "reasoning_budget_logits_processor",

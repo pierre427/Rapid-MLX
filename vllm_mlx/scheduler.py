@@ -137,6 +137,16 @@ from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
 
+
+def _materialize_logprobs_for_transport(logprobs: Any):
+    """Copy one vocabulary distribution to host memory on the MLX thread."""
+    import numpy as np
+
+    if isinstance(logprobs, np.ndarray):
+        return logprobs
+    return np.array(logprobs.astype(mx.float32), copy=True)
+
+
 # Functional hybrid cache updates retain their prior lazy graph until an eval
 # barrier. Eight steps bounds that graph to a few hundred live Metal handles on
 # current 40-layer families while amortizing the synchronization cost.
@@ -8407,6 +8417,15 @@ class Scheduler:
                 else:
                     new_text = self._decode_tokens([response.token])
 
+            logprobs = response.logprobs
+            if request.sampling_params.return_logprobs and logprobs is not None:
+                # This method runs on the single MLX step worker. Materialize
+                # requested distributions here, while their thread-local
+                # stream is valid; the HTTP route later consumes only a NumPy
+                # snapshot. Doing this conditionally avoids a full-vocabulary
+                # D2H copy on every ordinary decode token.
+                logprobs = _materialize_logprobs_for_transport(logprobs)
+
             # output_token_ids is a live reference (not a defensive copy):
             # consumers read it synchronously; the per-decode list() was O(n).
             output = RequestOutput(
@@ -8417,7 +8436,7 @@ class Scheduler:
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 cached_tokens=request.cached_tokens,
-                logprobs=response.logprobs,
+                logprobs=logprobs,
             )
 
             # Check text-based stop sequences. ``SamplingParams.stop`` is a
