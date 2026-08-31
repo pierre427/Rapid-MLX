@@ -1815,8 +1815,12 @@ def _install_mtp_vendored(
         _cleanup_uid(uid)
         _disabled_uids.pop(uid, None)
         _terminal_uids.pop(uid, None)
+        # Materialize the removal set before mutating ``_initial_skip_logged``.
+        # ``set.difference_update`` consumes its iterable lazily, so a generator
+        # over the same set raises ``RuntimeError: Set changed size during
+        # iteration`` as soon as the first matching key is removed.
         _initial_skip_logged.difference_update(
-            key for key in _initial_skip_logged if key[0] == uid
+            tuple(key for key in _initial_skip_logged if key[0] == uid)
         )
 
     def _prepare_batch_expansion() -> bool:

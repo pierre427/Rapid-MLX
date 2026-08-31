@@ -1678,6 +1678,11 @@ def test_install_mtp_vendored_initial_skip_log_is_deduplicated_on_uid_reuse(
     assert len(skip_logs) == 1
     assert gb.orig_step_calls == 2
 
+    # Completion reaps every log-once key for the departing uid.  The removal
+    # must not iterate lazily over the same set it mutates.
+    gb.next_responses = [SimpleNamespace(uid=45, finish_reason="stop")]
+    gb.next()
+
 
 def test_install_mtp_vendored_hands_off_exactly_on_batch_size_growth(monkeypatch):
     """A prepared B1-to-B2 boundary emits the staged target token once."""
