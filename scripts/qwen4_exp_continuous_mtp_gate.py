@@ -30,6 +30,10 @@ PROMPTS = (
     "rollback matters during speculative decoding.",
     "In one paragraph of at least 80 words, explain how continuous batching "
     "improves inference throughput.",
+    "In one paragraph of at least 80 words, explain why exact artifact hashes "
+    "matter when validating a model port.",
+    "In one paragraph of at least 80 words, explain how fail-closed admission "
+    "protects an inference service.",
 )
 
 
@@ -187,12 +191,14 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-tokens", type=int, default=24)
+    parser.add_argument("--batch-size", type=int, default=2, choices=(2, 4))
     args = parser.parse_args()
     if args.max_tokens < 3:
         parser.error("--max-tokens must be at least 3")
 
     checkpoint = args.checkpoint.resolve()
     output = args.output.resolve()
+    prompts = PROMPTS[: args.batch_size]
     result: dict[str, Any] = {
         "status": "loading",
         "checkpoint": str(checkpoint),
@@ -208,7 +214,8 @@ def main() -> int:
             "mlx_lm": importlib.metadata.version("mlx-lm"),
         },
         "max_tokens": args.max_tokens,
-        "prompts": list(PROMPTS),
+        "batch_size": args.batch_size,
+        "prompts": list(prompts),
         "arms": {},
     }
     _write(output, result)
@@ -228,7 +235,7 @@ def main() -> int:
     )
 
     tokenizer = load_tokenizer(checkpoint)
-    prompt_tokens = [_tokens(tokenizer, prompt) for prompt in PROMPTS]
+    prompt_tokens = [_tokens(tokenizer, prompt) for prompt in prompts]
     result["prompt_tokens"] = [len(tokens) for tokens in prompt_tokens]
 
     plain = [
@@ -258,8 +265,9 @@ def main() -> int:
     _write(output, result)
 
     batch_a = _continuous(runtime, prompt_tokens, args.max_tokens)
-    result["arms"]["mtp_b2_a"] = batch_a
-    result["status"] = "b2-a-complete"
+    batch_a_name = f"mtp_b{args.batch_size}_a"
+    result["arms"][batch_a_name] = batch_a
+    result["status"] = f"b{args.batch_size}-a-complete"
     _write(output, result)
 
     seq_b = _sequential_arm(runtime, prompt_tokens, args.max_tokens)
@@ -268,29 +276,37 @@ def main() -> int:
     _write(output, result)
 
     batch_b = _continuous(runtime, prompt_tokens, args.max_tokens)
-    result["arms"]["mtp_b2_b"] = batch_b
+    batch_b_name = f"mtp_b{args.batch_size}_b"
+    result["arms"][batch_b_name] = batch_b
 
     plain_tokens = [lane["tokens"] for lane in plain]
     b1_a_tokens = [lane["tokens"]["1"] for lane in seq_a["lanes"]]
     b1_b_tokens = [lane["tokens"]["1"] for lane in seq_b["lanes"]]
-    b2_a_tokens = [batch_a["tokens"][str(uid)] for uid in (1, 2)]
-    b2_b_tokens = [batch_b["tokens"][str(uid)] for uid in (1, 2)]
+    batch_a_tokens = [
+        batch_a["tokens"][str(uid)] for uid in range(1, args.batch_size + 1)
+    ]
+    batch_b_tokens = [
+        batch_b["tokens"][str(uid)] for uid in range(1, args.batch_size + 1)
+    ]
     checks = {
         "b1_a_equals_plain": b1_a_tokens == plain_tokens,
         "b1_b_equals_plain": b1_b_tokens == plain_tokens,
-        "b2_repeat_exact": b2_a_tokens == b2_b_tokens,
-        "b2_equals_plain": b2_a_tokens == plain_tokens,
+        "batch_repeat_exact": batch_a_tokens == batch_b_tokens,
+        "batch_equals_plain": batch_a_tokens == plain_tokens,
     }
     result["checks"] = checks
     result["performance"] = {
         "b1_bracket_decode_tps": [seq_a["decode_tps"], seq_b["decode_tps"]],
-        "b2_repeat_decode_tps": [batch_a["decode_tps"], batch_b["decode_tps"]],
-        "b2_over_b1_a": batch_a["decode_tps"] / seq_a["decode_tps"],
-        "b2_over_b1_b": batch_b["decode_tps"] / seq_b["decode_tps"],
+        "batch_repeat_decode_tps": [
+            batch_a["decode_tps"],
+            batch_b["decode_tps"],
+        ],
+        "batch_over_b1_a": batch_a["decode_tps"] / seq_a["decode_tps"],
+        "batch_over_b1_b": batch_b["decode_tps"] / seq_b["decode_tps"],
     }
     result["decoded"] = {
         "plain": [tokenizer.decode(tokens) for tokens in plain_tokens],
-        "b2": [tokenizer.decode(tokens) for tokens in b2_a_tokens],
+        "batch": [tokenizer.decode(tokens) for tokens in batch_a_tokens],
     }
     result["status"] = "passed" if all(checks.values()) else "failed"
     _write(output, result)
