@@ -24,7 +24,7 @@ from .continuous_engine import (
 from .mlx_backend import RapidMLXSelfMTPBackend, RapidRaggedCacheAdapter
 from .ragged_cache import preflight_ragged_cache, trim_ragged_cache
 
-_SUPPORTED_FAMILIES = frozenset({"qwen3_5"})
+_SUPPORTED_FAMILIES = frozenset({"qwen3_5", "qwen4_exp"})
 
 
 def _unsupported(message: str) -> ContinuousSelfMTPUnsupportedError:
@@ -62,6 +62,10 @@ def _resolve_inner(model: Any, family: str) -> Any:
         from .qwen3_5_inject import _resolve_inner_text_model
 
         inner = _resolve_inner_text_model(model)
+    elif family == "qwen4_exp":
+        from .qwen4_exp_inject import _resolve_inner
+
+        inner = _resolve_inner(model)
     else:  # Guarded by descriptor validation; retained for direct testability.
         inner = None
     if inner is None:
@@ -153,7 +157,12 @@ def assemble_continuous_self_mtp_runtime(
 
     from .ragged_cache import install_ragged_cache_rollback
 
-    install_ragged_cache_rollback(qwen4_state_cls=None, qsa_cls=None)
+    if family == "qwen4_exp":
+        # Qwen4 owns both recurrent state and QSA index caches.  Install their
+        # exact ragged rollback hooks before any cache factory can run.
+        install_ragged_cache_rollback()
+    else:
+        install_ragged_cache_rollback(qwen4_state_cls=None, qsa_cls=None)
 
     def mtp_forward(hidden: Any, token_ids: Any, cache: Any, *, return_hidden: bool):
         # RapidForwardSeams always asks for hidden state.  The injected batched

@@ -156,17 +156,39 @@ def test_dynamic_membership_requires_policy_and_dense_attestation():
     assert policy_off.capabilities.dynamic_membership is False
 
 
-def test_qwen4_is_not_attested_by_the_dense_adapter():
-    descriptor = _descriptor("qwen4_exp")
+def test_qwen4_assembles_fixed_membership_with_qwen4_cache_install(monkeypatch):
+    descriptor = _descriptor("qwen4_exp", dynamic_join=False)
     inner = _InjectedTextModel(descriptor)
     inner.model_type = "qwen4_exp_text"
     outer = _OuterModel(inner)
+    installs = []
+    monkeypatch.setattr(
+        "vllm_mlx.spec_decode.mtp.ragged_cache.install_ragged_cache_rollback",
+        lambda **kwargs: installs.append(kwargs),
+    )
 
-    with pytest.raises(ContinuousSelfMTPUnsupportedError, match="unsupported model"):
-        runtime_module.assemble_continuous_self_mtp_runtime(
-            outer,
-            array_ops=_ArrayOpsStub(),
-        )
+    assembled = runtime_module.assemble_continuous_self_mtp_runtime(
+        outer,
+        allow_dynamic_membership=True,
+        array_ops=_ArrayOpsStub(),
+    )
+
+    assert assembled.config.architecture == "qwen4_exp"
+    assert assembled.capabilities.dynamic_membership is False
+    assert installs == [{}]
+
+
+def test_qwen4_dynamic_attestation_cannot_be_manufactured_by_caller():
+    descriptor = _descriptor("qwen4_exp", dynamic_join=False)
+    inner = _InjectedTextModel(descriptor)
+    inner.model_type = "qwen4_exp_text"
+
+    assembled = runtime_module.assemble_continuous_self_mtp_runtime(
+        inner,
+        allow_dynamic_membership=True,
+        array_ops=_ArrayOpsStub(),
+    )
+    assert assembled.capabilities.dynamic_membership is False
 
 
 @pytest.mark.parametrize(

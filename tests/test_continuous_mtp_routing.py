@@ -169,6 +169,28 @@ def test_install_plan_threads_attested_dynamic_membership():
     assert admitted.router.runtime.capabilities.dynamic_membership is True
 
 
+def test_qwen4_install_is_fixed_membership_only():
+    model = _Model()
+    model.batched_mtp_capability = _descriptor("qwen4_exp") | {
+        "dynamic_join": False
+    }
+
+    fixed = plan_router_install(model, enabled=True, hard_reserve_bytes=0)
+    dynamic = plan_router_install(
+        model,
+        enabled=True,
+        allow_dynamic_membership=True,
+        hard_reserve_bytes=0,
+    )
+
+    assert fixed.admitted is True
+    assert fixed.router is not None
+    assert fixed.router.runtime.model_family == "qwen4_exp"
+    assert fixed.router.runtime.capabilities.dynamic_membership is False
+    assert dynamic.admitted is False
+    assert "dynamic membership is not attested" in dynamic.reasons
+
+
 def test_supported_requests_build_an_immutable_fixed_cohort_plan():
     router = _router()
 

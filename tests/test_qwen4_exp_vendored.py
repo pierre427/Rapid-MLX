@@ -1356,6 +1356,9 @@ def test_qwen4_native_mtp_dispatch_attaches_synthetic_head(monkeypatch):
     import mlx.nn as nn
 
     from vllm_mlx.spec_decode.mtp import dispatch_mtp_inject, dispatch_mtp_validate
+    from vllm_mlx.spec_decode.mtp.continuous_runtime import (
+        assemble_continuous_self_mtp_runtime,
+    )
     from vllm_mlx.spec_decode.mtp.dispatch import (
         _MTP_INJECT_DISPATCH,
         _MTP_VALIDATE_DISPATCH,
@@ -1380,6 +1383,8 @@ def test_qwen4_native_mtp_dispatch_attaches_synthetic_head(monkeypatch):
     assert dispatch_mtp_inject(model, "qwen4_exp", allow_random_init=True) is True
     assert dispatch_mtp_validate(model, "qwen4_exp") is True
     assert model.mtp_max_speculative_tokens == 1
+    assert model.batched_mtp_capability["model_family"] == "qwen4_exp"
+    assert model.batched_mtp_capability["dynamic_join"] is False
 
     inner = model.language_model
     cache = inner.make_mtp_cache()
@@ -1387,8 +1392,23 @@ def test_qwen4_native_mtp_dispatch_attaches_synthetic_head(monkeypatch):
         mx.array([[1]]), cache=inner.make_cache(), return_hidden=True
     )
     mtp_logits = inner.mtp_forward(hidden, mx.array([[2]]), cache)
-    mx.eval(logits, mtp_logits)
+    batch_logits, batch_hidden = inner.mtp_batch_forward(
+        hidden, mx.array([[2]]), inner.make_mtp_cache()
+    )
+    mx.eval(logits, mtp_logits, batch_logits, batch_hidden)
     assert mtp_logits.shape == (1, 1, args.vocab_size)
+    np.testing.assert_allclose(
+        np.asarray(batch_logits), np.asarray(mtp_logits), rtol=0, atol=0
+    )
+    assert batch_hidden.shape == hidden.shape
+
+    runtime = assemble_continuous_self_mtp_runtime(
+        model,
+        allow_dynamic_membership=True,
+        array_ops=object(),
+    )
+    assert runtime.config.architecture == "qwen4_exp"
+    assert runtime.capabilities.dynamic_membership is False
 
 
 def test_qwen4_mtp_checkpoint_file_discovery_and_weight_sanitize(tmp_path):

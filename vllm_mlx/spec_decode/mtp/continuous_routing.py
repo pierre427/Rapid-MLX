@@ -36,6 +36,8 @@ from .prepared_state import (
     evaluate_restore,
 )
 
+_SUPPORTED_CONTINUOUS_MTP_FAMILIES = frozenset({"qwen3_5", "qwen4_exp"})
+
 
 class ContinuousMTPIntegrationRoute(str, enum.Enum):
     CONTINUOUS_PLANNED = "continuous_planned"
@@ -364,14 +366,13 @@ def _runtime_refusals(
     reasons: list[str] = []
     if config.enabled is not True:
         reasons.append("continuous self-MTP is disabled")
-    if runtime.model_family != "qwen3_5":
+    if runtime.model_family not in _SUPPORTED_CONTINUOUS_MTP_FAMILIES:
         reasons.append(f"unsupported model family: {runtime.model_family}")
     descriptor = runtime.capability_descriptor
     required_descriptor = {
         "protocol_version": 1,
         "recursive_draft_depth": 2,
         "fixed_membership": True,
-        "dynamic_join": True,
         "quantized_cache": False,
         "windowed_cache": False,
         "xtc": False,
@@ -379,6 +380,8 @@ def _runtime_refusals(
     for name, expected in required_descriptor.items():
         if descriptor.get(name) != expected:
             reasons.append(f"capability descriptor mismatch: {name}")
+    if not isinstance(descriptor.get("dynamic_join"), bool):
+        reasons.append("capability descriptor mismatch: dynamic_join")
     if runtime.cache_quantized:
         reasons.append("quantized cache is unsupported")
     if runtime.cache_windowed:
