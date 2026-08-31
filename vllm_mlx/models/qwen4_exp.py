@@ -52,6 +52,31 @@ from .qwen4_exp_cache import QSAIndexCache, Qwen4ExpStateCache  # noqa: E402
 
 
 _QWEN4_FUSED_EXPERT_MODES = ("stock", "auto", "scalar", "tile4")
+# MLX #4437: Metal's column reducer launches 256 threads per 32 output
+# columns and silently truncates a grid wider than UINT32_MAX. 2**28 columns
+# keep each dispatch at half that limit while leaving ordinary QSA unchanged.
+_QSA_REDUCTION_CHUNK_COLUMNS = 1 << 28
+
+
+def _sum_qsa_heads(scores: mx.array) -> mx.array:
+    """Reduce QSA heads without overflowing Metal's dispatch width."""
+    if scores.ndim != 3 or scores.shape[0] == 0:
+        raise ValueError("QSA head scores must have shape [heads, queries, keys]")
+
+    output_shape = scores.shape[1:]
+    columns = math.prod(output_shape)
+    if columns <= _QSA_REDUCTION_CHUNK_COLUMNS:
+        return mx.sum(scores, axis=0)
+
+    flat_scores = scores.reshape(scores.shape[0], columns)
+    reduced = [
+        mx.sum(
+            flat_scores[:, start : start + _QSA_REDUCTION_CHUNK_COLUMNS],
+            axis=0,
+        )
+        for start in range(0, columns, _QSA_REDUCTION_CHUNK_COLUMNS)
+    ]
+    return mx.concatenate(reduced, axis=0).reshape(output_shape)
 
 
 def _qwen4_fused_expert_mode_from_env() -> str:
@@ -921,8 +946,8 @@ class QSAIndexer(nn.Module):
                     query[batch_index].transpose(1, 0, 2),
                     keys.T,
                 )
-                scores = mx.sum(
-                    mx.maximum(scores.astype(mx.float32), 0), axis=0
+                scores = _sum_qsa_heads(
+                    mx.maximum(scores.astype(mx.float32), 0)
                 ) / math.sqrt(self.head_dim)
                 query_ends = offsets[batch_index] + mx.arange(length) - input_start + 1
                 complete_counts = mx.maximum(query_ends // self.compress_ratio, 0)

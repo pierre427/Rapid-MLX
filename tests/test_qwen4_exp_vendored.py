@@ -1262,6 +1262,62 @@ def test_qsa_sparse_scores_use_one_reference_batched_matmul(monkeypatch):
     ]
 
 
+def test_qsa_head_sum_keeps_one_reduction_below_dispatch_bound(monkeypatch):
+    scores = mx.arange(2 * 3 * 4, dtype=mx.float32).reshape(2, 3, 4)
+    original = qwen4_exp.mx.sum
+    shapes = []
+
+    def record_sum(values, *, axis):
+        shapes.append((values.shape, axis))
+        return original(values, axis=axis)
+
+    monkeypatch.setattr(qwen4_exp.mx, "sum", record_sum)
+    reduced = qwen4_exp._sum_qsa_heads(scores)
+    mx.eval(reduced)
+
+    assert reduced.shape == (3, 4)
+    assert shapes == [((2, 3, 4), 0)]
+
+
+def test_qsa_head_sum_chunks_before_dispatch_overflow(monkeypatch):
+    scores = mx.arange(4 * 3 * 4, dtype=mx.float32).reshape(4, 3, 4)
+    expected = mx.sum(scores, axis=0)
+    original = qwen4_exp.mx.sum
+    shapes = []
+
+    def record_sum(values, *, axis):
+        shapes.append((values.shape, axis))
+        return original(values, axis=axis)
+
+    monkeypatch.setattr(qwen4_exp, "_QSA_REDUCTION_CHUNK_COLUMNS", 5)
+    monkeypatch.setattr(qwen4_exp.mx, "sum", record_sum)
+    reduced = qwen4_exp._sum_qsa_heads(scores)
+    mx.eval(reduced, expected)
+
+    np.testing.assert_array_equal(np.array(reduced), np.array(expected))
+    assert shapes == [((4, 5), 0), ((4, 5), 0), ((4, 2), 0)]
+
+
+def test_qsa_reduction_chunk_bound_fits_uint32_dispatch_width():
+    threads_per_group = 256
+    columns_per_group = 32
+    max_grid_width = (1 << 32) - 1
+
+    chunk_columns = qwen4_exp._QSA_REDUCTION_CHUNK_COLUMNS
+    chunk_grid_width = (
+        threads_per_group
+        * ((chunk_columns + columns_per_group - 1) // columns_per_group)
+    )
+    overflow_columns = 1 << 29
+    overflow_grid_width = (
+        threads_per_group
+        * ((overflow_columns + columns_per_group - 1) // columns_per_group)
+    )
+
+    assert chunk_grid_width <= max_grid_width
+    assert overflow_grid_width > max_grid_width
+
+
 def test_qsa_indexer_fail_closed_internal_invariants():
     args = _args(indexer_budget=8, indexer_compress_ratio=2)
     indexer = QSAIndexer(args)
