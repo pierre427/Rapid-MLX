@@ -24,6 +24,15 @@ from .prompt_lookup_capability import PromptLookupVerificationIdentity
 ATTESTATION_SCHEMA_VERSION = 1
 ATTESTATION_ISSUER = "rapid-mlx-production-metal-oracle-v1"
 HYBRID_TRANSACTIONAL_ACCEPT_ROUTE = "hybrid_transactional_accept_v1"
+FIXED_M4_COMPILED_VERIFY_ROUTE = "fixed_m4_compiled_verify_v1"
+DIRECT_SPARSE_M3_QSA_ROUTE = "direct_sparse_m3_qsa_v1"
+SUPPORTED_ATTESTATION_ROUTES = frozenset(
+    {
+        HYBRID_TRANSACTIONAL_ACCEPT_ROUTE,
+        FIXED_M4_COMPILED_VERIFY_ROUTE,
+        DIRECT_SPARSE_M3_QSA_ROUTE,
+    }
+)
 _TRUSTED_RECEIPT_SEAL = object()
 
 REQUIRED_STATE_SURFACES = frozenset(
@@ -69,6 +78,7 @@ class OraclePhase(str, Enum):
 class OracleExecutionKind(str, Enum):
     EAGER_TRANSACTION = "eager_transaction"
     COMPILED_CANDIDATE = "compiled_candidate"
+    SPARSE_CANDIDATE = "sparse_candidate"
 
 
 @dataclass(frozen=True)
@@ -420,7 +430,7 @@ def validate_prompt_lookup_oracle(
         reasons.append("geometry_identity_mismatch")
     if evidence.production_metal is not True:
         reasons.append("not_production_metal")
-    if expected_route != HYBRID_TRANSACTIONAL_ACCEPT_ROUTE:
+    if expected_route not in SUPPORTED_ATTESTATION_ROUTES:
         reasons.append("unsupported_attestation_route")
     if evidence.route.route_name != expected_route:
         reasons.append("route_mismatch")
@@ -453,6 +463,29 @@ def validate_prompt_lookup_oracle(
             reasons.append("compile_outside_warmup")
         if evidence.route.post_warmup_recompile_count != 0:
             reasons.append("post_warmup_recompile_observed")
+    elif evidence.route.execution_kind is OracleExecutionKind.SPARSE_CANDIDATE:
+        if evidence.route.compiled_candidate is not False:
+            reasons.append("execution_kind_mismatch")
+        if any(
+            count != 0
+            for count in (
+                evidence.route.compile_count,
+                evidence.route.warmup_compile_count,
+                evidence.route.post_warmup_recompile_count,
+            )
+        ):
+            reasons.append("sparse_route_has_compile_activity")
+
+    if (
+        expected_route == FIXED_M4_COMPILED_VERIFY_ROUTE
+        and evidence.route.execution_kind is not OracleExecutionKind.COMPILED_CANDIDATE
+    ):
+        reasons.append("route_execution_kind_mismatch")
+    if (
+        expected_route == DIRECT_SPARSE_M3_QSA_ROUTE
+        and evidence.route.execution_kind is not OracleExecutionKind.SPARSE_CANDIDATE
+    ):
+        reasons.append("route_execution_kind_mismatch")
 
     case_by_key: dict[OracleCaseKey, OracleCaseEvidence] = {}
     duplicate_keys: set[OracleCaseKey] = set()
@@ -562,7 +595,7 @@ def verify_trusted_prompt_lookup_receipt(
         raise AttestationValidationError("trusted receipt identity mismatch")
     if receipt.route_name != expected_route:
         raise AttestationValidationError("trusted receipt route mismatch")
-    if expected_route != HYBRID_TRANSACTIONAL_ACCEPT_ROUTE:
+    if expected_route not in SUPPORTED_ATTESTATION_ROUTES:
         raise AttestationValidationError("trusted receipt route is unsupported")
     return receipt
 
@@ -711,6 +744,17 @@ def _validate_receipt(receipt: PromptLookupAttestationReceipt) -> None:
             raise ValueError("compiled receipt lacks warmup compilation")
         if receipt.compile_count != receipt.warmup_compile_count:
             raise ValueError("compiled receipt records compile outside warmup")
+    elif receipt.execution_kind is OracleExecutionKind.SPARSE_CANDIDATE:
+        if receipt.compiled_candidate is not False:
+            raise ValueError("sparse receipt records compiled execution")
+        if any(
+            count != 0
+            for count in (
+                receipt.compile_count,
+                receipt.warmup_compile_count,
+            )
+        ):
+            raise ValueError("sparse receipt records compile activity")
     for name in ("batch_size", "verify_width"):
         value = getattr(receipt, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -798,6 +842,8 @@ def _validate_prefix_vector(value: tuple[int, ...], name: str) -> None:
 __all__ = [
     "ATTESTATION_ISSUER",
     "ATTESTATION_SCHEMA_VERSION",
+    "DIRECT_SPARSE_M3_QSA_ROUTE",
+    "FIXED_M4_COMPILED_VERIFY_ROUTE",
     "HYBRID_TRANSACTIONAL_ACCEPT_ROUTE",
     "REQUIRED_STATE_SURFACES",
     "AttestationSubject",
@@ -814,6 +860,7 @@ __all__ = [
     "RawBitValue",
     "RouteEngagementEvidence",
     "SurfaceEvidence",
+    "SUPPORTED_ATTESTATION_ROUTES",
     "TrustedPromptLookupReceipt",
     "compare_raw_bits",
     "issue_prompt_lookup_attestation",
