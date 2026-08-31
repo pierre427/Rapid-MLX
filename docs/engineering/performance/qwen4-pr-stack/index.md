@@ -3,8 +3,32 @@
 Status: **private Forgejo integration branch pushed; publication branches are
 not pushed and nothing is submitted upstream**.
 
-Base: Rapid-MLX `origin/main` at
-`746522837c2cde5deca3784786ce06d10b45e66c`.
+Current restack: Rapid-MLX `origin/main` at
+`7da40670f349f9faa4b690b48be5110953496610`; private branch
+`codex/qwen4-upstream-stack-final-20260831`. See the
+[exact 2026-08-31 restack manifest](restack-20260831.md) for the current
+58-commit series, closure tests, final defaults, and recommended review order.
+
+The per-body commit hashes in the historical table below are source-lineage
+identifiers from the first staging packet. They are not the rebased hashes;
+the restack manifest is authoritative for checkout and review.
+
+## Current truth boundary (supersedes historical pending statements below)
+
+- Live single-user continuous B1 delivery, native Qwen4 injection, schema-v2
+  APC restore, request-local seeded RNG, and the latched Flash-Next route are
+  implemented in the restacked integration series.
+- Quantized QSA cache ownership composes with APC and continuous MTP, but BF16
+  remains the global default; int8 is a capacity profile because its 8K and
+  16K throughput results change sign.
+- Fused-down MoE is guarded auto by product decision. Real M=1 tile4 dispatch
+  is witnessed; M=3 scalar remains isolated-geometry qualified but was not
+  reached by the closure request. No end-to-end fused speedup is claimed.
+- Flash dynamic membership remains fail-closed. A second real request causes
+  the single-user PLD policy to latch plain fallback at a cache-safe boundary.
+- Publication branches, human line review, per-PR validation, and actual
+  upstream submission remain pending. The private integration branch is not a
+  claim that every logical PR unit is independently merge-ready.
 
 This directory contains one proposed PR body per focused layer in the local
 Qwen4 continuous self-MTP stack. PRs 1--12A map to existing focused commits.
