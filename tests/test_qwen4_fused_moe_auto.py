@@ -133,3 +133,20 @@ def test_status_reports_configured_blocks_and_reached_path_counts(monkeypatch):
         "dispatches": {"scalar": 3, "tile4": 7},
         "fallbacks": 2,
     }
+
+
+def test_status_accepts_native_mlx_lm_observability_contract():
+    native_block = SimpleNamespace(
+        fused_expert_kernel_mode="auto",
+        fused_expert_dispatches={"scalar": 9, "tile4": 11},
+        fused_expert_fallbacks=4,
+    )
+    native_model = SimpleNamespace(
+        named_modules=lambda: [("language_model.layers.0.mlp", native_block)]
+    )
+
+    assert qwen4_exp.qwen4_fused_expert_status(native_model) == {
+        "mode_counts": {"stock": 0, "auto": 1, "scalar": 0, "tile4": 0},
+        "dispatches": {"scalar": 9, "tile4": 11},
+        "fallbacks": 4,
+    }

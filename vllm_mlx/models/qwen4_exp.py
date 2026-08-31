@@ -480,14 +480,20 @@ def qwen4_fused_expert_status(model: nn.Module) -> dict[str, Any]:
     dispatches = {"scalar": 0, "tile4": 0}
     fallbacks = 0
     for _name, module in model.named_modules():
-        if not isinstance(module, SparseMoeBlock):
+        # A current mlx-lm may supply its native qwen4_exp module while older
+        # installs use Rapid's vendored implementation.  Both expose this
+        # bounded observability contract; an isinstance check against only the
+        # vendored class silently hid real native dispatches.
+        mode = getattr(module, "fused_expert_kernel_mode", None)
+        module_dispatches = getattr(module, "fused_expert_dispatches", None)
+        if mode not in modes or not isinstance(module_dispatches, dict):
             continue
-        modes[module.fused_expert_kernel_mode] += 1
+        modes[mode] += 1
         for variant in dispatches:
             dispatches[variant] += int(
-                module.fused_expert_dispatches.get(variant, 0)
+                module_dispatches.get(variant, 0)
             )
-        fallbacks += int(module.fused_expert_fallbacks)
+        fallbacks += int(getattr(module, "fused_expert_fallbacks", 0))
     return {
         "mode_counts": modes,
         "dispatches": dispatches,
