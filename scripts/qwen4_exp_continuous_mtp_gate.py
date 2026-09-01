@@ -201,14 +201,14 @@ def _continuous(
             f"{ {uid: len(tokens) for uid, tokens in generated.items()} }"
         )
     if any(reason != "length" for reason in finish_reasons.values()):
-        raise AssertionError(f"continuous MTP did not finish by length: {finish_reasons}")
+        raise AssertionError(
+            f"continuous MTP did not finish by length: {finish_reasons}"
+        )
 
     result = {
         "tokens": {str(uid): tokens for uid, tokens in generated.items()},
         "from_draft": {str(uid): count for uid, count in from_draft.items()},
-        "finish_reasons": {
-            str(uid): reason for uid, reason in finish_reasons.items()
-        },
+        "finish_reasons": {str(uid): reason for uid, reason in finish_reasons.items()},
         "prefill_s": prefill_s,
         "decode_s": decode_s,
         "decode_tps": (len(prompts) * max_tokens) / decode_s,
@@ -347,8 +347,7 @@ def main() -> int:
         "b1_a_equals_plain": b1_a_tokens == plain_tokens,
         "b1_b_equals_plain": b1_b_tokens == plain_tokens,
         "batch_repeat_exact": batch_a_tokens == batch_b_tokens,
-        "batch_equals_plain_matched_shape": batch_a_tokens
-        == plain_batch["tokens"],
+        "batch_equals_plain_matched_shape": batch_a_tokens == plain_batch["tokens"],
     }
     result["checks"] = checks
     result["comparisons"] = {
@@ -369,9 +368,7 @@ def main() -> int:
     }
     result["decoded"] = {
         "plain": [tokenizer.decode(tokens) for tokens in plain_tokens],
-        "plain_batch": [
-            tokenizer.decode(tokens) for tokens in plain_batch["tokens"]
-        ],
+        "plain_batch": [tokenizer.decode(tokens) for tokens in plain_batch["tokens"]],
         "batch": [tokenizer.decode(tokens) for tokens in batch_a_tokens],
     }
     result["status"] = "passed" if all(checks.values()) else "failed"

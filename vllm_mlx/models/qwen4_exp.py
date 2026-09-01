@@ -82,14 +82,17 @@ def _detect_norm_convention(
         return bool(declared)
 
     total = sum(len(means) for means in families.values())
-    one_score = sum(
-        len(means) * abs(sum(means) / len(means) - 1.0)
-        for means in families.values()
-    ) / total
-    zero_score = sum(
-        len(means) * abs(sum(means) / len(means))
-        for means in families.values()
-    ) / total
+    one_score = (
+        sum(
+            len(means) * abs(sum(means) / len(means) - 1.0)
+            for means in families.values()
+        )
+        / total
+    )
+    zero_score = (
+        sum(len(means) * abs(sum(means) / len(means)) for means in families.values())
+        / total
+    )
     if one_score + _NORM_CONVENTION_MARGIN < zero_score:
         detected = True
     elif zero_score + _NORM_CONVENTION_MARGIN < one_score:
@@ -1613,9 +1616,7 @@ class TextModel(nn.Module):
             declared=self.args.mlx_norm_weights_are_one_centered,
         ):
             for key, value in sanitized.items():
-                if any(
-                    key.endswith(suffix) for suffix in _ZERO_CENTERED_NORM_SUFFIXES
-                ):
+                if any(key.endswith(suffix) for suffix in _ZERO_CENTERED_NORM_SUFFIXES):
                     sanitized[key] = value - 1.0
         return sanitized
 

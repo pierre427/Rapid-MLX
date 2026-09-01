@@ -6,11 +6,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Sequence, Tuple
-
 
 CONTRACT_VERSION = 1
 
@@ -30,27 +29,27 @@ class Qwen4ArtifactReceipt:
     model_type: str
     text_model_type: str
     num_hidden_layers: int
-    layer_types: Tuple[str, ...]
+    layer_types: tuple[str, ...]
     hc_count: int
-    ple_layer_ids: Tuple[int, ...]
+    ple_layer_ids: tuple[int, ...]
     indexer_n_heads: int
     indexer_budget: int
     indexer_compress_ratio: int
     mtp_num_hidden_layers: int
     tensor_count: int
-    shard_names: Tuple[str, ...]
+    shard_names: tuple[str, ...]
     ple_tensor_count: int
     mtp_tensor_count: int
 
 
 @dataclass(frozen=True)
 class Qwen4TransactionRecord:
-    lane_uids: Tuple[int, ...]
-    draft_depths: Tuple[int, ...]
-    accepted_lengths: Tuple[int, ...]
-    emitted_counts: Tuple[int, ...]
-    terminal: Tuple[bool, ...]
-    physical_target_drops: Tuple[int, ...]
+    lane_uids: tuple[int, ...]
+    draft_depths: tuple[int, ...]
+    accepted_lengths: tuple[int, ...]
+    emitted_counts: tuple[int, ...]
+    terminal: tuple[bool, ...]
+    physical_target_drops: tuple[int, ...]
     physical_trim_count: int
 
 
@@ -89,8 +88,7 @@ def validate_qwen4_config(config: Mapping) -> Mapping:
     if not isinstance(ple_layer_ids, Sequence) or isinstance(ple_layer_ids, str):
         raise ValueError("Qwen4 ple_layer_ids must be a sequence")
     if not ple_layer_ids or any(
-        not isinstance(value, int) or not 0 <= value < layers
-        for value in ple_layer_ids
+        not isinstance(value, int) or not 0 <= value < layers for value in ple_layer_ids
     ):
         raise ValueError("Qwen4 ple_layer_ids must name valid hidden layers")
 
@@ -148,9 +146,7 @@ def inspect_qwen4_artifact(model_path: Path) -> Qwen4ArtifactReceipt:
         ".ple" in name or ".ngram" in name or "shared_embedding" in name
         for name in tensor_names
     )
-    mtp_count = sum(
-        name.startswith("mtp.") or ".mtp." in name for name in tensor_names
-    )
+    mtp_count = sum(name.startswith("mtp.") or ".mtp." in name for name in tensor_names)
     if ple_count == 0:
         raise ValueError("Qwen4 artifact index contains no PLE tensors")
 
@@ -189,7 +185,7 @@ def compare_artifact_receipts(
         raise ValueError("Qwen4 artifact receipt mismatch: " + ", ".join(differences))
 
 
-def validate_transaction(record: Qwen4TransactionRecord) -> Tuple[int, ...]:
+def validate_transaction(record: Qwen4TransactionRecord) -> tuple[int, ...]:
     widths = {
         len(record.lane_uids),
         len(record.draft_depths),

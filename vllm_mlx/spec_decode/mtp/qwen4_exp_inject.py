@@ -124,9 +124,7 @@ def _sanitize_mtp_weights(
         declared=declared_norm_convention,
     ):
         for key, value in sanitized.items():
-            if any(
-                key.endswith(suffix) for suffix in _ZERO_CENTERED_NORM_SUFFIXES
-            ):
+            if any(key.endswith(suffix) for suffix in _ZERO_CENTERED_NORM_SUFFIXES):
                 sanitized[key] = value - 1.0
     return sanitized
 
@@ -322,8 +320,7 @@ def validate_qwen4_exp_mtp_support(model: Any) -> bool:
     return (
         callable(getattr(inner, "mtp_forward", None))
         and callable(getattr(inner, "mtp_batch_forward", None))
-        and getattr(inner, "batched_mtp_capability", None)
-        is BATCHED_MTP_CAPABILITY
+        and getattr(inner, "batched_mtp_capability", None) is BATCHED_MTP_CAPABILITY
         and getattr(inner, "mtp_recursive_draft_depth", None) == 2
         and callable(getattr(inner, "make_mtp_cache", None))
         and "return_hidden" in signature.parameters

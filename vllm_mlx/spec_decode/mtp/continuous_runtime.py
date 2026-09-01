@@ -103,8 +103,7 @@ def _require_descriptor(
         "tokenwise_exact"
     ):
         raise _unsupported(
-            "Qwen4 capability descriptor requires target_verify_mode="
-            "'tokenwise_exact'"
+            "Qwen4 capability descriptor requires target_verify_mode='tokenwise_exact'"
         )
     if family == "qwen4_exp" and descriptor.get("max_exact_fixed_lanes") != 2:
         raise _unsupported(

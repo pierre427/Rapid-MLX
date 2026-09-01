@@ -2073,9 +2073,7 @@ def test_qwen4_norm_convention_fails_closed_on_ambiguous_gains():
     key = "language_model.model.layers.0.self_attn.k_norm.weight"
 
     with pytest.raises(ValueError, match="ambiguous Qwen4 norm-weight convention"):
-        qwen4_exp._detect_norm_convention(
-            {key: mx.array([0.4, 0.6], dtype=mx.float32)}
-        )
+        qwen4_exp._detect_norm_convention({key: mx.array([0.4, 0.6], dtype=mx.float32)})
 
 
 def test_qwen4_norm_convention_rejects_conflicting_metadata():
@@ -2092,8 +2090,7 @@ def test_qwen4_quantization_paths_follow_sanitized_ple_shards(tmp_path):
     from vllm_mlx.utils.tokenizer import _qwen4_exp_quantization_override
 
     original_path = (
-        "language_model.model.layers.1.ple.ple_embedding."
-        "ngram_embedding.shard_007"
+        "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_007"
     )
     unchanged_path = "language_model.model.layers.1.mlp.gate"
     (tmp_path / "config.json").write_text(
@@ -2116,8 +2113,7 @@ def test_qwen4_quantization_paths_follow_sanitized_ple_shards(tmp_path):
     quantization = override["quantization"]
     assert original_path not in quantization
     assert quantization[
-        "language_model.model.layers.1.ple.ple_embedding."
-        "ngram_embedding.shards.7"
+        "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.7"
     ] == {"group_size": 32, "bits": 4}
     assert quantization[unchanged_path] == {"group_size": 64, "bits": 8}
     assert quantization["group_size"] == 64

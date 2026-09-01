@@ -394,9 +394,10 @@ def _runtime_refusals(
             reasons.append(f"capability descriptor mismatch: {name}")
     if not isinstance(descriptor.get("dynamic_join"), bool):
         reasons.append("capability descriptor mismatch: dynamic_join")
-    if runtime.model_family == "qwen4_exp" and descriptor.get(
-        "max_exact_fixed_lanes"
-    ) != 2:
+    if (
+        runtime.model_family == "qwen4_exp"
+        and descriptor.get("max_exact_fixed_lanes") != 2
+    ):
         reasons.append("capability descriptor mismatch: max_exact_fixed_lanes")
     if runtime.cache_quantized:
         reasons.append("quantized cache is unsupported")
