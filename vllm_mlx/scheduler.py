@@ -1366,9 +1366,14 @@ def _install_mtp_vendored(
         _cleanup_uid(uid)
         _disabled_uids.pop(uid, None)
         _terminal_uids.pop(uid, None)
-        _initial_skip_logged.difference_update(
-            key for key in _initial_skip_logged if key[0] == uid
-        )
+        # Materialize the keys before mutating the source set. Passing a
+        # generator over ``_initial_skip_logged`` directly to
+        # ``difference_update`` makes CPython advance the iterator while the
+        # same operation removes entries, raising ``RuntimeError: Set changed
+        # size during iteration`` as soon as a plain/fallthrough request
+        # finishes.
+        departed_log_keys = {key for key in _initial_skip_logged if key[0] == uid}
+        _initial_skip_logged.difference_update(departed_log_keys)
 
     def _sampling_options_for_uid(uid: int) -> tuple[dict[str, Any] | None, str]:
         """Resolve the request-local MTP sampling contract, fail closed.

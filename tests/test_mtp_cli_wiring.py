@@ -2044,6 +2044,62 @@ def test_install_mtp_vendored_reaps_request_state_on_departure(
     assert gb._mtp_vendored_disabled_uids == {}
 
 
+def test_install_mtp_vendored_reaps_plain_fallthrough_log_key_on_finish(
+    monkeypatch,
+):
+    """A logged plain-decode skip must not crash request completion.
+
+    ``set.difference_update(generator_over_same_set)`` mutates the set while
+    its generator is live. Tool grammars and other custom processors take this
+    ordinary-MTP fallthrough path, so the failure surfaced as request-wide
+    503s immediately after a constrained request produced its final token.
+    """
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from vllm_mlx.scheduler import _install_mtp_vendored
+    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+
+    def _unexpected_generator(*args, **kwargs):
+        raise AssertionError("custom processor must keep request on plain decode")
+
+    monkeypatch.setattr(_gen_mod, "mtp_generate_step", _unexpected_generator)
+
+    batch_gen, gb = _make_batch_gen_with_gb()
+    gb.uids = [7]
+    gb.tokens = [[101, 102]]
+    gb._next_tokens = mx.array([500], dtype=mx.uint32)
+    gb._next_logprobs = [mx.array([0.0])]
+    custom_processor = lambda tokens, logits: logits
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            seed=None,
+        ),
+        _mtp_safe_logits_processors=(),
+    )
+
+    assert _install_mtp_vendored(
+        batch_gen,
+        model=_StubModel(),
+        requests={"req-7": request},
+        uid_to_request_id={7: "req-7"},
+        uid_to_request_processors={7: [custom_processor]},
+    )
+    gb._step()
+    assert gb.orig_step_calls == 1
+
+    response = SimpleNamespace(uid=7, finish_reason="stop", prompt_cache=[object()])
+    gb.next_responses = [response]
+
+    assert gb.next() == [response]
+    assert response.prompt_cache is not None
+
+
 def test_install_mtp_vendored_discards_finished_cache_after_partial_round(
     monkeypatch,
 ):
