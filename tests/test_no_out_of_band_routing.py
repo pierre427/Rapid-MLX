@@ -168,6 +168,11 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # bit-exact kernel for an already-selected model and falls back for
         # unsupported shapes; it does not select a model, parser, or lane.
         "RAPID_MLX_QWEN4_FUSED_GDN_DECODE",
+        # Opt-in fused Qwen4 speculative-verify GDN recurrence (B=1, S=k+1).
+        # Same contract as the decode flag: a bit-exact kernel for an
+        # already-selected model that falls back to stock for unsupported
+        # shapes; it does not select a model, parser, or lane.
+        "RAPID_MLX_QWEN4_FUSED_GDN_VERIFY",
         # Opt-in re-quantization of the lm_head when serving fp8-block
         # checkpoints through the load-time mxfp8 repack
         # (vllm_mlx/fp8_repack.py). A precision/speed knob on an
