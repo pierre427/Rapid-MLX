@@ -138,8 +138,10 @@ def load_manifest(sidecar_path) -> dict:
     return manifest
 
 
-def _source_refs(model_path: Path, manifest: dict, weight_map: dict) -> dict:
-    prefix = manifest["tensor_prefix"]
+def _source_refs(
+    model_path: Path, manifest: dict, weight_map: dict, source_prefix: str
+) -> dict:
+    prefix = source_prefix
     parts = {
         "weight": ("U32", manifest["dims"] // 8, 4),
         "scales": ("BF16", manifest["dims"] // 32, 2),
@@ -158,8 +160,14 @@ def _source_refs(model_path: Path, manifest: dict, weight_map: dict) -> dict:
     headers, refs = {}, {}
     for name in sorted(expected):
         source = (model_path / weight_map[name]).resolve()
-        if not source.is_relative_to(model_path.resolve()):
-            raise ValueError("PLE source tensor path escapes model directory")
+        contained = source.is_relative_to(model_path)
+        if not contained and model_path.parent.name == "snapshots":
+            # Hugging Face snapshots expose immutable weight symlinks whose
+            # targets live in the same repository cache's sibling blobs dir.
+            cache_blobs = (model_path.parent.parent / "blobs").resolve()
+            contained = source.is_relative_to(cache_blobs)
+        if not contained:
+            raise ValueError("PLE source tensor path escapes model repository")
         if source not in headers:
             with source.open("rb") as stream:
                 raw = stream.read(8)
@@ -216,7 +224,19 @@ def validate_artifact(model_path, sidecar_path, *, random_rows=256) -> dict:
         or manifest["num_shards"] != text.get("split_ngram_parts", 128)
     ):
         raise ValueError("PLE manifest geometry/prefix differs from model config")
-    refs = _source_refs(model_path, manifest, json.loads(index_bytes)["weight_map"])
+    # The published checkpoint owns raw Hugging Face keys under
+    # model.language_model; Model.sanitize maps those to the vendored
+    # language_model.model runtime path recorded by the sidecar manifest.
+    source_prefix = (
+        f"model.language_model.layers.{layer_ids[0] - 1}.ple."
+        "ple_embedding.ngram_embedding"
+    )
+    refs = _source_refs(
+        model_path,
+        manifest,
+        json.loads(index_bytes)["weight_map"],
+        source_prefix,
+    )
     _positive_int(random_rows, "random_rows", zero=True)
     if random_rows > 4096:
         raise ValueError("PLE random validation sample exceeds4096 rows")

@@ -78,6 +78,9 @@ class Artifact:
         self.root = Path(root)
         self.path = self.root / "ple_rows.bin"
         self.prefix = "language_model.model.layers.0.ple.ple_embedding.ngram_embedding"
+        self.source_prefix = (
+            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+        )
         rng = np.random.default_rng(9)
         self.words = rng.integers(0, 2**32, (8, 4), dtype=np.uint32)
         self.scales = np.full((8, 1), 0x3D80, dtype=np.uint16)
@@ -99,7 +102,7 @@ class Artifact:
                 ("scales", self.scales, "BF16"),
                 ("biases", self.biases, "BF16"),
             ]:
-                key = f"{self.prefix}.shard_{shard}.{part}"
+                key = f"{self.source_prefix}.shard_{shard}.{part}"
                 values = array[shard * 4 : shard * 4 + 4]
                 raw = values.tobytes()
                 header[key] = dict(
@@ -154,6 +157,20 @@ class SidecarContracts(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.a = Artifact(self.tmp.name)
+
+    def test_hugging_face_snapshot_blob_symlink_is_accepted(self):
+        cache = self.a.root / "models--owner--model"
+        snapshot = cache / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        artifact = Artifact(snapshot)
+        blobs = cache / "blobs"
+        blobs.mkdir()
+        source = snapshot / "model-ple.safetensors"
+        blob = blobs / "deadbeef"
+        source.replace(blob)
+        source.symlink_to(blob)
+        receipt = sidecar.validate_artifact(snapshot, artifact.path, random_rows=0)
+        self.assertEqual(receipt["manifest"]["total_rows"], 8)
 
     def test_validation_and_exact_integer_affine(self):
         receipt = sidecar.validate_artifact(self.a.root, self.a.path)
@@ -695,7 +712,9 @@ class CPULoadContracts(SidecarContracts):
         mx = self.mx
         model = self.qwen.Model(self.qwen.ModelArgs.from_dict(self.a.config))
         weights = {
-            key.replace(".shard_", ".shards."): mx.array(values).view(mx.bfloat16)
+            key.replace(self.a.source_prefix, self.a.prefix).replace(
+                ".shard_", ".shards."
+            ): mx.array(values).view(mx.bfloat16)
             if not key.endswith(".weight")
             else mx.array(values)
             for key, values in self.a.tensors.items()
