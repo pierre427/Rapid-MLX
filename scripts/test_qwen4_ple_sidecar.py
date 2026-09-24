@@ -158,6 +158,19 @@ class SidecarContracts(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.a = Artifact(self.tmp.name)
 
+    def test_builder_reproduces_and_validates_sidecar(self):
+        from rapid_mlx.models.qwen4_ple_build import build_sidecar
+
+        output = self.a.root / "built.bin"
+        receipt = build_sidecar(self.a.root, output, chunk_rows=2, validation_rows=2)
+        self.assertEqual(output.read_bytes(), self.a.packed.tobytes())
+        self.assertEqual(receipt["bytes_written"], len(self.a.packed.tobytes()))
+        self.assertEqual(
+            receipt["manifest"]["shard_sha256"], self.a.manifest["shard_sha256"]
+        )
+        with self.assertRaises(FileExistsError):
+            build_sidecar(self.a.root, output, chunk_rows=2)
+
     def test_hugging_face_snapshot_blob_symlink_is_accepted(self):
         cache = self.a.root / "models--owner--model"
         snapshot = cache / "snapshots" / ("a" * 40)

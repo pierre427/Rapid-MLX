@@ -2,62 +2,85 @@
 
 - Owner: Vector
 - Source PR: #3367
-- Integration branch: `integration/pr-3367-ple-current`
-- Mac mini worktree: `/Users/raullenmini/orca/worktrees/pr3367-ple`
-- Base: `0c049254ed9229a97f436548f1d28478e35524e6`
+- Studio integration branch: `integration/pr-3367-studio`
+- Studio worktree: `/Volumes/NVMe-4T/rapid-worktrees/pr3367`
+- Immutable model revision: `rapid-mlx/Qwen3.8-Flash-Next-4bit@dcf657e4acda2aae72da99cde65b6c491cd96998`
 
 ## Scope
 
 Port Pierre Lamy's opt-in Qwen4 q4/group32 PLE reader from the retired
 `vllm_mlx` package path to current `rapid_mlx`, preserve attribution, and
-establish whether its memory reduction justifies the synchronous host lookup
-on real inference. This work must not trigger or prepare a release.
+measure its user-visible memory and latency tradeoff on real inference. This
+work must not trigger or prepare a release.
 
-## Verified on Mac mini
+## Correctness and usability fixes
 
-- The 32 focused CPU contracts pass after the package-path port. Ruff check,
-  Ruff format check, and `git diff --check` pass for the changed Python files.
-- The Apple-Silicon CI lane now runs the focused sidecar contracts; the source
-  PR left them under `scripts/`, outside normal pytest collection and without a
-  workflow invocation.
-- The existing Qwen4 suite reaches 114/115 tests in the local verification
-  environment. The sole failure is an unchanged MTP test calling
-  `mx.full_like`, which this Mac mini's installed MLX does not provide.
-- A same-geometry synthetic lookup probe (128 shards, 160-wide q4/group32,
-  16 rows per decode token) was bit-exact. Its file was only 12.5 MiB and hot
-  in the page cache, so its timing is implementation smoke evidence only and
-  must not be used as the production speed gate.
+The public checkpoint stores the source tensors under
+`model.language_model...`, while the vendored model sanitizes them to
+`language_model.model...`. The original PR required the runtime prefix in the
+source index and rejected its target checkpoint. Validation now binds both
+exact prefixes.
 
-## Exact production artifact and capacity blocker
+Hugging Face snapshots use symlinks into the same repository cache's sibling
+`blobs/` directory. Validation now accepts that immutable layout while still
+rejecting arbitrary paths outside the model repository.
 
-The published source checkpoint is
-`rapid-mlx/Qwen3.8-Flash-Next-4bit` at immutable revision
-`dcf657e4acda2aae72da99cde65b6c491cd96998`. Its config declares one PLE
-layer, 128 shards, 320,001,536 total rows, 160 dimensions, and q4/group32 for
-PLE. The packed table is therefore exactly 32,000,153,600 bytes. The public
-index SHA-256 is
-`1ffe41e4484e7dc137900b12b14ae29cf92d1737e89fbe72c4fa2dd1b42ee7f1` and
-reports 104,681,488,408 bytes of model tensors.
+The real checkpoint also has one trained RMSNorm anchor mean at 0.765 while the
+other 47 anchors are in the zero-centered band. The detector now requires 95%
+producer consensus plus a robust median band; the deliberately mixed contract
+is still rejected.
 
-This Mac mini has 32 GiB unified memory and about 34 GiB free disk. The
-resident baseline requires roughly the full 104.7 GB tensor set; the offloaded
-variant still leaves roughly 72.7 GB before runtime state. Neither arm can run
-on this host, and downloading the source plus writing the 32.0 GB sidecar also
-exceeds free disk. A same-host off/on A/B here would be fabricated evidence.
+A production builder is available as:
 
-The immutable public repository has no `ple_rows.bin` or sidecar manifest. The
-only located inventory receipt points to Pierre's local
-`/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP/ple_rows.bin` and
-records 32,000,153,600 bytes. The PR contains a reader but no artifact builder
-or published sidecar, so users currently have no reproducible path to activate
-it.
+```sh
+python -m rapid_mlx.models.qwen4_ple_build \
+  --model /path/to/immutable/snapshot \
+  --output /path/to/ple_rows.bin
+```
 
-## Remaining merge gate
+It streams tensor chunks, verifies all source geometry, writes per-shard
+SHA-256 values, fsyncs and atomically publishes through partial files, and
+validates shard edges plus random rows before publication.
 
-Run separate clean processes on a host that can load the 104.7 GB resident
-baseline (practically 128 GB or larger), using one immutable checkpoint and a
-source-bound sidecar. Record peak resident/Metal memory, TTFT, decode tok/s,
-greedy output parity, the 32,000,153,600 removed bytes, exact hashes, and the
-full invocation. Also supply a reproducible builder or publish the immutable
-sidecar and manifest. Keep the PR out of the queue until both the artifact path
-and isolated user-benefit gate exist.
+## Studio A/B
+
+Host: Apple Silicon Mac Studio with 256 GiB unified memory. The host had
+background load, so cold load and first-token timings were noisy. Each lane ran
+in a separate process with offline loading, greedy sampling, a 64 MiB bounded
+row cache, and the exact revision above. Token IDs were identical in every
+paired run.
+
+The source index SHA-256 is
+`1ffe41e4484e7dc137900b12b14ae29cf92d1737e89fbe72c4fa2dd1b42ee7f1`.
+The model index reports 104,681,488,408 tensor bytes. The sidecar contains 128
+shards, 320,001,536 rows, 160 dimensions, and exactly 32,000,153,600 bytes.
+
+After one warmup:
+
+| Measured request | Resident PLE | File-backed PLE | Delta |
+| --- | ---: | ---: | ---: |
+| Peak MLX memory, short prompt | 102.978 GB | 70.975 GB | -32.003 GB |
+| TTFT, short prompt / 64 output | 226.3 ms | 305.5 ms | +79.2 ms |
+| Decode, short prompt | 25.97 tok/s | 25.54 tok/s | -1.65% |
+| Peak MLX memory, 1024-token prompt | 106.025 GB | 74.022 GB | -32.003 GB |
+| TTFT, 1024-token prompt / 32 output | 1.442 s | 1.487 s | +44.3 ms |
+| Decode, 1024-token prompt | 27.31 tok/s | 26.59 tok/s | -2.64% |
+
+Cold timings varied substantially in both directions because of background
+load and page-cache state; they are retained in
+`/Volumes/NVMe-4T/pr3367-artifacts/{on,off,on2,off2}.log` and are not used as
+the speed claim.
+
+The production builder recreated all 32,000,153,600 bytes in 25.04 seconds.
+`cmp` confirmed that its output was byte-identical to the independently built
+A/B artifact, and validation checked 512 rows spanning every shard edge plus
+256 random samples.
+
+## Verification
+
+- 36 focused sidecar CPU/load/production-lane contracts pass.
+- 13 Qwen4 norm-convention CPU contracts pass.
+- Ruff check, Ruff format check, and `git diff --check` pass.
+- Earlier Mac mini verification reached 114/115 existing Qwen4 tests; its only
+  failure was an unchanged MTP test calling unavailable `mx.full_like` in
+  that host's older MLX build.
