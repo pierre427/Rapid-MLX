@@ -27,7 +27,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location(
-    "vllm_mlx.models.qwen4_ple_sidecar", ROOT / "vllm_mlx/models/qwen4_ple_sidecar.py"
+    "rapid_mlx.models.qwen4_ple_sidecar", ROOT / "rapid_mlx/models/qwen4_ple_sidecar.py"
 )
 sidecar = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = sidecar
@@ -450,7 +450,7 @@ class CPULoadContracts(SidecarContracts):
 
         mx.set_default_device(mx.cpu)
         cls.mx = mx
-        from vllm_mlx.models import qwen4_exp
+        from rapid_mlx.models import qwen4_exp
 
         cls.qwen = qwen4_exp
 
@@ -474,7 +474,7 @@ class CPULoadContracts(SidecarContracts):
             "raise RuntimeError('custom model executed')"
         )
         (self.a.root / "config.json").write_text(json.dumps(self.a.config))
-        from vllm_mlx.models.qwen4_ple_nvme import load_file_backed_qwen4
+        from rapid_mlx.models.qwen4_ple_nvme import load_file_backed_qwen4
 
         loaded, _ = load_file_backed_qwen4(self.a.root, self.a.path, cache_bytes=1064)
         self.assertIs(type(loaded), self.qwen.Model)
@@ -504,7 +504,7 @@ class CPULoadContracts(SidecarContracts):
     def test_strict_load_failure_closes_reader_even_with_retained_traceback(self):
         from mlx.utils import tree_flatten
 
-        from vllm_mlx.models import qwen4_ple_nvme as adapter
+        from rapid_mlx.models import qwen4_ple_nvme as adapter
 
         mx = self.mx
         model = self.qwen.Model(self.qwen.ModelArgs.from_dict(self.a.config))
@@ -545,7 +545,7 @@ class CPULoadContracts(SidecarContracts):
     def test_loader_identity_failure_remains_inside_reader_ownership_scope(self):
         import mlx_lm.utils as utils
 
-        from vllm_mlx.models import qwen4_ple_nvme as adapter
+        from rapid_mlx.models import qwen4_ple_nvme as adapter
 
         reader = SimpleNamespace(close=mock.Mock())
 
@@ -559,7 +559,7 @@ class CPULoadContracts(SidecarContracts):
         reader.close.assert_called_once()
 
     def test_installer_cleanup_error_does_not_replace_original_validation_error(self):
-        from vllm_mlx.models import qwen4_ple_nvme as adapter
+        from rapid_mlx.models import qwen4_ple_nvme as adapter
 
         model = self.qwen.Model(self.qwen.ModelArgs.from_dict(self.a.config))
         reader = sidecar.PLESidecarReader(self.a.root, self.a.path, random_rows=0)
@@ -588,10 +588,10 @@ class CPULoadContracts(SidecarContracts):
     def _production_lane(self, stack, *, load_error=None, tokenizer_error=None):
         import mlx_lm.utils as mlx_utils
 
-        from vllm_mlx import model_aliases
-        from vllm_mlx.models import qwen4_ple_nvme as adapter
-        from vllm_mlx.utils import chat_template_registry
-        from vllm_mlx.utils import tokenizer as loader
+        from rapid_mlx import model_aliases
+        from rapid_mlx.models import qwen4_ple_nvme as adapter
+        from rapid_mlx.utils import chat_template_registry
+        from rapid_mlx.utils import tokenizer as loader
 
         stack.enter_context(
             mock.patch.dict(
@@ -701,7 +701,7 @@ class CPULoadContracts(SidecarContracts):
             for key, values in self.a.tensors.items()
         }
         weights.pop(next(iter(weights)))
-        from vllm_mlx.models.qwen4_ple_nvme import install_file_backed_ple
+        from rapid_mlx.models.qwen4_ple_nvme import install_file_backed_ple
 
         with (
             sidecar._bound_load_source(self.a.root),
