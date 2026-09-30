@@ -103,10 +103,8 @@ _LIVE = [False]
 
 
 def _bucket(rows: int) -> str:
-    for low, high in ROW_BUCKETS:
-        if low <= rows <= high:
-            return f"{low}-{high}"
-    return f">{MAX_ROWS}"
+    # Lane calls take 1..MAX_ROWS rows, which the buckets cover exactly.
+    return next(f"{low}-{high}" for low, high in ROW_BUCKETS if low <= rows <= high)
 
 
 def stats() -> dict:

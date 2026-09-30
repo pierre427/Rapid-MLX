@@ -580,3 +580,143 @@ def test_a_config_that_declares_experts_is_moe_whatever_its_module_names():
         language_model=SimpleNamespace(args={"moe_num_experts": 4}),
     )
     assert lane.is_moe(wrapper)
+
+
+class _BiasedAttention(nn.Module):
+    """Qwen2-style attention: q/k/v carry an additive bias."""
+
+    def __init__(self):
+        super().__init__()
+        for name, n, seed in (
+            ("q_proj", 64, 21),
+            ("k_proj", 32, 22),
+            ("v_proj", 32, 23),
+        ):
+            m = _quantized(256, n, 4, 64, seed=seed)
+            m.bias = mx.random.normal((n,), key=mx.random.key(seed + 100)).astype(
+                mx.bfloat16
+            )
+            setattr(self, name, m)
+
+    def __call__(self, x):
+        return mx.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], -1)
+
+
+class _TwoBlocks(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = _Attention()
+        self.b = _Attention()
+
+
+@metal
+def test_biased_groups_add_each_members_bias_and_stay_row_invariant():
+    model = _BiasedAttention()
+    receipt = lane.install_lane_matmul(model, mode="exact")
+    assert receipt["groups"] == {"affine-q4-g64x3": 1}
+    x = mx.random.normal((1, 6, 256), key=mx.random.key(12)).astype(mx.bfloat16)
+    together = model(x)
+    alone = mx.concatenate([model(x[:, i : i + 1]) for i in range(6)], axis=1)
+    assert mx.array_equal(together, alone).item()
+    lane.uninstall(model)
+
+
+@metal
+def test_calls_outside_the_lane_window_or_format_fall_back_to_stock():
+    model = _Attention()
+    lane.install_lane_matmul(model, mode="exact")  # 1..32 rows take the lane
+    before = dict(lane.stats())
+    wide = mx.random.normal((40, 64), key=mx.random.key(13)).astype(mx.bfloat16)
+    y = model.o_proj(wide)  # 40 rows > max_rows: stock
+    stock = nn.QuantizedLinear.__call__(model.o_proj, wide)
+    assert mx.array_equal(y, stock).item()
+    f32 = mx.random.normal((3, 64), key=mx.random.key(14))  # fp32 activations: refused
+    assert mx.array_equal(
+        model.o_proj(f32), nn.QuantizedLinear.__call__(model.o_proj, f32)
+    ).item()
+    after = lane.stats()
+    assert after["stock_above_max_rows"] == before.get("stock_above_max_rows", 0) + 1
+    assert after["stock_unsupported"] == before.get("stock_unsupported", 0) + 1
+    inst._LIVE[0] = False  # a device without a backend: every call stays stock
+    try:
+        model.o_proj(mx.zeros((3, 64), dtype=mx.bfloat16))
+        assert lane.stats()["stock_disabled"] == before.get("stock_disabled", 0) + 1
+    finally:
+        inst._LIVE[0] = True
+    lane.uninstall(model)
+
+
+@metal
+def test_the_stock_stack_probe_runs_once_per_shape():
+    real = inst._probe_stock_stack
+    probes = []
+
+    def spy(members, group, rows_below, seen):
+        result = real(members, group, rows_below, seen)
+        probes.append(len(seen))
+        return result
+
+    inst._probe_stock_stack = spy
+    try:
+        receipt = lane.install_lane_matmul(_TwoBlocks(), mode="crossover")
+    finally:
+        inst._probe_stock_stack = real
+    assert receipt["stock_stacked"] == {"groups": 2, "unproven": 0}
+    assert probes == [1, 1]  # the second, same-shaped group reused the verdict
+
+
+def test_unquantized_siblings_stack_and_run_stock_as_one_matmul(monkeypatch):
+    monkeypatch.setattr(lm, "backend", lambda: "mpp")
+    monkeypatch.setattr(inst, "backend", lambda: "mpp")
+    monkeypatch.setattr(inst, "available", lambda: True)
+
+    class _Dense(nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name, n in (("q_proj", 64), ("k_proj", 64), ("v_proj", 64)):
+                layer = nn.Linear(128, n, bias=False)
+                layer.weight = layer.weight.astype(mx.bfloat16)
+                setattr(self, name, layer)
+
+    model = _Dense()
+    x = mx.random.normal((2, 128), key=mx.random.key(15)).astype(mx.bfloat16)
+    before = [model[name](x) for name in ("q_proj", "k_proj", "v_proj")]
+    receipt = inst.install(model, min_rows_by_format={"bf16": 16})
+    assert receipt["groups"] == {"unquantizedx3": 1}
+    assert type(model.q_proj) is inst.LaneLinear
+    group = inst._group(model.q_proj)
+    assert "scales" not in group.stack
+    stacked = inst._stock_matmul(group, x)
+    assert mx.array_equal(stacked, mx.concatenate(before, axis=-1)).item()
+    after = [
+        model[name](x) for name in ("q_proj", "k_proj", "v_proj")
+    ]  # 2 rows < 16: stock
+    assert all(mx.array_equal(a, b).item() for a, b in zip(before, after))
+    inst.uninstall(model)
+
+
+def test_mixed_format_siblings_only_stack_within_a_format(monkeypatch):
+    monkeypatch.setattr(lm, "backend", lambda: "simd")
+    monkeypatch.setattr(inst, "backend", lambda: "simd")
+    monkeypatch.setattr(simd, "check", lambda *a, **k: True)
+    model = _Attention()
+    model.v_proj = _quantized(256, 32, 8, 64, seed=30)  # q8 beside q4 q/k
+    receipt = inst.install(model, min_rows_by_format={"q4": 1, "q8": 1})
+    assert receipt["groups"] == {"affine-q4-g64x2": 1}
+    assert inst._group(model.v_proj) is None
+    inst.uninstall(model)
+
+
+def test_law_ids_buckets_and_format_classes():
+    assert inst.law_id(1, "simd") == "lane-simd-v1"
+    assert inst.law_id(8, "mpp") == "lane-matmul-v1+stock-below-8"
+    assert [inst._bucket(r) for r in (1, 4, 8, 16, 33, 128)] == [
+        "1-3",
+        "4-7",
+        "8-15",
+        "16-32",
+        "33-128",
+        "33-128",
+    ]
+    assert inst.format_class(nn.RMSNorm(8)) is None
+    assert inst.format_class(nn.Linear(8, 8)) is None  # fp32 weights: no class
