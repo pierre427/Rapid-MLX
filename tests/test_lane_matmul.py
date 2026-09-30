@@ -562,3 +562,21 @@ def test_the_stock_stack_probe_covers_fp16_activations(monkeypatch):
     monkeypatch.setattr(inst, "_stock_matmul", spy)
     lane.install_lane_matmul(_Attention(), mode="crossover")
     assert mx.bfloat16 in calls and mx.float16 in calls
+
+
+def test_a_config_that_declares_experts_is_moe_whatever_its_module_names():
+    from types import SimpleNamespace
+
+    model = _Attention()
+    assert not lane.is_moe(model)
+    model.args = SimpleNamespace(num_experts=0, text_config={"n_routed_experts": 64})
+    assert lane.is_moe(model)
+    model.args = SimpleNamespace(num_local_experts=8)
+    assert lane.is_moe(model)
+    model.args = SimpleNamespace(num_experts=True)  # a bool is not an expert count
+    assert not lane.is_moe(model)
+    wrapper = SimpleNamespace(
+        named_modules=model.named_modules,
+        language_model=SimpleNamespace(args={"moe_num_experts": 4}),
+    )
+    assert lane.is_moe(wrapper)

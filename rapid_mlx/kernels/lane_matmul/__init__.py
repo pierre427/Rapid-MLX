@@ -70,7 +70,48 @@ def mode_from_env() -> str:
     return raw
 
 
+_EXPERT_KEYS = (
+    "num_experts",
+    "n_routed_experts",
+    "num_local_experts",
+    "moe_num_experts",
+)
+
+
+def _config_moe(config) -> bool:
+    """Whether a model config (mlx-lm ``model.args``, or a dict) routes to experts."""
+    if config is None:
+        return False
+    scopes = [config]
+    for nested in ("text_config", "llm_config"):
+        inner = (
+            config.get(nested)
+            if isinstance(config, dict)
+            else getattr(config, nested, None)
+        )
+        if inner is not None:
+            scopes.append(inner)
+    for scope in scopes:
+        for key in _EXPERT_KEYS:
+            value = (
+                scope.get(key) if isinstance(scope, dict) else getattr(scope, key, None)
+            )
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return True
+    return False
+
+
 def is_moe(model) -> bool:
+    """Routed experts, from the config's expert count or an expert module.
+
+    The config is authoritative (a checkpoint declaring experts is MoE
+    whatever its module names); the module scan catches expert containers of
+    models without an args object (mlx-lm's SwitchGLU / SwitchLinear, and
+    the usual ``*MoE`` / ``*SparseMoeBlock`` / ``*Experts`` names).
+    """
+    for holder in (model, getattr(model, "language_model", None)):
+        if holder is not None and _config_moe(getattr(holder, "args", None)):
+            return True
     for _name, module in model.named_modules():
         kind = type(module).__name__
         if "Switch" in kind or kind.endswith(("MoE", "SparseMoeBlock", "Experts")):
