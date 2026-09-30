@@ -96,7 +96,16 @@ def install_lane_matmul(model, mode: str | None = None) -> dict | None:
         )
         return None
     thresholds = {fmt: 1 for fmt in CROSSOVER} if mode == "exact" else dict(CROSSOVER)
-    receipt = install(model, min_rows_by_format=thresholds)
+    try:
+        receipt = install(model, min_rows_by_format=thresholds)
+    except Exception:
+        # A kernel that fails to compile or launch in an install-time probe
+        # must not abort serving: restore every projection to stock.
+        uninstall(model)
+        logger.warning(
+            "[lane_matmul] install failed; serving with stock kernels", exc_info=True
+        )
+        return None
     receipt["mode"] = mode
     if not receipt["covered"]:
         uninstall(model)

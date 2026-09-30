@@ -190,9 +190,44 @@ def test_crossover_keeps_short_calls_on_stock():
     assert receipt["stock_stacked"] == {"groups": 1, "unproven": 0}
     group = inst._group(model.q_proj)
     assert group.stock_stacked
-    assert mx.array_equal(model(x), before).item()  # 4 rows < 8: stock arithmetic
-    assert group.stock_last is not None  # the stacked stock launch served them
+    launches = []
+    real = inst._stock_matmul
+    inst._stock_matmul = lambda g, v: launches.append(v.shape) or real(g, v)
+    try:
+        assert mx.array_equal(model(x), before).item()  # 4 rows < 8: stock arithmetic
+    finally:
+        inst._stock_matmul = real
+    assert len(launches) == 1  # one stacked stock launch served q, k and v
+    assert group.stock_last is None  # released once all three took their columns
     lane.uninstall(model)
+
+
+@metal
+def test_lane_group_results_are_released_after_every_member_took_them():
+    model = _Attention()
+    lane.install_lane_matmul(model, mode="exact")
+    group = inst._group(model.q_proj)
+    x = mx.random.normal((1, 5, 256), key=mx.random.key(9)).astype(mx.bfloat16)
+    mx.eval(model(x))
+    assert group.last is None and group.size == 3
+    mx.eval(model.q_proj(x))  # a lone member call keeps one result until reused
+    assert group.last is not None and group.last[2] == 1
+    lane.uninstall(model)
+
+
+def test_an_install_failure_leaves_the_model_on_stock(monkeypatch, caplog):
+    monkeypatch.setattr(lane, "available", lambda: True)
+
+    def boom(model, **_kw):
+        inst.install(model, min_rows_by_format={"q4": 1}, groups=())
+        raise RuntimeError("metal compile failed")
+
+    monkeypatch.setattr(lane, "install", boom)
+    monkeypatch.setattr(inst, "_check_simd_twins", lambda model: {})
+    model = _Attention()
+    assert lane.install_lane_matmul(model, mode="exact") is None
+    assert type(model.q_proj) is nn.QuantizedLinear
+    assert "serving with stock kernels" in caplog.text
 
 
 @metal

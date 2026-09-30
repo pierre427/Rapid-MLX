@@ -75,11 +75,27 @@ class _Group:
     lw: LaneWeights
     stack: dict  # the stacked MLX arrays the members' weights are views of
     call: dict  # the members' stock quantization arguments (bits, group size, mode)
-    last: tuple | None = None  # (x, stacked output) of the latest lane call
+    size: int  # members; a shared result is dropped once all of them took it
+    last: list | None = None  # [x, stacked output, members served] of a lane launch
     # Below the crossover the members' stock calls can run as one stacked
     # stock launch when a probe proved it bitwise equal (see _probe_stock_stack).
     stock_stacked: bool = False
-    stock_last: tuple | None = None
+    stock_last: list | None = None
+
+
+def _shared(group: _Group, attr: str, x, compute):
+    """The group's stacked result for input ``x``: computed by the first
+    member that sees ``x``, released once every member has taken its columns
+    (so no layer keeps its last input and output alive between steps)."""
+    held = getattr(group, attr)
+    launched = held is None or held[0] is not x
+    if launched:
+        held = [x, compute(), 0]
+        setattr(group, attr, held)
+    held[2] += 1
+    if held[2] >= group.size:
+        setattr(group, attr, None)
+    return held[1], launched
 
 
 # The device can run a lane backend (fixed at install; checked once, not per call).
@@ -138,12 +154,11 @@ class _LaneMixin:
                     # The first sibling to see this input computes the whole
                     # group; the others take their columns of the same result.
                     start, stop = self.__dict__["_lane_columns"]
-                    if group.last is None or group.last[0] is not x:
-                        group.last = (x, lane_matmul(x, group.lw))
-                        STATS["group_launches"] += 1
-                    else:
-                        STATS["group_reuses"] += 1
-                    y = group.last[1][..., start:stop]
+                    out, launched = _shared(
+                        group, "last", x, lambda: lane_matmul(x, group.lw)
+                    )
+                    STATS["group_launches" if launched else "group_reuses"] += 1
+                    y = out[..., start:stop]
                     if lw.bias is not None:
                         y = y + lw.bias
                 STATS["lane_calls"] += 1
@@ -172,10 +187,9 @@ def _stock_matmul(group: _Group, x):
 
 def _stock_stacked(module, group: _Group, x):
     """This member's columns of one stock launch over the group's stack."""
-    if group.stock_last is None or group.stock_last[0] is not x:
-        group.stock_last = (x, _stock_matmul(group, x))
+    out, _ = _shared(group, "stock_last", x, lambda: _stock_matmul(group, x))
     start, stop = module.__dict__["_lane_columns"]
-    y = group.stock_last[1][..., start:stop]
+    y = out[..., start:stop]
     bias = module.get("bias")
     return y if bias is None else y + bias
 
@@ -297,7 +311,7 @@ def _stack(members) -> _Group:
         if quantized
         else {}
     )
-    return _Group(lw, stacked, call)
+    return _Group(lw, stacked, call, len(members))
 
 
 def _dissolve(model) -> None:
